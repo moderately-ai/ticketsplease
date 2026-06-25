@@ -10,6 +10,16 @@ on:
 permissions:
   contents: write
 
+# One release run per tag, ever. The push and workflow_dispatch triggers can both
+# fire for the same tag; without this they race on create-release/upload and leave
+# a broken, asset-less release. `cancel-in-progress: false` is deliberate — a
+# duplicate QUEUES behind the in-flight run rather than cancelling it, because
+# cancelling a release mid-upload is what corrupts it. The idempotent create-release
+# below then makes the queued duplicate a clean no-op.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Create the GitHub Release first; the matrix below uploads assets to it.
   # (upload-rust-binary-action attaches to an existing release, it does not
@@ -18,9 +28,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # Idempotent: create the release only if absent. A re-run or a queued
+      # duplicate trigger finds it already there and leaves it untouched, instead
+      # of failing with "Release.tag_name already exists" (HTTP 422).
+      - name: Create release if absent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving it in place."
+          else
+            gh release create "$tag" --repo "${GITHUB_REPOSITORY}" --title "$tag" --generate-notes
+          fi
 
   upload:
     needs: create-release
