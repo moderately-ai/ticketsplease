@@ -29,7 +29,7 @@ globset = "0.4"
 guppy = "0.17"
 include_dir = "0.7"
 
-# Disk hygiene per ~/.claude-work/CLAUDE.md and ../../tomsanbear/quiltdb house style.
+# Disk hygiene: line-tables-only debug info + opt-level=1 deps for fast iteration.
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
@@ -38,9 +38,9 @@ split-debuginfo = "unpacked"
 opt-level = 1
 
 [profile.release]
-# `strip` + `codegen-units = 1` shrink the shipping artifact (not target/). Per
-# ~/.claude-work/rules/rust.md, LTO is applied in CI via CARGO_PROFILE_RELEASE_LTO,
-# not here — it inflates intermediate bitcode locally for no benefit.
+# `strip` + `codegen-units = 1` shrink the shipping artifact (not target/). LTO is
+# applied in CI via CARGO_PROFILE_RELEASE_LTO, not here — it inflates intermediate
+# bitcode locally for no benefit.
 strip = true
 codegen-units = 1
 

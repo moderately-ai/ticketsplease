@@ -38,8 +38,8 @@ jobs:
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     env:
-      # LTO at release time only (per ~/.claude-work/rules/rust.md): inflates
-      # intermediate bitcode for no local benefit, so it lives here, not in Cargo.toml.
+      # LTO at release time only: it inflates intermediate bitcode for no local
+      # benefit, so it lives here rather than in Cargo.toml.
       CARGO_PROFILE_RELEASE_LTO: fat
     steps:
       - uses: actions/checkout@v5

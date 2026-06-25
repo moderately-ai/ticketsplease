@@ -5,8 +5,8 @@
 #     cargo deny check
 #
 # The pre-commit hook runs the same command before every commit (see
-# .pre-commit-config.yaml). Adapted from ../../tomsanbear/quiltdb without that
-# repo's vendored git forks — ticketsplease pulls only crates.io dependencies.
+# .pre-commit-config.yaml). ticketsplease pulls only crates.io dependencies, so the
+# gate stays focused on advisories, licenses, and source provenance.
 
 [advisories]
 db-urls = ["https://github.com/RustSec/advisory-db"]

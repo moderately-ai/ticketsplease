@@ -1,4 +1,4 @@
-# Pre-commit configuration, adapted from ../../tomsanbear/quiltdb.
+# Pre-commit configuration.
 #
 # One-time setup per dev machine:
 #     pip install pre-commit        # or: brew install pre-commit
@@ -6,11 +6,9 @@
 #     pre-commit install --install-hooks
 #     pre-commit install --hook-type commit-msg
 #
-# Deliberate divergences from quiltdb:
-#   * Conventional Commits are enforced via `conventional-pre-commit` (runs in
-#     pre-commit's own managed env) rather than bun/commitlint, to avoid pulling
-#     a JS toolchain into this lean Rust + shell project.
-#   * The quiltdb-specific `xtask audit-*` hooks are omitted (no such rules yet).
+# Note: Conventional Commits are enforced via `conventional-pre-commit` (which runs
+# in pre-commit's own managed env) rather than bun/commitlint, to avoid pulling a
+# JS toolchain into this lean Rust + shell project.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

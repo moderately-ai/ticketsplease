@@ -206,12 +206,12 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          \n\
          # Map abstract scope names to path globs. Tickets reference these stable names.\n\
          [scopes]\n\
-         # \"datafusion/session\" = [\"quiltdb-datafusion/src/session/**\"]\n\
+         # \"query/planner\" = [\"crates/query/src/planner/**\"]\n\
          \n\
          # Optionally map a scope to its owning crate so the Rust backend can expand\n\
          # reverse-dependents (requires `cargo` at runtime).\n\
          [scope_crates]\n\
-         # \"core\" = \"quiltdb-core\"\n"
+         # \"core\" = \"my-core-crate\"\n"
     )
 }
 
