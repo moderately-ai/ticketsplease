@@ -1,7 +1,7 @@
 ---
 id: integration-tests
 title: Integration and snapshot test suite
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [cli]
