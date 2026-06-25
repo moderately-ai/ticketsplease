@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
+use ticketsplease_core::claim as claim_core;
 use ticketsplease_core::config::Backend;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
@@ -15,8 +16,8 @@ use ticketsplease_core::{
 };
 
 use crate::cli::{
-    CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SelfUpdateArgs, SetArgs,
-    ShowArgs, SkillInstallArgs, WhyArgs,
+    ClaimArgs, CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs,
+    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -711,6 +712,49 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
     }
 }
 
+/// `claim` — atomically take ownership of a ticket via the git-ref lock + lease.
+pub fn claim(repo: &Path, fmt: Format, args: &ClaimArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let outcome = claim_core::claim(&store, &args.id, &args.agent, args.ttl)?;
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "id": outcome.id,
+            "assignee": outcome.assignee,
+            "lease_expires_at": outcome.lease_expires_at,
+            "stolen": outcome.stolen,
+        })),
+        Format::Human => {
+            let note = if outcome.stolen {
+                " (took over an expired claim)"
+            } else {
+                ""
+            };
+            println!("Claimed `{}` for `{}`{note}", outcome.id, outcome.assignee);
+            Ok(())
+        }
+    }
+}
+
+/// `release` — drop a claim and return the ticket to the ready pool.
+pub fn release(repo: &Path, fmt: Format, args: &ReleaseArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let released = claim_core::release(&store, &args.id, args.agent.as_deref(), args.force)?;
+    match fmt {
+        Format::Json => {
+            print_json(&json!({ "schema_version": 1, "id": args.id, "released": released }))
+        }
+        Format::Human => {
+            if released {
+                println!("Released `{}`", args.id);
+            } else {
+                println!("Ticket `{}` was not claimed (nothing to release)", args.id);
+            }
+            Ok(())
+        }
+    }
+}
+
 fn ticket_summary(ticket: &Ticket) -> Value {
     json!({
         "id": ticket.id,
@@ -732,5 +776,7 @@ fn ticket_json(ticket: &Ticket) -> Value {
         "scopes": ticket.scopes,
         "paths": ticket.paths,
         "tags": ticket.tags,
+        "assignee": ticket.assignee,
+        "lease_expires_at": ticket.lease_expires_at,
     })
 }

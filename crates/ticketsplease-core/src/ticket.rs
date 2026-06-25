@@ -153,6 +153,10 @@ pub struct Ticket {
     pub paths: Vec<String>,
     /// Free-form tags.
     pub tags: Vec<String>,
+    /// Agent currently holding the claim, if any.
+    pub assignee: Option<String>,
+    /// Claim lease expiry (epoch seconds), if claimed.
+    pub lease_expires_at: Option<u64>,
     doc: Document,
 }
 
@@ -186,6 +190,8 @@ impl Ticket {
             scopes: string_list(y, "scopes"),
             paths: string_list(y, "paths"),
             tags: string_list(y, "tags"),
+            assignee: optional_string(y, "assignee"),
+            lease_expires_at: optional_string(y, "lease_expires_at").and_then(|s| s.parse().ok()),
             doc,
         })
     }
@@ -275,6 +281,33 @@ impl Ticket {
             self.tags.retain(|t| t != tag);
         }
         Ok(changed)
+    }
+
+    /// Record a claim: set status in-progress, assignee, and the lease expiry.
+    pub fn set_claim(&mut self, assignee: &str, lease_expires_at: u64) -> Result<()> {
+        self.set_status(Status::InProgress)?;
+        self.doc.set_scalar("assignee", assignee)?;
+        self.doc
+            .set_scalar("lease_expires_at", &lease_expires_at.to_string())?;
+        self.assignee = Some(assignee.to_string());
+        self.lease_expires_at = Some(lease_expires_at);
+        Ok(())
+    }
+
+    /// Clear a claim: drop assignee + lease and return the ticket to `ready`.
+    pub fn clear_claim(&mut self) -> Result<()> {
+        self.set_status(Status::Ready)?;
+        self.doc.remove_key("assignee");
+        self.doc.remove_key("lease_expires_at");
+        self.assignee = None;
+        self.lease_expires_at = None;
+        Ok(())
+    }
+
+    /// Whether this ticket's claim lease is still live at `now` (epoch seconds).
+    #[must_use]
+    pub fn lease_live(&self, now: u64) -> bool {
+        self.lease_expires_at.is_some_and(|exp| exp > now)
     }
 
     /// Replace the markdown body (frontmatter stays byte-for-byte intact).

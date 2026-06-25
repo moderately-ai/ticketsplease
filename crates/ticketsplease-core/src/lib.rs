@@ -5,6 +5,7 @@
 //! (which requires `cargo` at runtime) lives in the separate `ticketsplease-cargo`
 //! crate and plugs in behind the scheduling/guard core.
 
+pub mod claim;
 pub mod config;
 pub mod error;
 pub mod frontmatter;

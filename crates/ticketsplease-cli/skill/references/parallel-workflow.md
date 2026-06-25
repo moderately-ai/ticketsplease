@@ -10,12 +10,17 @@ while there is ready work:
     if batches is empty: break
     front = batches[0]                       # the immediately-dispatchable disjoint set
     for ticket in front:                     # one worker per ticket, in parallel
-        `ticketsplease set <ticket.id> --status in-progress`
-        dispatch a worker on branch tkt/<ticket.id> scoped to ticket.scopes
+        `ticketsplease claim <ticket.id> --as <worker> --format json`   # exit 6 → already taken, skip
+        dispatch the worker on branch tkt/<ticket.id> scoped to ticket.scopes
     wait for workers; merge each only if its guard passes (below)
+    on success `ticketsplease set <id> --status done`; on abandon `ticketsplease release <id> --as <worker>`
 ```
 
 Why only `batches[0]`? Every member of a single batch is scope-disjoint, so the whole front is safe to run at once. Later batches conflict with the front (they share a scope or a dependency component) and should wait until the front merges and the graph is recomputed.
+
+## Push or pull
+
+The loop above is **push-based**: one orchestrator claims each ticket and hands it out. Because `claim` is atomic (a git-ref compare-and-swap), you can equally run **pull-based** — give every worker the same `tracks`/`ready` output and let each worker `claim` its own pick. Of any workers that race the same ticket, exactly one wins; the losers get exit 6 and simply move to the next ready ticket. No central coordinator, no double-assignment. Prefer this when you have a fleet of interchangeable workers rather than one orchestrator. Always claim *before* doing work, never after — the claim is what reserves the ticket; setting status by hand (`set --status in-progress`) is not race-safe and can let two workers grab one ticket.
 
 ## Branch naming
 
@@ -48,4 +53,4 @@ The guard is the safety net that lets you dispatch aggressively: if two branches
 
 ## One-shot, stateless
 
-Every invocation is independent and offline — there is no daemon and no shared state beyond the git-tracked files. An agent calls `ticketsplease next`, does the work, calls `ticketsplease guard`, sets status, and moves on. This makes the tool safe to drive from a loop and trivial to retry.
+Every invocation is independent and offline — no daemon, and the only shared state is git-tracked: the ticket files plus the claim locks (refs under `refs/ticketsplease/claim/`). An agent calls `ticketsplease claim`/`next`, does the work, calls `ticketsplease guard`, sets status or releases, and moves on. This makes the tool safe to drive from a loop and trivial to retry — a retried or crashed run leaves no corrupt state, and an abandoned claim simply expires on its lease so the ticket returns to the pool.

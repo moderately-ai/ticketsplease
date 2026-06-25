@@ -47,6 +47,10 @@ pub enum Command {
     Tracks(TracksArgs),
     /// Recommend the next ticket(s) to work on.
     Next(NextArgs),
+    /// Atomically claim a ticket for an agent (race-safe, lease-based).
+    Claim(ClaimArgs),
+    /// Release a claimed ticket back to the ready pool.
+    Release(ReleaseArgs),
     /// Explain why two tickets can or cannot run in parallel.
     Why(WhyArgs),
     /// Guard a branch against scope under-declaration and collisions.
@@ -196,6 +200,32 @@ pub struct WhyArgs {
     pub b: String,
 }
 
+/// `claim` arguments.
+#[derive(Args)]
+pub struct ClaimArgs {
+    /// Ticket id to claim.
+    pub id: String,
+    /// Identity of the claiming agent (recorded as the assignee).
+    #[arg(long = "as")]
+    pub agent: String,
+    /// Lease length in seconds; once it expires the claim is reclaimable by others.
+    #[arg(long, default_value_t = ticketsplease_core::claim::DEFAULT_TTL_SECS)]
+    pub ttl: u64,
+}
+
+/// `release` arguments.
+#[derive(Args)]
+pub struct ReleaseArgs {
+    /// Ticket id to release.
+    pub id: String,
+    /// Identity releasing the claim; only the holder may release without --force.
+    #[arg(long = "as")]
+    pub agent: Option<String>,
+    /// Release even if the claim is held by another agent.
+    #[arg(long)]
+    pub force: bool,
+}
+
 /// `guard` arguments.
 #[derive(Args)]
 pub struct GuardArgs {
@@ -267,6 +297,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(_) => commands::tracks(repo, fmt),
         Command::Next(a) => commands::next(repo, fmt, a),
+        Command::Claim(a) => commands::claim(repo, fmt, a),
+        Command::Release(a) => commands::release(repo, fmt, a),
         Command::Why(a) => commands::why(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => commands::migrate(repo, fmt),

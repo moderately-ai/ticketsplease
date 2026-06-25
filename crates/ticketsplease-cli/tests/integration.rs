@@ -305,6 +305,131 @@ fn create_from_batch() {
         .success();
 }
 
+/// Make `repo` a git repo with one commit — the claim lock ref targets HEAD.
+fn git_init_commit(repo: &Path) {
+    git(repo, &["init", "-q", "-b", "main"]);
+    git(
+        repo,
+        &["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+    );
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+}
+
+#[test]
+fn claim_release_and_steal() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+
+    // alice claims -> in-progress -> excluded from the ready pool.
+    tkt(repo)
+        .args(["claim", "t", "--as", "alice"])
+        .assert()
+        .success();
+    assert!(ready_ids(repo).is_empty(), "a claimed ticket is not ready");
+
+    // A live claim blocks others, and a non-holder cannot release it.
+    tkt(repo)
+        .args(["claim", "t", "--as", "bob"])
+        .assert()
+        .code(6);
+    tkt(repo)
+        .args(["release", "t", "--as", "bob"])
+        .assert()
+        .code(6);
+
+    // The holder releases; bob then claims cleanly.
+    tkt(repo)
+        .args(["release", "t", "--as", "alice"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["claim", "t", "--as", "bob"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "t", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(v["assignee"], "bob");
+
+    // An expired lease (ttl 0) is reclaimable: carol takes it over.
+    tkt(repo)
+        .args(["release", "t", "--as", "bob"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["claim", "t", "--as", "dave", "--ttl", "0"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["claim", "t", "--as", "carol", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["assignee"], "carol");
+    assert_eq!(v["stolen"], true, "an expired lease should be stolen");
+}
+
+#[test]
+fn concurrent_claims_have_exactly_one_winner() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().to_path_buf();
+    tkt(&repo).args(["init", "--no-skill"]).assert().success();
+    tkt(&repo)
+        .args(["create", "--id", "hot", "--title", "Hot"])
+        .assert()
+        .success();
+    git_init_commit(&repo);
+
+    // Race many agents at one ticket; git's create-only ref update must let exactly
+    // one win and turn every loser into a clean exit-6 conflict (never a co-winner).
+    let bin = env!("CARGO_BIN_EXE_ticketsplease");
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let repo = repo.clone();
+            let bin = bin.to_string();
+            std::thread::spawn(move || {
+                Proc::new(&bin)
+                    .arg("--repo")
+                    .arg(&repo)
+                    .args(["claim", "hot", "--as", &format!("racer{i}")])
+                    .output()
+                    .unwrap()
+                    .status
+                    .code()
+                    .unwrap_or(-1)
+            })
+        })
+        .collect();
+    let codes: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let winners = codes.iter().filter(|&&c| c == 0).count();
+    let conflicts = codes.iter().filter(|&&c| c == 6).count();
+    assert_eq!(winners, 1, "exactly one claimer must win; got {codes:?}");
+    assert_eq!(
+        winners + conflicts,
+        codes.len(),
+        "every loser must be a clean conflict (exit 6); got {codes:?}"
+    );
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Proc::new("git")
         .arg("-C")

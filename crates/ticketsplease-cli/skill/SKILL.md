@@ -49,7 +49,11 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ```
    Each element of `batches` is a set of tickets that share no scope. Dispatch all members of a single batch to separate workers at the same time — they are guaranteed not to collide.
 
-2. **Per worker**, take one ticket, branch with the ticket id in the name (e.g. `tkt/<id>`), and do the work touching only the ticket's declared scope.
+2. **Per worker, claim the ticket first** — the atomic hand-off that stops two workers grabbing the same one:
+   ```sh
+   ticketsplease claim <id> --as <worker-id> --format json   # exit 6 → already claimed, pick another
+   ```
+   The claim is race-safe (a git-ref compare-and-swap: of N workers racing one ticket, exactly one wins and the rest get exit 6) and carries a lease, so a crashed worker's ticket becomes reclaimable instead of stuck forever. It also flips the ticket to in-progress, so `ready`/`tracks`/`next` stop offering it. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside the ticket's declared scope. This is what makes **pull-based** dispatch safe: many workers can each `claim` straight off the same `tracks`/`ready` pool with no central coordinator handing out assignments.
 
 3. **Before merging, guard the branch:**
    ```sh
@@ -58,7 +62,7 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's declared area; it clears this **pre-merge filter**. (This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
    - Exit `6` → a **declared-area overlap, not a proven conflict.** The JSON says where: `under_declared` lists scopes the branch touched but the ticket never declared; `collisions` lists open tickets whose declared area it overlaps. Resolve by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), coordinating with the named ticket, or — if you own the merge — building+testing the combined result.
 
-4. **Move status as work flows:** `ticketsplease set <id> --status in-progress|review|done`.
+4. **Finish or release.** `claim` already set the ticket in-progress; on completion move it forward with `ticketsplease set <id> --status review|done`. If you abandon the work, `ticketsplease release <id> --as <worker-id>` drops the claim and returns it to the ready pool. Renew a long-running claim by re-running `claim` (it extends your lease).
 
 For a single highest-leverage pick instead of a whole batch:
 ```sh
@@ -86,7 +90,7 @@ ticketsplease lint        # validate schema, links, and cycles (exit 3 / 5 on pr
 
 Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves everything else — custom frontmatter keys, comments, key order, and the markdown body — byte-for-byte. You can also hand-edit ticket files directly; they are just markdown.
 
-Frontmatter schema: `id` (slug, equals the filename), `title`, `status` (todo/ready/in-progress/blocked/review/done), `priority` (p0 highest … p3), `dependencies[]` (ticket ids), `scopes[]` (names from `ticketsplease.toml`), `paths[]` (extra globs), `tags[]`.
+Frontmatter schema: `id` (slug, equals the filename), `title`, `status` (todo/ready/in-progress/blocked/review/done), `priority` (p0 highest … p3), `dependencies[]` (ticket ids), `scopes[]` (names from `ticketsplease.toml`), `paths[]` (extra globs), `tags[]`. Claiming additionally manages `assignee` and `lease_expires_at` (epoch seconds) — leave those to `claim`/`release` rather than editing them by hand.
 
 ## Deeper references
 

@@ -118,6 +118,25 @@ impl Document {
         self.fm.push_str(ending);
     }
 
+    /// Remove a top-level scalar key's line, preserving everything else. Returns
+    /// whether a line was removed (scalars only; for a block value it removes just
+    /// the key line).
+    pub fn remove_key(&mut self, key: &str) -> bool {
+        let mut out = String::with_capacity(self.fm.len());
+        let mut removed = false;
+        for line in self.fm.split_inclusive('\n') {
+            if !removed && is_key_line(line, key) {
+                removed = true;
+            } else {
+                out.push_str(line);
+            }
+        }
+        if removed {
+            self.fm = out;
+        }
+        removed
+    }
+
     /// Surgically set a scalar key's value, preserving everything else. Appends
     /// the key at the end of the frontmatter if absent.
     pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {

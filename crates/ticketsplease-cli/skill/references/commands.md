@@ -80,6 +80,19 @@ The single highest-scored dispatchable ticket, or N mutually conflict-free picks
 
 JSON: `{ "schema_version", "picks": [ {id,title,status,priority,scopes,score} ] }`.
 
+## claim / release
+
+```
+ticketsplease claim <id> --as <worker> [--ttl <secs>]      # default ttl 3600
+ticketsplease release <id> [--as <worker>] [--force]
+```
+`claim` atomically takes a ticket for a worker and marks it in-progress. Atomicity is a git-ref compare-and-swap (`refs/ticketsplease/claim/<id>` created with `git update-ref`'s create-only mode): of N workers racing one ticket, exactly one wins and the rest get **exit 6**. The claim records `assignee` + `lease_expires_at` in the frontmatter; once the lease expires the ticket is reclaimable, so a crashed worker does not strand it (the next claimer takes over with `"stolen": true`). Re-claiming as the same worker extends the lease. Only todo/ready/in-progress tickets are claimable (else exit 3). The lock lives in `.git`, coordinating across worktrees and a single checkout offline.
+
+`release` drops the claim and returns the ticket to `ready`. Without `--force`, only the recorded holder may release (a non-holder gets exit 6); releasing an unclaimed ticket is a no-op success.
+
+claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool }`.
+release JSON: `{ "schema_version", "id", "released": bool }`.
+
 ## guard
 
 ```
