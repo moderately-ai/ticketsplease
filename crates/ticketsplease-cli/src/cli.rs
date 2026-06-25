@@ -47,6 +47,8 @@ pub enum Command {
     Tracks(TracksArgs),
     /// Recommend the next ticket(s) to work on.
     Next(NextArgs),
+    /// Explain why two tickets can or cannot run in parallel.
+    Why(WhyArgs),
     /// Guard a branch against scope under-declaration and collisions.
     Guard(GuardArgs),
     /// Lint and validate all tickets.
@@ -180,6 +182,15 @@ pub struct NextArgs {
     pub parallel: usize,
 }
 
+/// `why` arguments.
+#[derive(Args)]
+pub struct WhyArgs {
+    /// First ticket id.
+    pub a: String,
+    /// Second ticket id.
+    pub b: String,
+}
+
 /// `guard` arguments.
 #[derive(Args)]
 pub struct GuardArgs {
@@ -251,6 +262,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(_) => commands::tracks(repo, fmt),
         Command::Next(a) => commands::next(repo, fmt, a),
+        Command::Why(a) => commands::why(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => commands::migrate(repo, fmt),
         Command::Skill(a) => match &a.command {

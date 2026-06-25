@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
+
 use crate::error::{Error, Result};
 use crate::lint::Diagnostic;
 use crate::ticket::{Priority, Ticket};
@@ -210,6 +212,54 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
         });
     }
     out
+}
+
+/// Why two tickets can (or cannot) share a parallel batch — the same criteria
+/// `tracks` uses, surfaced for explainability (`tkt why`).
+#[derive(Debug, Clone, Serialize)]
+pub struct Why {
+    /// First ticket id.
+    pub a: String,
+    /// Second ticket id.
+    pub b: String,
+    /// Scopes both tickets declare (a shared-scope conflict).
+    pub shared_scopes: Vec<String>,
+    /// Whether they sit in the same weakly-connected dependency component.
+    pub same_dependency_component: bool,
+    /// True if either criterion holds — they cannot run in the same batch.
+    pub conflict: bool,
+}
+
+/// Explain the scheduling relationship between two tickets.
+pub fn why(tickets: &[Ticket], a_id: &str, b_id: &str) -> Result<Why> {
+    let by_id: BTreeMap<&str, &Ticket> = tickets.iter().map(|t| (t.id.as_str(), t)).collect();
+    let a = by_id
+        .get(a_id)
+        .ok_or_else(|| Error::NotFound(a_id.to_string()))?;
+    let b = by_id
+        .get(b_id)
+        .ok_or_else(|| Error::NotFound(b_id.to_string()))?;
+
+    let a_scopes: BTreeSet<&str> = a.scopes.iter().map(String::as_str).collect();
+    let shared_scopes: Vec<String> = b
+        .scopes
+        .iter()
+        .filter(|s| a_scopes.contains(s.as_str()))
+        .cloned()
+        .collect();
+
+    let comp = components(tickets);
+    let same_dependency_component =
+        a_id != b_id && comp.get(a_id).copied() == comp.get(b_id).copied();
+
+    let conflict = !shared_scopes.is_empty() || same_dependency_component;
+    Ok(Why {
+        a: a_id.to_string(),
+        b: b_id.to_string(),
+        shared_scopes,
+        same_dependency_component,
+        conflict,
+    })
 }
 
 // --- internal graph helpers -------------------------------------------------
@@ -424,6 +474,32 @@ mod tests {
         ];
         let picks = next(&tickets, 1).unwrap();
         assert_eq!(picks[0].ticket.id, "b");
+    }
+
+    #[test]
+    fn why_explains_shared_scope_and_disjoint() {
+        let tickets = vec![
+            t("a", "todo", "p1", &[], &["core"]),
+            t("b", "todo", "p1", &[], &["core"]),
+            t("c", "todo", "p1", &[], &["io"]),
+        ];
+        let shared = why(&tickets, "a", "b").unwrap();
+        assert!(shared.conflict);
+        assert_eq!(shared.shared_scopes, vec!["core"]);
+        assert!(!why(&tickets, "a", "c").unwrap().conflict);
+        assert!(why(&tickets, "a", "ghost").is_err());
+    }
+
+    #[test]
+    fn why_explains_dependency_component() {
+        let tickets = vec![
+            t("a", "todo", "p1", &["b"], &["x"]),
+            t("b", "todo", "p1", &[], &["y"]),
+        ];
+        let w = why(&tickets, "a", "b").unwrap();
+        assert!(w.conflict);
+        assert!(w.same_dependency_component);
+        assert!(w.shared_scopes.is_empty());
     }
 
     #[test]

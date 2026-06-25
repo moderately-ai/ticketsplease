@@ -15,7 +15,7 @@ use ticketsplease_core::{
 
 use crate::cli::{
     CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SelfUpdateArgs, SetArgs,
-    ShowArgs, SkillInstallArgs,
+    ShowArgs, SkillInstallArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -582,6 +582,46 @@ fn read_text(path: &str) -> Result<String> {
     } else {
         std::fs::read_to_string(path)
             .map_err(|e| Error::Invalid(format!("cannot read {path}: {e}")))
+    }
+}
+
+/// `why` — explain whether two tickets can run in parallel, and if not, why.
+pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let tickets = store.load_all()?;
+    let w = schedule::why(&tickets, &args.a, &args.b)?;
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "a": w.a,
+            "b": w.b,
+            "conflict": w.conflict,
+            "shared_scopes": w.shared_scopes,
+            "same_dependency_component": w.same_dependency_component,
+        })),
+        Format::Human => {
+            if w.conflict {
+                let mut reasons = Vec::new();
+                if !w.shared_scopes.is_empty() {
+                    reasons.push(format!("shared scope(s): {}", w.shared_scopes.join(", ")));
+                }
+                if w.same_dependency_component {
+                    reasons.push("same dependency component".to_string());
+                }
+                println!(
+                    "`{}` and `{}` cannot share a batch — {}.",
+                    w.a,
+                    w.b,
+                    reasons.join("; ")
+                );
+            } else {
+                println!(
+                    "`{}` and `{}` do not conflict — they can run in parallel.",
+                    w.a, w.b
+                );
+            }
+            Ok(())
+        }
     }
 }
 
