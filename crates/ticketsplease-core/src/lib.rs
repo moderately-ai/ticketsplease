@@ -8,6 +8,7 @@
 pub mod config;
 pub mod error;
 pub mod frontmatter;
+pub mod guard;
 pub mod lint;
 pub mod schedule;
 pub mod store;

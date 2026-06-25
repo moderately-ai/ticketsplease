@@ -4,12 +4,17 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
+use ticketsplease_cargo::CargoMapper;
+use ticketsplease_core::config::Backend;
+use ticketsplease_core::guard;
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::{
     lint as lint_core, schedule, Error, Priority, Result, Status, Store, Ticket,
 };
 
-use crate::cli::{CreateArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SetArgs, ShowArgs};
+use crate::cli::{
+    CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SetArgs, ShowArgs,
+};
 use crate::format::{print_json, Format};
 
 /// `init` — scaffold the tickets directory and config.
@@ -329,6 +334,115 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// `guard` — reconcile a branch's actual diff against its ticket's declared scopes.
+pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let all = store.load_all()?;
+    let base = args
+        .base
+        .clone()
+        .unwrap_or_else(|| store.config.default_base.clone());
+    let target_id = resolve_ticket(args, &all)?;
+    let target = all
+        .iter()
+        .find(|t| t.id == target_id)
+        .ok_or_else(|| Error::NotFound(target_id.clone()))?;
+
+    let diff = guard::BranchDiff::compute(repo, &base, &args.branch)?;
+
+    let path_mapper = guard::PathGlobMapper::new(&store.config)?;
+    let cargo_mapper = if store.config.language.backend == Backend::Rust {
+        Some(CargoMapper::new(repo, &store.config.scope_crates))
+    } else {
+        None
+    };
+    let mut mappers: Vec<&dyn guard::AffectedSetMapper> = vec![&path_mapper];
+    if let Some(cm) = &cargo_mapper {
+        mappers.push(cm);
+    }
+
+    let report = guard::evaluate(target, &all, diff, &mappers)?;
+
+    match fmt {
+        Format::Json => {
+            let mut value = serde_json::to_value(&report)
+                .map_err(|e| Error::Internal(format!("serializing guard report: {e}")))?;
+            if let Value::Object(ref mut map) = value {
+                map.insert("schema_version".to_string(), json!(1));
+            }
+            print_json(&value)?;
+        }
+        Format::Human => print_guard_human(&report),
+    }
+
+    if report.conflict {
+        Err(Error::Conflict(format!(
+            "branch `{}` escapes ticket `{}`'s declared scopes or collides with an open ticket",
+            report.branch, report.ticket
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_ticket(args: &GuardArgs, all: &[Ticket]) -> Result<String> {
+    if let Some(id) = &args.ticket {
+        return Ok(id.clone());
+    }
+    let mut best: Option<&str> = None;
+    for t in all {
+        if args.branch.contains(t.id.as_str()) {
+            let better = match best {
+                Some(b) => t.id.len() > b.len(),
+                None => true,
+            };
+            if better {
+                best = Some(t.id.as_str());
+            }
+        }
+    }
+    best.map(str::to_string).ok_or_else(|| {
+        Error::NotFound(format!(
+            "no ticket inferred from branch `{}` (pass --ticket)",
+            args.branch
+        ))
+    })
+}
+
+fn print_guard_human(report: &guard::GuardReport) {
+    println!(
+        "ticket {}  ({}...{})",
+        report.ticket, report.base, report.branch
+    );
+    println!("  changed files:   {}", report.changed_files.len());
+    println!(
+        "  affected scopes: {}",
+        join_or_none(&report.affected_scopes)
+    );
+    println!(
+        "  declared scopes: {}",
+        join_or_none(&report.declared_scopes)
+    );
+    if !report.under_declared.is_empty() {
+        println!("  UNDER-DECLARED:  {}", report.under_declared.join(", "));
+    }
+    for c in &report.collisions {
+        println!("  COLLISION with `{}`: {}", c.ticket, c.scopes.join(", "));
+    }
+    println!(
+        "  verdict: {}",
+        if report.conflict { "CONFLICT" } else { "ok" }
+    );
+}
+
+fn join_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_string()
+    } else {
+        items.join(", ")
     }
 }
 

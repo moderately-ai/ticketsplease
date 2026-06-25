@@ -160,6 +160,19 @@ pub struct NextArgs {
     pub parallel: usize,
 }
 
+/// `guard` arguments.
+#[derive(Args)]
+pub struct GuardArgs {
+    /// Branch (or ref) to guard.
+    pub branch: String,
+    /// Base ref to diff against (defaults to the config `default_base`).
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Explicit ticket id (otherwise inferred from the branch name).
+    #[arg(long)]
+    pub ticket: Option<String>,
+}
+
 // Commands implemented in later milestones keep placeholder argument structs.
 macro_rules! empty_args {
     ($($name:ident),* $(,)?) => {
@@ -171,14 +184,7 @@ macro_rules! empty_args {
     };
 }
 
-empty_args!(
-    ReadyArgs,
-    TracksArgs,
-    GuardArgs,
-    LintArgs,
-    MigrateArgs,
-    SelfUpdateArgs,
-);
+empty_args!(ReadyArgs, TracksArgs, LintArgs, MigrateArgs, SelfUpdateArgs,);
 
 /// `skill` subcommand group.
 #[derive(Args)]
@@ -213,7 +219,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(_) => commands::tracks(repo, fmt),
         Command::Next(a) => commands::next(repo, fmt, a),
-        Command::Guard(_) => not_implemented("guard"),
+        Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => not_implemented("migrate"),
         Command::Skill(a) => match &a.command {
             SkillCommand::Install(_) => not_implemented("skill install"),
