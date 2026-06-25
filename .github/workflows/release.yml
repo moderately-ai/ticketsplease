@@ -7,13 +7,20 @@ on:
 permissions:
   contents: write
 
-env:
-  # LTO at release time only (per ~/.claude-work/rules/rust.md): inflates
-  # intermediate bitcode for no local benefit, so it lives here, not in Cargo.toml.
-  CARGO_PROFILE_RELEASE_LTO: fat
-
 jobs:
+  # Create the GitHub Release first; the matrix below uploads assets to it.
+  # (upload-rust-binary-action attaches to an existing release, it does not
+  # create one — without this job every matrix job fails with "release not found".)
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   upload:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -27,8 +34,12 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
+    env:
+      # LTO at release time only (per ~/.claude-work/rules/rust.md): inflates
+      # intermediate bitcode for no local benefit, so it lives here, not in Cargo.toml.
+      CARGO_PROFILE_RELEASE_LTO: fat
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build and upload static binary
         uses: taiki-e/upload-rust-binary-action@v1
         with:
