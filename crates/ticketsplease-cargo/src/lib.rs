@@ -105,6 +105,39 @@ impl AffectedSetMapper for CargoMapper {
     }
 }
 
+/// A workspace member, for seeding scope config on `init`.
+pub struct WorkspaceMember {
+    /// Crate name.
+    pub name: String,
+    /// Crate directory relative to the workspace root (empty for a root crate).
+    pub rel_dir: String,
+}
+
+/// List the workspace members (name + relative dir), sorted by name. Runs
+/// `cargo metadata`, so it requires `cargo` on `PATH`.
+pub fn workspace_members(repo: &Path) -> Result<Vec<WorkspaceMember>> {
+    let graph = MetadataCommand::new()
+        .current_dir(repo)
+        .build_graph()
+        .map_err(|e| Error::Invalid(format!("cargo metadata failed: {e}")))?;
+    let workspace = graph.workspace();
+    let root = workspace.root();
+    let mut out = Vec::new();
+    for pkg in workspace.iter() {
+        let dir = pkg.manifest_path().parent().unwrap_or(root);
+        let rel = dir
+            .strip_prefix(root)
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default();
+        out.push(WorkspaceMember {
+            name: pkg.name().to_string(),
+            rel_dir: rel,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
 fn file_under(file: &str, crate_rel_dir: &str) -> bool {
     if crate_rel_dir.is_empty() {
         // A crate rooted at the workspace root owns anything not under a sub-crate.

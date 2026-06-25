@@ -148,12 +148,17 @@ pub struct InitOutcome {
 
 /// Scaffold a repository: create the tickets directory and (unless one exists) a
 /// templated `ticketsplease.toml`. Idempotent unless `force`.
-pub fn init_repo(repo_root: &Path, tickets_dir: &str, force: bool) -> Result<InitOutcome> {
+pub fn init_repo(
+    repo_root: &Path,
+    tickets_dir: &str,
+    config_body: &str,
+    force: bool,
+) -> Result<InitOutcome> {
     let dir = repo_root.join(tickets_dir);
     fs::create_dir_all(&dir).map_err(Error::Io)?;
     let config_path = repo_root.join(CONFIG_FILE);
     let wrote_config = if force || !config_path.exists() {
-        write_atomic(&config_path, &config_template(tickets_dir))?;
+        write_atomic(&config_path, config_body)?;
         true
     } else {
         false
@@ -187,7 +192,9 @@ pub fn slugify(title: &str) -> String {
     }
 }
 
-fn config_template(tickets_dir: &str) -> String {
+/// The default `ticketsplease.toml` body (path-glob backend, commented examples).
+#[must_use]
+pub fn default_config_template(tickets_dir: &str) -> String {
     format!(
         "schema_version = 1\n\
          tickets_dir = \"{tickets_dir}\"\n\

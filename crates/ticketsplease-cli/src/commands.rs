@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use serde_json::{json, Value};
-use ticketsplease_cargo::CargoMapper;
+use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::config::Backend;
 use ticketsplease_core::guard;
 use ticketsplease_core::store::{self, CreateOutcome};
@@ -21,7 +21,8 @@ use crate::skill;
 
 /// `init` — scaffold the tickets directory and config.
 pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
-    let outcome = store::init_repo(repo, &args.dir, args.force)?;
+    let config_body = build_config(repo, &args.dir);
+    let outcome = store::init_repo(repo, &args.dir, &config_body, args.force)?;
     let dir = outcome.tickets_dir.display().to_string();
     let skill_path = if args.no_skill {
         None
@@ -472,6 +473,41 @@ fn join_or_none(items: &[String]) -> String {
     } else {
         items.join(", ")
     }
+}
+
+/// Build the config body for `init`: a Rust-seeded config when a cargo workspace
+/// is detected, otherwise the default path-glob template. A cargo-metadata failure
+/// falls back to the default rather than failing init.
+fn build_config(repo: &Path, tickets_dir: &str) -> String {
+    if repo.join("Cargo.toml").exists() {
+        if let Ok(members) = workspace_members(repo) {
+            if !members.is_empty() {
+                return build_rust_config(tickets_dir, &members);
+            }
+        }
+    }
+    store::default_config_template(tickets_dir)
+}
+
+fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
+    let mut s = format!(
+        "schema_version = 1\ntickets_dir = \"{tickets_dir}\"\ndefault_base = \"main\"\n\n\
+         [language]\n# Auto-detected a cargo workspace; the guard expands a changed crate\n\
+         # through the cargo reverse-dependency graph.\nbackend = \"rust\"\n\n[scopes]\n"
+    );
+    for m in members {
+        let glob = if m.rel_dir.is_empty() {
+            "src/**".to_string()
+        } else {
+            format!("{}/**", m.rel_dir)
+        };
+        s.push_str(&format!("\"{}\" = [\"{glob}\"]\n", m.name));
+    }
+    s.push_str("\n[scope_crates]\n");
+    for m in members {
+        s.push_str(&format!("\"{}\" = \"{}\"\n", m.name, m.name));
+    }
+    s
 }
 
 fn ticket_summary(ticket: &Ticket) -> Value {

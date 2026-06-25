@@ -1,7 +1,7 @@
 ---
 id: init-rust-autodetect
 title: Auto-detect Rust workspace in init and seed scopes
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [cli]
