@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::config::Backend;
@@ -83,13 +84,20 @@ pub fn self_update(fmt: Format, args: &SelfUpdateArgs) -> Result<()> {
 /// `create` — write a new ticket (idempotent with an explicit `--id`).
 pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let store = Store::open(repo)?;
+    if let Some(from) = &args.from {
+        return create_batch(&store, fmt, from);
+    }
+    let title = args
+        .title
+        .as_deref()
+        .ok_or_else(|| Error::Invalid("provide --title or --from".into()))?;
     let status: Status = args.status.parse()?;
     let priority: Priority = args.priority.parse()?;
 
     let build = |id: &str| -> Result<String> {
         Ticket::new(
             id,
-            &args.title,
+            title,
             status,
             priority,
             &args.depends_on,
@@ -105,7 +113,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
         let contents = build(id)?;
         (id.clone(), store.create_exact(id, &contents)?)
     } else {
-        let base = store::slugify(&args.title);
+        let base = store::slugify(title);
         (store.create_unique(&base, build)?, CreateOutcome::Created)
     };
 
@@ -121,6 +129,78 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
                 CreateOutcome::Created => println!("Created ticket `{id}`"),
                 CreateOutcome::Unchanged => println!("Ticket `{id}` already exists (unchanged)"),
             }
+            Ok(())
+        }
+    }
+}
+
+/// One element of a `create --from` batch.
+#[derive(Deserialize)]
+struct TicketSpec {
+    title: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default, alias = "dependencies")]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    body: String,
+}
+
+/// Batch-create from a JSON array of specs (file path, or `-` for stdin). Each
+/// ticket is written atomically; an explicit `id` makes that element idempotent.
+fn create_batch(store: &Store, fmt: Format, from: &str) -> Result<()> {
+    let raw = read_text(from)?;
+    let specs: Vec<TicketSpec> = serde_json::from_str(&raw).map_err(|e| {
+        Error::Invalid(format!(
+            "invalid --from JSON (expected an array of ticket specs): {e}"
+        ))
+    })?;
+
+    let mut created = Vec::new();
+    for spec in &specs {
+        let status: Status = spec.status.as_deref().unwrap_or("todo").parse()?;
+        let priority: Priority = spec.priority.as_deref().unwrap_or("p2").parse()?;
+        let build = |id: &str| -> Result<String> {
+            Ticket::new(
+                id,
+                &spec.title,
+                status,
+                priority,
+                &spec.depends_on,
+                &spec.scopes,
+                &spec.paths,
+                &spec.tags,
+                &spec.body,
+            )
+            .map(|t| t.render())
+        };
+        let id = if let Some(id) = &spec.id {
+            store.create_exact(id, &build(id)?)?;
+            id.clone()
+        } else {
+            store.create_unique(&store::slugify(&spec.title), build)?
+        };
+        created.push(id);
+    }
+
+    match fmt {
+        Format::Json => print_json(&json!({ "schema_version": 1, "created": created })),
+        Format::Human => {
+            println!(
+                "Created {} ticket(s): {}",
+                created.len(),
+                created.join(", ")
+            );
             Ok(())
         }
     }

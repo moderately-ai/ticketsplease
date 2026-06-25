@@ -263,6 +263,48 @@ fn set_body_from_file_and_remove_tag() {
     );
 }
 
+#[test]
+fn create_from_batch() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    let specs = r#"[
+      {"id":"a","title":"A","priority":"p1","scopes":["core"]},
+      {"id":"b","title":"B","depends_on":["a"],"scopes":["io"],"body":"spec for b"}
+    ]"#;
+    let path = repo.join("backlog.json");
+    std::fs::write(&path, specs).unwrap();
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let out = tkt(repo)
+        .args(["list", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"a") && ids.contains(&"b"));
+
+    let show = tkt(repo).args(["show", "b"]).output().unwrap();
+    let text = String::from_utf8(show.stdout).unwrap();
+    assert!(text.contains("spec for b"));
+    assert!(text.contains("dependencies: [a]"));
+
+    // Explicit ids make a re-run idempotent (no error, no duplicates).
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Proc::new("git")
         .arg("-C")

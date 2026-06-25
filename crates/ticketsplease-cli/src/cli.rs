@@ -77,10 +77,15 @@ pub struct InitArgs {
 
 /// `create` arguments.
 #[derive(Args)]
+#[command(group = ArgGroup::new("create_input").required(true).multiple(false).args(["title", "from"]))]
 pub struct CreateArgs {
-    /// Ticket title.
+    /// Ticket title (single create). Mutually exclusive with --from.
     #[arg(long)]
-    pub title: String,
+    pub title: Option<String>,
+    /// Batch-create from a JSON array of ticket specs; `-` reads stdin. Each element:
+    /// `{title, id?, status?, priority?, depends_on?, scopes?, paths?, tags?, body?}`.
+    #[arg(long)]
+    pub from: Option<String>,
     /// Explicit id (slug); defaults to a slug of the title.
     #[arg(long)]
     pub id: Option<String>,

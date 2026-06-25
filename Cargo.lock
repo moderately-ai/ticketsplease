@@ -711,6 +711,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "include_dir",
+ "serde",
  "serde_json",
  "tempfile",
  "ticketsplease-cargo",
