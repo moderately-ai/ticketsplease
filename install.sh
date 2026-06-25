@@ -62,20 +62,25 @@ verify() {
 main() {
   target="$(detect_target)"
   asset="${BIN_NAME}-${target}.tar.gz"
+  # The release workflow names the checksum after the archive base name
+  # (ticketsplease-<target>.sha256), not "<asset>.tar.gz.sha256".
+  sum="${BIN_NAME}-${target}.sha256"
   if [ "$TICKETSPLEASE_VERSION" = "latest" ]; then
     base="https://github.com/${REPO}/releases/latest/download"
   else
     base="https://github.com/${REPO}/releases/download/${TICKETSPLEASE_VERSION}"
   fi
   url="${base}/${asset}"
+  sum_url="${base}/${sum}"
 
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
   err "Downloading ${url}"
   download "$url" "${tmp}/${asset}"
-  if download "${url}.sha256" "${tmp}/${asset}.sha256" 2>/dev/null; then
-    verify "${tmp}/${asset}" "${tmp}/${asset}.sha256"
+  if download "$sum_url" "${tmp}/${sum}" 2>/dev/null; then
+    verify "${tmp}/${asset}" "${tmp}/${sum}"
+    err "Checksum verified."
   else
     err "warning: no published checksum; skipping verification"
   fi
