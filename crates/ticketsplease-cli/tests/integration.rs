@@ -162,6 +162,34 @@ fn guard_flags_under_declaration_then_clears() {
         .success();
 }
 
+#[test]
+fn json_output_is_byte_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "x"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "y"])
+        .assert()
+        .success();
+
+    let run = || {
+        tkt(repo)
+            .args(["tracks", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    assert_eq!(
+        run(),
+        run(),
+        "json output must be byte-identical across runs (R13)"
+    );
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Proc::new("git")
         .arg("-C")
