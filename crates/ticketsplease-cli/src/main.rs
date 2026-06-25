@@ -1,6 +1,7 @@
 //! ticketsplease — git-native parallel-work ticketing CLI.
 
 mod cli;
+mod commands;
 mod format;
 
 use std::process::ExitCode;

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use ticketsplease_core::Result;
 
+use crate::commands;
 use crate::format::Format;
 
 /// Top-level CLI.
@@ -58,8 +59,100 @@ pub enum Command {
     SelfUpdate(SelfUpdateArgs),
 }
 
-// Argument structs are intentionally empty in the scaffold; each is fleshed out
-// when its command is implemented in the corresponding milestone.
+/// `init` arguments.
+#[derive(Args)]
+pub struct InitArgs {
+    /// Tickets directory to create (relative to the repo root).
+    #[arg(long, default_value = "tickets")]
+    pub dir: String,
+    /// Overwrite an existing config file.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// `create` arguments.
+#[derive(Args)]
+pub struct CreateArgs {
+    /// Ticket title.
+    #[arg(long)]
+    pub title: String,
+    /// Explicit id (slug); defaults to a slug of the title.
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Status: todo | ready | in-progress | blocked | review | done.
+    #[arg(long, default_value = "todo")]
+    pub status: String,
+    /// Priority: p0 | p1 | p2 | p3.
+    #[arg(long, default_value = "p2")]
+    pub priority: String,
+    /// Dependency ticket ids (repeatable or comma-separated).
+    #[arg(long = "depends-on", value_delimiter = ',')]
+    pub depends_on: Vec<String>,
+    /// Declared scope names (repeatable or comma-separated).
+    #[arg(long = "scope", value_delimiter = ',')]
+    pub scopes: Vec<String>,
+    /// Explicit path globs (repeatable or comma-separated).
+    #[arg(long = "path", value_delimiter = ',')]
+    pub paths: Vec<String>,
+    /// Tags (repeatable or comma-separated).
+    #[arg(long = "tag", value_delimiter = ',')]
+    pub tags: Vec<String>,
+    /// Markdown body.
+    #[arg(long, default_value = "")]
+    pub body: String,
+}
+
+/// `set` arguments.
+#[derive(Args)]
+pub struct SetArgs {
+    /// Ticket id.
+    pub id: String,
+    /// New status.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// New priority.
+    #[arg(long)]
+    pub priority: Option<String>,
+    /// Scopes to add (repeatable or comma-separated).
+    #[arg(long = "add-scope", value_delimiter = ',')]
+    pub add_scope: Vec<String>,
+    /// Scopes to remove (repeatable or comma-separated).
+    #[arg(long = "remove-scope", value_delimiter = ',')]
+    pub remove_scope: Vec<String>,
+    /// Tags to add (repeatable or comma-separated).
+    #[arg(long = "add-tag", value_delimiter = ',')]
+    pub add_tag: Vec<String>,
+}
+
+/// `link` arguments.
+#[derive(Args)]
+pub struct LinkArgs {
+    /// Ticket that gains (or loses) a dependency.
+    pub id: String,
+    /// The dependency target id.
+    #[arg(long = "depends-on")]
+    pub depends_on: String,
+    /// Remove the link instead of adding it.
+    #[arg(long)]
+    pub remove: bool,
+}
+
+/// `show` arguments.
+#[derive(Args)]
+pub struct ShowArgs {
+    /// Ticket id.
+    pub id: String,
+}
+
+/// `list` arguments.
+#[derive(Args)]
+pub struct ListArgs {
+    /// Filter by status.
+    #[arg(long)]
+    pub status: Option<String>,
+}
+
+// Commands implemented in later milestones keep placeholder argument structs.
 macro_rules! empty_args {
     ($($name:ident),* $(,)?) => {
         $(
@@ -71,12 +164,6 @@ macro_rules! empty_args {
 }
 
 empty_args!(
-    InitArgs,
-    CreateArgs,
-    SetArgs,
-    LinkArgs,
-    ShowArgs,
-    ListArgs,
     ReadyArgs,
     TracksArgs,
     NextArgs,
@@ -100,26 +187,28 @@ pub enum SkillCommand {
     Install(SkillInstallArgs),
 }
 
-/// Placeholder arguments for `skill install`.
+/// `skill install` arguments.
 #[derive(Args)]
 pub struct SkillInstallArgs {}
 
 /// Dispatch a parsed CLI invocation.
 pub fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Init(_) => not_implemented("init"),
-        Command::Create(_) => not_implemented("create"),
-        Command::Set(_) => not_implemented("set"),
-        Command::Link(_) => not_implemented("link"),
-        Command::Show(_) => not_implemented("show"),
-        Command::List(_) => not_implemented("list"),
+    let repo = cli.repo.as_path();
+    let fmt = cli.format;
+    match &cli.command {
+        Command::Init(a) => commands::init(repo, fmt, a),
+        Command::Create(a) => commands::create(repo, fmt, a),
+        Command::Set(a) => commands::set(repo, fmt, a),
+        Command::Link(a) => commands::link(repo, fmt, a),
+        Command::Show(a) => commands::show(repo, fmt, a),
+        Command::List(a) => commands::list(repo, fmt, a),
+        Command::Lint(_) => commands::lint(repo, fmt),
         Command::Ready(_) => not_implemented("ready"),
         Command::Tracks(_) => not_implemented("tracks"),
         Command::Next(_) => not_implemented("next"),
         Command::Guard(_) => not_implemented("guard"),
-        Command::Lint(_) => not_implemented("lint"),
         Command::Migrate(_) => not_implemented("migrate"),
-        Command::Skill(args) => match args.command {
+        Command::Skill(a) => match &a.command {
             SkillCommand::Install(_) => not_implemented("skill install"),
         },
         Command::SelfUpdate(_) => not_implemented("self-update"),

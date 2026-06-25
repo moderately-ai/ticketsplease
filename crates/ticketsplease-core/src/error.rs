@@ -19,6 +19,9 @@ pub enum Error {
     /// The guard found a scope under-declaration or collision.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// An unexpected internal failure.
+    #[error("internal error: {0}")]
+    Internal(String),
     /// Underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -36,6 +39,7 @@ impl Error {
             Error::NotFound(_) => 4,
             Error::Cycle(_) => 5,
             Error::Conflict(_) => 6,
+            Error::Internal(_) => 1,
             Error::Io(_) => 1,
         }
     }

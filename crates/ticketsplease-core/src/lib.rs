@@ -7,5 +7,11 @@
 
 pub mod config;
 pub mod error;
+pub mod frontmatter;
+pub mod lint;
+pub mod store;
+pub mod ticket;
 
 pub use error::{Error, Result};
+pub use store::Store;
+pub use ticket::{Priority, Status, Ticket};
