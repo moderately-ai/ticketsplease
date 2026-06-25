@@ -1,0 +1,23 @@
+schema_version = 1
+tickets_dir = "tickets"
+default_base = "main"
+
+[language]
+# ticketsplease dogfoods itself: the Rust backend expands a changed crate through
+# the cargo reverse-dependency graph when guarding a branch.
+backend = "rust"
+
+# Abstract scope names -> path globs. Tickets reference these stable names.
+[scopes]
+"core" = ["crates/ticketsplease-core/**"]
+"cargo-backend" = ["crates/ticketsplease-cargo/**"]
+"cli" = ["crates/ticketsplease-cli/**"]
+"skill" = ["crates/ticketsplease-cli/skill/**"]
+"dist" = ["install.sh", ".github/**"]
+"docs" = ["README.md"]
+
+# Scope -> owning crate, so the guard flags a crate's reverse-dependents.
+[scope_crates]
+"core" = "ticketsplease-core"
+"cargo-backend" = "ticketsplease-cargo"
+"cli" = "ticketsplease-cli"
