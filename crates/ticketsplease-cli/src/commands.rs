@@ -516,6 +516,12 @@ fn print_guard_human(report: &guard::GuardReport) {
         "  verdict: {}",
         if report.conflict { "CONFLICT" } else { "ok" }
     );
+    if report.conflict {
+        println!(
+            "  note: a declared-area overlap, not a proven merge conflict — declare/narrow scope, \
+             coordinate with the listed ticket(s), or build+test the merged result before merging."
+        );
+    }
 }
 
 fn join_or_none(items: &[String]) -> String {

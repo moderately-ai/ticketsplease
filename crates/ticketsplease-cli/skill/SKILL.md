@@ -26,7 +26,7 @@ When several agents work a repo in parallel, the failure mode is two of them edi
   | 3 | invalid / dirty (malformed ticket, failed lint) |
   | 4 | ticket not found |
   | 5 | dependency cycle |
-  | 6 | **conflict** — guard found an under-declared scope or a collision |
+  | 6 | **conflict** — guard found a declared-area overlap (an under-declared scope, or collision with an open ticket). A conservative pre-merge filter, *not* a proof of merge conflict. |
 
 - Output is deterministic (sorted, no timestamps) — safe to diff and cache.
 - Every command accepts `--repo <path>` (default the current directory). Operations are fully offline and atomic.
@@ -55,8 +55,8 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ```sh
    ticketsplease guard tkt/<id> --format json   # exit 6 → do not merge
    ```
-   - Exit `0` → the diff stays within the declared scope and collides with no open ticket; safe to merge.
-   - Exit `6` → the JSON shows why: `under_declared` lists scopes the branch touched but the ticket never declared; `collisions` lists open tickets it overlaps. Resolve by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), or picking different work.
+   - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's declared area; it clears this **pre-merge filter**. (This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
+   - Exit `6` → a **declared-area overlap, not a proven conflict.** The JSON says where: `under_declared` lists scopes the branch touched but the ticket never declared; `collisions` lists open tickets whose declared area it overlaps. Resolve by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), coordinating with the named ticket, or — if you own the merge — building+testing the combined result.
 
 4. **Move status as work flows:** `ticketsplease set <id> --status in-progress|review|done`.
 
@@ -70,6 +70,7 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 
 - `ticketsplease ready` — dependency-satisfied tickets, priority-ordered (a ticket is ready when its status is todo/ready and every dependency is done).
 - `ticketsplease tracks` — conflict-free parallel batches (the headline feature).
+- `ticketsplease why <a> <b>` — explain whether two tickets can co-run, and if not, the exact reason (shared scope and/or same dependency component). Use it when the scheduler's grouping is surprising.
 - `ticketsplease next [--parallel N]` — scored recommendation(s); the score favours priority, critical-path position, and how much downstream work the ticket unblocks.
 - `ticketsplease list [--status <s>]`, `ticketsplease show <id>`.
 
