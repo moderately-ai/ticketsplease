@@ -1,7 +1,7 @@
 ---
 id: self-update
 title: self-update command
-status: todo
+status: done
 priority: p2
 dependencies: [release-ci]
 scopes: [cli]

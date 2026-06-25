@@ -66,6 +66,26 @@ impl Document {
         }
     }
 
+    /// Whether the frontmatter has a top-level key `key`.
+    #[must_use]
+    pub fn has_key(&self, key: &str) -> bool {
+        self.fm.split_inclusive('\n').any(|l| is_key_line(l, key))
+    }
+
+    /// Append `key: []` when the key is absent (used by migrations to back-fill).
+    pub fn ensure_empty_list(&mut self, key: &str) {
+        if self.has_key(key) {
+            return;
+        }
+        let ending = self.default_ending();
+        if !self.fm.is_empty() && !self.fm.ends_with('\n') {
+            self.fm.push_str(ending);
+        }
+        self.fm.push_str(key);
+        self.fm.push_str(": []");
+        self.fm.push_str(ending);
+    }
+
     /// Surgically set a scalar key's value, preserving everything else. Appends
     /// the key at the end of the frontmatter if absent.
     pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {

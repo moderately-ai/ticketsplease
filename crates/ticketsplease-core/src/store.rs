@@ -215,7 +215,7 @@ pub fn default_config_template(tickets_dir: &str) -> String {
     )
 }
 
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()

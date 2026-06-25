@@ -7,17 +7,19 @@ use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::config::Backend;
 use ticketsplease_core::guard;
+use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::{
     lint as lint_core, schedule, Error, Priority, Result, Status, Store, Ticket,
 };
 
 use crate::cli::{
-    CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SetArgs, ShowArgs,
-    SkillInstallArgs,
+    CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SelfUpdateArgs, SetArgs,
+    ShowArgs, SkillInstallArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
+use crate::update;
 
 /// `init` — scaffold the tickets directory and config.
 pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
@@ -61,6 +63,18 @@ pub fn skill_install(repo: &Path, fmt: Format, args: &SkillInstallArgs) -> Resul
         Format::Json => print_json(&json!({ "schema_version": 1, "installed": path })),
         Format::Human => {
             println!("Installed skill to {path}");
+            Ok(())
+        }
+    }
+}
+
+/// `self-update` — replace the binary in place from GitHub Releases.
+pub fn self_update(fmt: Format, args: &SelfUpdateArgs) -> Result<()> {
+    update::run(args.version.as_deref())?;
+    match fmt {
+        Format::Json => print_json(&json!({ "schema_version": 1, "updated": true })),
+        Format::Human => {
+            println!("Updated ticketsplease via the installer");
             Ok(())
         }
     }
@@ -360,6 +374,31 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
         Format::Human => {
             for p in &picks {
                 println!("{}  (score {})  {}", p.ticket.id, p.score, p.ticket.title);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `migrate` — bring ticket frontmatter up to the current schema (round-trip-safe).
+pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
+    let store = Store::open(repo)?;
+    let report = migrate_core::migrate(&store)?;
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "migrated": report.migrated,
+            "unchanged": report.unchanged,
+        })),
+        Format::Human => {
+            if report.migrated.is_empty() {
+                println!("All {} ticket(s) already current", report.unchanged);
+            } else {
+                println!(
+                    "Migrated {} ticket(s): {}",
+                    report.migrated.len(),
+                    report.migrated.join(", ")
+                );
             }
             Ok(())
         }

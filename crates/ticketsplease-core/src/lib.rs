@@ -10,6 +10,7 @@ pub mod error;
 pub mod frontmatter;
 pub mod guard;
 pub mod lint;
+pub mod migrate;
 pub mod schedule;
 pub mod store;
 pub mod ticket;

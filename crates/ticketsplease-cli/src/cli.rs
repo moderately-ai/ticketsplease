@@ -176,6 +176,14 @@ pub struct GuardArgs {
     pub ticket: Option<String>,
 }
 
+/// `self-update` arguments.
+#[derive(Args)]
+pub struct SelfUpdateArgs {
+    /// Update to a specific tag (default: the latest release).
+    #[arg(long)]
+    pub version: Option<String>,
+}
+
 // Commands implemented in later milestones keep placeholder argument structs.
 macro_rules! empty_args {
     ($($name:ident),* $(,)?) => {
@@ -187,7 +195,7 @@ macro_rules! empty_args {
     };
 }
 
-empty_args!(ReadyArgs, TracksArgs, LintArgs, MigrateArgs, SelfUpdateArgs,);
+empty_args!(ReadyArgs, TracksArgs, LintArgs, MigrateArgs,);
 
 /// `skill` subcommand group.
 #[derive(Args)]
@@ -227,15 +235,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Tracks(_) => commands::tracks(repo, fmt),
         Command::Next(a) => commands::next(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
-        Command::Migrate(_) => not_implemented("migrate"),
+        Command::Migrate(_) => commands::migrate(repo, fmt),
         Command::Skill(a) => match &a.command {
             SkillCommand::Install(a) => commands::skill_install(repo, fmt, a),
         },
-        Command::SelfUpdate(_) => not_implemented("self-update"),
+        Command::SelfUpdate(a) => commands::self_update(fmt, a),
     }
-}
-
-fn not_implemented(name: &str) -> Result<()> {
-    eprintln!("ticketsplease {name}: not yet implemented");
-    Ok(())
 }

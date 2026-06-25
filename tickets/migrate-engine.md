@@ -1,7 +1,7 @@
 ---
 id: migrate-engine
 title: Frontmatter migration engine
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core]
