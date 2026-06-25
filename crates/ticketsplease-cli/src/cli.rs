@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use ticketsplease_core::Result;
 
 use crate::commands;
@@ -107,6 +107,7 @@ pub struct CreateArgs {
 
 /// `set` arguments.
 #[derive(Args)]
+#[command(group = ArgGroup::new("body_op").multiple(false).args(["body", "body_file", "append_body", "append_body_file"]))]
 pub struct SetArgs {
     /// Ticket id.
     pub id: String,
@@ -125,12 +126,22 @@ pub struct SetArgs {
     /// Tags to add (repeatable or comma-separated).
     #[arg(long = "add-tag", value_delimiter = ',')]
     pub add_tag: Vec<String>,
-    /// Replace the ticket's markdown body with this text.
-    #[arg(long, conflicts_with = "append_body", allow_hyphen_values = true)]
+    /// Tags to remove (repeatable or comma-separated).
+    #[arg(long = "remove-tag", value_delimiter = ',')]
+    pub remove_tag: Vec<String>,
+    /// Replace the body with this text (markdown bullets are fine).
+    #[arg(long, allow_hyphen_values = true)]
     pub body: Option<String>,
-    /// Append this text to the ticket's markdown body.
+    /// Replace the body from a file; `-` reads stdin (safe for rich markdown
+    /// containing backticks, `$(...)`, etc. that a shell would otherwise mangle).
+    #[arg(long = "body-file")]
+    pub body_file: Option<String>,
+    /// Append this text to the body.
     #[arg(long = "append-body", allow_hyphen_values = true)]
     pub append_body: Option<String>,
+    /// Append the body from a file; `-` reads stdin.
+    #[arg(long = "append-body-file")]
+    pub append_body_file: Option<String>,
 }
 
 /// `link` arguments.

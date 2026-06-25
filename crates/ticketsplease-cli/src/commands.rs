@@ -147,11 +147,17 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     for tag in &args.add_tag {
         ticket.add_tag(tag)?;
     }
-    if let Some(body) = &args.body {
-        ticket.set_body(body);
+    for tag in &args.remove_tag {
+        ticket.remove_tag(tag)?;
     }
-    if let Some(text) = &args.append_body {
-        ticket.append_body(text);
+    if let Some(body) = body_input(args.body.as_deref(), args.body_file.as_deref())? {
+        ticket.set_body(&body);
+    }
+    if let Some(text) = body_input(
+        args.append_body.as_deref(),
+        args.append_body_file.as_deref(),
+    )? {
+        ticket.append_body(&text);
     }
 
     let changed = ticket.render() != before;
@@ -553,6 +559,30 @@ fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
         s.push_str(&format!("\"{}\" = \"{}\"\n", m.name, m.name));
     }
     s
+}
+
+/// Resolve a body value from either an inline arg or a file (`-` reads stdin).
+/// The CLI `body_op` arg-group guarantees at most one of these is set.
+fn body_input(text: Option<&str>, file: Option<&str>) -> Result<Option<String>> {
+    if let Some(t) = text {
+        Ok(Some(t.to_string()))
+    } else if let Some(path) = file {
+        Ok(Some(read_text(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_text(path: &str) -> Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).map_err(Error::Io)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|e| Error::Invalid(format!("cannot read {path}: {e}")))
+    }
 }
 
 fn ticket_summary(ticket: &Ticket) -> Value {

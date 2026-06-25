@@ -227,6 +227,42 @@ fn set_updates_body() {
     assert!(text.contains("- a note"));
 }
 
+#[test]
+fn set_body_from_file_and_remove_tag() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "f", "--title", "F", "--tag", "keep,drop"])
+        .assert()
+        .success();
+
+    // Rich body with shell-hostile content, supplied via a file (no shell interpolation).
+    let body_path = repo.join("body.md");
+    std::fs::write(
+        &body_path,
+        "Spec with `record_dml_predicate` and $(danger).\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["set", "f", "--body-file", body_path.to_str().unwrap()])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "f", "--remove-tag", "drop"])
+        .assert()
+        .success();
+
+    let out = tkt(repo).args(["show", "f"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("`record_dml_predicate`"));
+    assert!(text.contains("$(danger)"));
+    assert!(
+        text.contains("tags: [keep]"),
+        "remove-tag should leave [keep]"
+    );
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Proc::new("git")
         .arg("-C")

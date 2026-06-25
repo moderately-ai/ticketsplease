@@ -268,6 +268,15 @@ impl Ticket {
         Ok(changed)
     }
 
+    /// Remove a tag (idempotent). Returns whether anything changed.
+    pub fn remove_tag(&mut self, tag: &str) -> Result<bool> {
+        let changed = self.doc.remove_list_item("tags", tag)?;
+        if changed {
+            self.tags.retain(|t| t != tag);
+        }
+        Ok(changed)
+    }
+
     /// Replace the markdown body (frontmatter stays byte-for-byte intact).
     pub fn set_body(&mut self, body: &str) {
         self.doc.set_body(body);
