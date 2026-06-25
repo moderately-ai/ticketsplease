@@ -1,7 +1,7 @@
 ---
 id: release-ci
 title: GitHub Actions cross-compile release matrix
-status: todo
+status: done
 priority: p1
 dependencies: [install-script]
 scopes: [dist]

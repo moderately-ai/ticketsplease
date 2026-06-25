@@ -1,7 +1,7 @@
 ---
 id: install-script
 title: POSIX install.sh (curl | sh)
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [dist]
