@@ -147,6 +147,12 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     for tag in &args.add_tag {
         ticket.add_tag(tag)?;
     }
+    if let Some(body) = &args.body {
+        ticket.set_body(body);
+    }
+    if let Some(text) = &args.append_body {
+        ticket.append_body(text);
+    }
 
     let changed = ticket.render() != before;
     if changed {

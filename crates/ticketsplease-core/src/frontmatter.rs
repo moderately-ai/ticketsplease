@@ -66,6 +66,38 @@ impl Document {
         }
     }
 
+    /// Replace the markdown body, leaving the frontmatter (and closing fence)
+    /// byte-for-byte intact. A non-empty body is normalised to end with a newline.
+    pub fn set_body(&mut self, body: &str) {
+        let fence_end = self
+            .trailing
+            .find('\n')
+            .map_or(self.trailing.len(), |i| i + 1);
+        let mut out = self.trailing[..fence_end].to_string();
+        if !out.ends_with('\n') {
+            out.push('\n'); // keep the closing fence on its own line
+        }
+        out.push_str(body);
+        if !body.is_empty() && !body.ends_with('\n') {
+            out.push('\n');
+        }
+        self.trailing = out;
+    }
+
+    /// Append text to the end of the markdown body (on its own line).
+    pub fn append_body(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.trailing.is_empty() && !self.trailing.ends_with('\n') {
+            self.trailing.push('\n');
+        }
+        self.trailing.push_str(text);
+        if !text.ends_with('\n') {
+            self.trailing.push('\n');
+        }
+    }
+
     /// Whether the frontmatter has a top-level key `key`.
     #[must_use]
     pub fn has_key(&self, key: &str) -> bool {
@@ -420,6 +452,35 @@ mod tests {
     fn body_extraction() {
         let doc = Document::parse(SAMPLE).unwrap();
         assert_eq!(doc.body(), "# Body\n\nText here.\n");
+    }
+
+    #[test]
+    fn set_body_replaces_only_the_body() {
+        let mut doc = Document::parse(SAMPLE).unwrap();
+        let fm_before = doc.fm().to_string();
+        doc.set_body("# New\n\nfresh.\n");
+        assert_eq!(doc.body(), "# New\n\nfresh.\n");
+        assert_eq!(doc.fm(), fm_before, "frontmatter must be untouched");
+        // The result still round-trips through the parser.
+        assert_eq!(
+            Document::parse(&doc.render()).unwrap().body(),
+            "# New\n\nfresh.\n"
+        );
+    }
+
+    #[test]
+    fn set_body_normalises_trailing_newline() {
+        let mut doc = Document::parse(SAMPLE).unwrap();
+        doc.set_body("no newline");
+        assert_eq!(doc.body(), "no newline\n");
+    }
+
+    #[test]
+    fn append_body_adds_after_existing_body() {
+        let mut doc = Document::parse(SAMPLE).unwrap();
+        doc.append_body("- appended");
+        assert!(doc.body().starts_with("# Body\n\nText here.\n"));
+        assert!(doc.body().ends_with("- appended\n"));
     }
 
     #[test]

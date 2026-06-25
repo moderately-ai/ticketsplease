@@ -190,6 +190,43 @@ fn json_output_is_byte_deterministic() {
     );
 }
 
+#[test]
+fn set_updates_body() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "b",
+            "--title",
+            "B",
+            "--body",
+            "original body",
+        ])
+        .assert()
+        .success();
+
+    tkt(repo)
+        .args(["set", "b", "--body", "replaced body"])
+        .assert()
+        .success();
+    let out = tkt(repo).args(["show", "b"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("replaced body") && !text.contains("original body"));
+    assert!(text.contains("id: b"), "frontmatter must be preserved");
+
+    tkt(repo)
+        .args(["set", "b", "--append-body", "- a note"])
+        .assert()
+        .success();
+    let out = tkt(repo).args(["show", "b"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("replaced body"));
+    assert!(text.contains("- a note"));
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Proc::new("git")
         .arg("-C")

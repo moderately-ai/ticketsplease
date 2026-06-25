@@ -125,6 +125,12 @@ pub struct SetArgs {
     /// Tags to add (repeatable or comma-separated).
     #[arg(long = "add-tag", value_delimiter = ',')]
     pub add_tag: Vec<String>,
+    /// Replace the ticket's markdown body with this text.
+    #[arg(long, conflicts_with = "append_body", allow_hyphen_values = true)]
+    pub body: Option<String>,
+    /// Append this text to the ticket's markdown body.
+    #[arg(long = "append-body", allow_hyphen_values = true)]
+    pub append_body: Option<String>,
 }
 
 /// `link` arguments.

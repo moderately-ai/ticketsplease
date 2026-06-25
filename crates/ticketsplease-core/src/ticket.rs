@@ -268,6 +268,16 @@ impl Ticket {
         Ok(changed)
     }
 
+    /// Replace the markdown body (frontmatter stays byte-for-byte intact).
+    pub fn set_body(&mut self, body: &str) {
+        self.doc.set_body(body);
+    }
+
+    /// Append text to the markdown body.
+    pub fn append_body(&mut self, text: &str) {
+        self.doc.append_body(text);
+    }
+
     /// Construct a new ticket from fields, rendering canonical frontmatter.
     #[allow(clippy::too_many_arguments)] // a flat ticket; a builder adds no clarity
     pub fn new(
