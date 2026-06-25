@@ -1,0 +1,4 @@
+# Four positional arguments are enough ambiguity to warrant a named `*Args`,
+# `*Request`, or domain input struct (clippy counts `self`, so this fires at
+# four user-visible arguments). Mirrors ../../tomsanbear/quiltdb house style.
+too-many-arguments-threshold = 5

@@ -1,0 +1,15 @@
+[package]
+name = "ticketsplease-cargo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rust/cargo crate-graph backend for the ticketsplease conflict guard."
+
+[dependencies]
+ticketsplease-core = { workspace = true }
+
+[lints]
+workspace = true

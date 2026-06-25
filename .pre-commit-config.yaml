@@ -1,0 +1,59 @@
+# Pre-commit configuration, adapted from ../../tomsanbear/quiltdb.
+#
+# One-time setup per dev machine:
+#     pip install pre-commit        # or: brew install pre-commit
+#     cargo install cargo-deny
+#     pre-commit install --install-hooks
+#     pre-commit install --hook-type commit-msg
+#
+# Deliberate divergences from quiltdb:
+#   * Conventional Commits are enforced via `conventional-pre-commit` (runs in
+#     pre-commit's own managed env) rather than bun/commitlint, to avoid pulling
+#     a JS toolchain into this lean Rust + shell project.
+#   * The quiltdb-specific `xtask audit-*` hooks are omitted (no such rules yet).
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --all-targets
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-deny
+        name: cargo deny check
+        # Requires `cargo install cargo-deny` (one-time). Config: deny.toml.
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+        types: [rust]

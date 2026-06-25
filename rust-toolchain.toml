@@ -1,0 +1,9 @@
+[toolchain]
+# ticketsplease builds on STABLE Rust on purpose: the tool must stay broadly
+# installable via `cargo install --git` on any contributor's or user's default
+# stable toolchain. This is a deliberate divergence from ../../tomsanbear/quiltdb,
+# which pins a specific nightly for unstable Cargo/rustc knobs that this project
+# does not use. Bump to a pinned stable (e.g. "1.86.0") if CI reproducibility
+# ever needs it.
+channel = "stable"
+components = ["rustfmt", "clippy"]

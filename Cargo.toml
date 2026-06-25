@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ticketsplease-core",
+    "crates/ticketsplease-cargo",
+    "crates/ticketsplease-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/moderately-ai/ticketsplease"
+authors = ["Moderately AI"]
+
+[workspace.dependencies]
+ticketsplease-core = { path = "crates/ticketsplease-core" }
+ticketsplease-cargo = { path = "crates/ticketsplease-cargo" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.8"
+
+# Disk hygiene per ~/.claude-work/CLAUDE.md and ../../tomsanbear/quiltdb house style.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+# `strip` + `codegen-units = 1` shrink the shipping artifact (not target/). Per
+# ~/.claude-work/rules/rust.md, LTO is applied in CI via CARGO_PROFILE_RELEASE_LTO,
+# not here — it inflates intermediate bitcode locally for no benefit.
+strip = true
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
