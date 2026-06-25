@@ -68,6 +68,9 @@ pub struct InitArgs {
     /// Overwrite an existing config file.
     #[arg(long)]
     pub force: bool,
+    /// Do not install the bundled Claude skill.
+    #[arg(long)]
+    pub no_skill: bool,
 }
 
 /// `create` arguments.
@@ -202,7 +205,11 @@ pub enum SkillCommand {
 
 /// `skill install` arguments.
 #[derive(Args)]
-pub struct SkillInstallArgs {}
+pub struct SkillInstallArgs {
+    /// Base directory to install the skill under (default `.claude/skills`).
+    #[arg(long, default_value = ".claude/skills")]
+    pub dir: String,
+}
 
 /// Dispatch a parsed CLI invocation.
 pub fn run(cli: Cli) -> Result<()> {
@@ -222,7 +229,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => not_implemented("migrate"),
         Command::Skill(a) => match &a.command {
-            SkillCommand::Install(_) => not_implemented("skill install"),
+            SkillCommand::Install(a) => commands::skill_install(repo, fmt, a),
         },
         Command::SelfUpdate(_) => not_implemented("self-update"),
     }

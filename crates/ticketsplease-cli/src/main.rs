@@ -3,6 +3,7 @@
 mod cli;
 mod commands;
 mod format;
+mod skill;
 
 use std::process::ExitCode;
 

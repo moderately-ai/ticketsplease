@@ -1,7 +1,7 @@
 ---
 id: embed-skill
 title: Embed and install the Claude skill
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [skill]

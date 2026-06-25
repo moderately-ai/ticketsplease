@@ -14,24 +14,52 @@ use ticketsplease_core::{
 
 use crate::cli::{
     CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SetArgs, ShowArgs,
+    SkillInstallArgs,
 };
 use crate::format::{print_json, Format};
+use crate::skill;
 
 /// `init` — scaffold the tickets directory and config.
 pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
     let outcome = store::init_repo(repo, &args.dir, args.force)?;
     let dir = outcome.tickets_dir.display().to_string();
+    let skill_path = if args.no_skill {
+        None
+    } else {
+        Some(
+            skill::install(repo, ".claude/skills")?
+                .display()
+                .to_string(),
+        )
+    };
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
             "tickets_dir": dir,
             "wrote_config": outcome.wrote_config,
+            "skill_installed": skill_path,
         })),
         Format::Human => {
             println!("Initialized ticketsplease (tickets dir: {dir})");
             if !outcome.wrote_config {
                 println!("(config already present; left unchanged)");
             }
+            if let Some(path) = &skill_path {
+                println!("Installed Claude skill to {path}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `skill install` — write the bundled Claude skill into the repo.
+pub fn skill_install(repo: &Path, fmt: Format, args: &SkillInstallArgs) -> Result<()> {
+    let target = skill::install(repo, &args.dir)?;
+    let path = target.display().to_string();
+    match fmt {
+        Format::Json => print_json(&json!({ "schema_version": 1, "installed": path })),
+        Format::Human => {
+            println!("Installed skill to {path}");
             Ok(())
         }
     }

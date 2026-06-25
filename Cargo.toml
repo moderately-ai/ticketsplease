@@ -27,6 +27,7 @@ toml = "0.8"
 yaml-rust2 = "0.10"
 globset = "0.4"
 guppy = "0.17"
+include_dir = "0.7"
 
 # Disk hygiene per ~/.claude-work/CLAUDE.md and ../../tomsanbear/quiltdb house style.
 [profile.dev]
