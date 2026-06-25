@@ -152,6 +152,14 @@ pub struct ListArgs {
     pub status: Option<String>,
 }
 
+/// `next` arguments.
+#[derive(Args)]
+pub struct NextArgs {
+    /// Return up to N mutually conflict-free picks.
+    #[arg(long, default_value_t = 1)]
+    pub parallel: usize,
+}
+
 // Commands implemented in later milestones keep placeholder argument structs.
 macro_rules! empty_args {
     ($($name:ident),* $(,)?) => {
@@ -166,7 +174,6 @@ macro_rules! empty_args {
 empty_args!(
     ReadyArgs,
     TracksArgs,
-    NextArgs,
     GuardArgs,
     LintArgs,
     MigrateArgs,
@@ -203,9 +210,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Show(a) => commands::show(repo, fmt, a),
         Command::List(a) => commands::list(repo, fmt, a),
         Command::Lint(_) => commands::lint(repo, fmt),
-        Command::Ready(_) => not_implemented("ready"),
-        Command::Tracks(_) => not_implemented("tracks"),
-        Command::Next(_) => not_implemented("next"),
+        Command::Ready(_) => commands::ready(repo, fmt),
+        Command::Tracks(_) => commands::tracks(repo, fmt),
+        Command::Next(a) => commands::next(repo, fmt, a),
         Command::Guard(_) => not_implemented("guard"),
         Command::Migrate(_) => not_implemented("migrate"),
         Command::Skill(a) => match &a.command {

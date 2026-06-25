@@ -5,9 +5,11 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 use ticketsplease_core::store::{self, CreateOutcome};
-use ticketsplease_core::{lint as lint_core, Error, Priority, Result, Status, Store, Ticket};
+use ticketsplease_core::{
+    lint as lint_core, schedule, Error, Priority, Result, Status, Store, Ticket,
+};
 
-use crate::cli::{CreateArgs, InitArgs, LinkArgs, ListArgs, SetArgs, ShowArgs};
+use crate::cli::{CreateArgs, InitArgs, LinkArgs, ListArgs, NextArgs, SetArgs, ShowArgs};
 use crate::format::{print_json, Format};
 
 /// `init` — scaffold the tickets directory and config.
@@ -219,7 +221,11 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
 /// `lint` — schema validation across all tickets. Exits non-zero on findings.
 pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
     let store = Store::open(repo)?;
-    let diagnostics = lint_core::lint(&store)?;
+    let mut diagnostics = lint_core::lint(&store)?;
+    // If every file parses, also validate links (dangling deps, cycles).
+    if let Ok(tickets) = store.load_all() {
+        diagnostics.extend(schedule::link_diagnostics(&tickets));
+    }
     let problems = diagnostics.len();
 
     match fmt {
@@ -247,6 +253,93 @@ pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
     } else {
         Err(Error::Invalid(format!("{problems} problem(s) found")))
     }
+}
+
+/// `ready` — the dependency-satisfied, priority-ordered queue.
+pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
+    let store = Store::open(repo)?;
+    let tickets = store.load_all()?;
+    let ready = schedule::ready(&tickets)?;
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = ready.iter().map(|t| ticket_summary(t)).collect();
+            print_json(&json!({ "schema_version": 1, "ready": rows }))
+        }
+        Format::Human => {
+            for t in &ready {
+                println!(
+                    "{:<3} {:<12} {}  {}",
+                    t.priority.as_str(),
+                    t.status.as_str(),
+                    t.id,
+                    t.title
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `tracks` — conflict-free parallel batches of ready tickets.
+pub fn tracks(repo: &Path, fmt: Format) -> Result<()> {
+    let store = Store::open(repo)?;
+    let tickets = store.load_all()?;
+    let batches = schedule::tracks(&tickets)?;
+    match fmt {
+        Format::Json => {
+            let arr: Vec<Value> = batches
+                .iter()
+                .map(|b| Value::Array(b.iter().map(|t| ticket_summary(t)).collect()))
+                .collect();
+            print_json(&json!({ "schema_version": 1, "batches": arr }))
+        }
+        Format::Human => {
+            if batches.is_empty() {
+                println!("(no ready tickets)");
+            }
+            for (i, batch) in batches.iter().enumerate() {
+                let ids: Vec<&str> = batch.iter().map(|t| t.id.as_str()).collect();
+                println!("batch {}: {}", i + 1, ids.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `next` — scored recommendation(s); `--parallel N` returns N disjoint picks.
+pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let tickets = store.load_all()?;
+    let picks = schedule::next(&tickets, args.parallel)?;
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = picks
+                .iter()
+                .map(|p| {
+                    let mut v = ticket_summary(p.ticket);
+                    v["score"] = json!(p.score);
+                    v
+                })
+                .collect();
+            print_json(&json!({ "schema_version": 1, "picks": rows }))
+        }
+        Format::Human => {
+            for p in &picks {
+                println!("{}  (score {})  {}", p.ticket.id, p.score, p.ticket.title);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ticket_summary(ticket: &Ticket) -> Value {
+    json!({
+        "id": ticket.id,
+        "title": ticket.title,
+        "status": ticket.status.as_str(),
+        "priority": ticket.priority.as_str(),
+        "scopes": ticket.scopes,
+    })
 }
 
 fn ticket_json(ticket: &Ticket) -> Value {
