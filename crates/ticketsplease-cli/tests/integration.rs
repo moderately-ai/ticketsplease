@@ -1221,3 +1221,151 @@ fn events_watch_wakes_and_times_out() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["events"].as_array().unwrap().len(), 1);
 }
+
+/// A foundational crate (`ast`) split into sub-crate scopes that all map to it,
+/// depended on by `parser`. Mirrors the real bug report.
+fn write_ast_workspace(repo: &Path) {
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/ast\", \"crates/parser\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for d in [
+        "crates/ast/src/dialect",
+        "crates/ast/src/precedence",
+        "crates/ast/src/vocab",
+        "crates/parser/src",
+    ] {
+        std::fs::create_dir_all(repo.join(d)).unwrap();
+    }
+    std::fs::write(
+        repo.join("crates/ast/Cargo.toml"),
+        "[package]\nname = \"ast\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("crates/ast/src/lib.rs"), "// ast root\n").unwrap();
+    std::fs::write(repo.join("crates/ast/src/dialect/mod.rs"), "// dialect\n").unwrap();
+    std::fs::write(
+        repo.join("crates/ast/src/precedence/mod.rs"),
+        "// precedence\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("crates/ast/src/vocab/mod.rs"), "// vocab\n").unwrap();
+    std::fs::write(
+        repo.join("crates/parser/Cargo.toml"),
+        "[package]\nname = \"parser\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nast = { path = \"../ast\" }\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("crates/parser/src/lib.rs"), "// parser\n").unwrap();
+}
+
+const AST_CONFIG: &str = "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+     [language]\nbackend = \"rust\"\n\
+     [scopes]\n\
+     \"ast-dialect-data\" = [\"crates/ast/src/dialect/**\", \"crates/ast/src/precedence/**\"]\n\
+     \"ast-vocab\" = [\"crates/ast/src/vocab/**\", \"crates/ast/src/lib.rs\"]\n\
+     \"parser-scope\" = [\"crates/parser/**\"]\n\
+     [scope_crates]\n\"ast-dialect-data\" = \"ast\"\n\"ast-vocab\" = \"ast\"\n\"parser-scope\" = \"parser\"\n";
+
+/// The reported bug: editing files inside the declared sub-crate scope of a
+/// widely-depended-on crate must NOT be CONFLICT just because sibling scopes and
+/// reverse-dependents map to the same crate — and a `paths` entry covers its file.
+/// A genuine escape into a sibling sub-scope must still fire.
+#[test]
+fn guard_subcrate_scopes_do_not_trip_under_declaration() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_ast_workspace(repo);
+    std::fs::write(repo.join("ticketsplease.toml"), AST_CONFIG).unwrap();
+    // Declares only ast-dialect-data; lib.rs (which matches the ast-vocab glob) is
+    // covered explicitly via --path.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "m1",
+            "--title",
+            "M1",
+            "--scope",
+            "ast-dialect-data",
+            "--path",
+            "crates/ast/src/lib.rs",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "m1", "--status", "in-progress"])
+        .assert()
+        .success();
+
+    git_init_commit(repo);
+    git(repo, &["checkout", "-q", "-b", "tkt/m1"]);
+    // Edit only inside the declared area (dialect/, precedence/) + lib.rs (a --path).
+    std::fs::write(repo.join("crates/ast/src/dialect/mod.rs"), "// edit\n").unwrap();
+    std::fs::write(repo.join("crates/ast/src/precedence/mod.rs"), "// edit\n").unwrap();
+    std::fs::write(repo.join("crates/ast/src/lib.rs"), "// edit root\n").unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "in-scope edit",
+        ],
+    );
+
+    // Within its lane -> exit 0, no under-declaration, despite siblings/dependents
+    // mapping to the same crate.
+    let out = tkt(repo)
+        .args(["guard", "tkt/m1", "--ticket", "m1", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["conflict"], false);
+    assert_eq!(v["under_declared"].as_array().unwrap().len(), 0);
+    assert_eq!(v["affected_causes"]["ast-dialect-data"], "direct");
+
+    // Now genuinely escape into a sibling sub-scope (vocab/, undeclared, not a path).
+    std::fs::write(repo.join("crates/ast/src/vocab/mod.rs"), "// escaped\n").unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "escape into vocab",
+        ],
+    );
+    let out = tkt(repo)
+        .args(["guard", "tkt/m1", "--ticket", "m1", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6), "a real escape must still fire");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let under: Vec<&str> = v["under_declared"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        under,
+        vec!["ast-vocab"],
+        "only the escaped sub-scope, nothing else"
+    );
+}

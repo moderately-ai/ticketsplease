@@ -887,15 +887,24 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
             &store.config.external_scopes,
         )?)
     };
-    let mut mappers: Vec<&dyn guard::AffectedSetMapper> = vec![&path_mapper];
-    if let Some(cm) = &cargo_mapper {
-        mappers.push(cm);
-    }
+    // direct = what the branch physically touches (path globs + external pins) —
+    // authoritative for under-declaration. impact = crate-graph reverse-dep
+    // expansion — a non-failing signal feeding collisions/affected only.
+    let mut direct: Vec<&dyn guard::AffectedSetMapper> = vec![&path_mapper];
     if let Some(em) = &external_mapper {
-        mappers.push(em);
+        direct.push(em);
+    }
+    let mut impact: Vec<&dyn guard::AffectedSetMapper> = Vec::new();
+    if let Some(cm) = &cargo_mapper {
+        impact.push(cm);
     }
 
-    let report = guard::evaluate(target, &all, diff, &mappers)?;
+    let coverage = guard::coverage_globset(&store.config, target)?;
+    let mappers = guard::Mappers {
+        direct: &direct,
+        impact: &impact,
+    };
+    let report = guard::evaluate(target, &all, diff, &mappers, &coverage)?;
 
     match fmt {
         Format::Json => {

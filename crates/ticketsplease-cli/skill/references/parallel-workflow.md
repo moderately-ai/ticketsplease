@@ -34,18 +34,18 @@ A worker must pass the guard before its branch merges:
 ticketsplease guard tkt/<id> --base main --format json
 case exit:
   0 -> merge
-  6 -> read the JSON; use `affected_causes` and each collision's `cause` to triage:
-         under_declared non-empty -> the branch touched an area the ticket never claimed.
-             A `direct` cause is a genuine miss: narrow the diff back into scope, or, if the area
-             is truly part of this ticket, `ticketsplease set <id> --add-scope <scope>` and re-guard.
-             A `transitive` cause is a downstream crate reached only via the cargo reverse-dep graph
-             (an additive change can't break it) — don't declare it just to pass; re-gate with
-             `guard --direct-only` (alias `--no-reverse-deps`) to confirm there's no real overlap.
-         collisions non-empty -> another open ticket owns an affected scope. Per collision:
-             `direct` -> a real overlap; coordinate (merge the other ticket first, or split the work).
-             `transitive` -> only the reverse-dep graph connects you; for an additive change this is
-             usually a false alarm — confirm with `guard --direct-only`, which re-gates on direct
-             overlap only. Don't let transitive noise train you to ignore exit 6.
+  6 -> read the JSON:
+         under_declared non-empty -> the branch edited files outside its declared area
+             (declared-scope globs + paths). These are genuine escapes — narrow the diff back, or
+             if the area is truly part of this ticket `ticketsplease set <id> --add-scope <scope>`
+             (or add the file to the ticket's `paths`) and re-guard. The cargo reverse-dep
+             expansion never lands here, so editing a foundational crate within your declared globs
+             will not trip it.
+         collisions non-empty -> another open ticket's declared area overlaps your affected set.
+             Per collision check `cause`: `direct` = a real overlap, coordinate (merge the other
+             first, or split the work); `transitive` = only the reverse-dep graph connects you,
+             usually a false alarm for additive work — confirm with `guard --direct-only` (alias
+             `--no-reverse-deps`). Don't let transitive noise train you to ignore exit 6.
   other -> a setup problem (4 = no ticket resolved, 3 = bad input); fix and retry.
 ```
 

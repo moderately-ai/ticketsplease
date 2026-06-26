@@ -71,6 +71,17 @@ pub trait AffectedSetMapper {
     fn map(&self, changed_files: &[String]) -> Result<BTreeMap<String, ScopeCause>>;
 }
 
+/// The scope mappers split by role (R10).
+pub struct Mappers<'a> {
+    /// File/pin-based mappers (path globs, external pins). Authoritative for
+    /// under-declaration: what the branch *physically touched*.
+    pub direct: &'a [&'a dyn AffectedSetMapper],
+    /// Crate-graph reverse-dependency mappers. A non-failing impact signal that
+    /// feeds collisions and the affected report, but never under-declaration —
+    /// touching a foundational crate is not a scope escape.
+    pub impact: &'a [&'a dyn AffectedSetMapper],
+}
+
 /// The always-on, language-agnostic mapper: match files against each scope's globs.
 pub struct PathGlobMapper {
     scopes: Vec<(String, GlobSet)>,
@@ -317,26 +328,79 @@ pub struct GuardReport {
     pub conflict: bool,
 }
 
-/// Evaluate the guard: map changed files to scopes via `mappers`, then reconcile
-/// against the target ticket's declared scopes and other open tickets.
+/// The ticket's declared file area: the globs of its declared scopes plus its
+/// explicit `paths`. A changed file matching this set is "covered" — it cannot be
+/// an under-declaration, regardless of which other scope's glob also matches it
+/// (so an explicit `paths` entry suppresses an overlapping scope).
+pub fn coverage_globset(config: &Config, ticket: &Ticket) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for scope in &ticket.scopes {
+        if let Some(globs) = config.scopes.get(scope) {
+            for g in globs {
+                builder.add(Glob::new(g).map_err(|e| {
+                    Error::Invalid(format!("invalid glob `{g}` for scope `{scope}`: {e}"))
+                })?);
+            }
+        }
+    }
+    for p in &ticket.paths {
+        builder.add(Glob::new(p).map_err(|e| {
+            Error::Invalid(format!(
+                "invalid path glob `{p}` on ticket `{}`: {e}",
+                ticket.id
+            ))
+        })?);
+    }
+    builder
+        .build()
+        .map_err(|e| Error::Invalid(format!("building coverage globset: {e}")))
+}
+
+/// Evaluate the guard. Two distinct judgements, deliberately decoupled:
+///
+/// - **Under-declaration** (a scope *escape*) is file-authoritative: a changed
+///   file outside the ticket's declared area (`declared_coverage`) is the only
+///   thing that counts, and the scopes reported are those the `direct` (file/pin)
+///   mappers attribute to those uncovered files. The crate-graph reverse-dependency
+///   expansion (the `impact` mappers) NEVER drives this — touching a foundational
+///   crate that everything depends on is not "the branch left its lane".
+/// - **Collisions** with other open tickets use the full affected set (direct +
+///   transitive impact), tagged by [`ScopeCause`] so a consumer can triage.
 pub fn evaluate(
     target: &Ticket,
     all: &[Ticket],
     diff: BranchDiff,
-    mappers: &[&dyn AffectedSetMapper],
+    mappers: &Mappers,
+    declared_coverage: &GlobSet,
 ) -> Result<GuardReport> {
+    // Affected = what the branch physically touches (direct) plus its transitive
+    // crate-graph impact (impact). Drives collisions and the informational report.
     let mut affected: BTreeMap<String, ScopeCause> = BTreeMap::new();
-    for mapper in mappers {
+    for mapper in mappers.direct.iter().chain(mappers.impact.iter()) {
         for (scope, cause) in mapper.map(&diff.changed_files)? {
             merge_cause(&mut affected, scope, cause);
         }
     }
 
     let declared: BTreeSet<String> = target.scopes.iter().cloned().collect();
-    let under_declared: Vec<String> = affected
-        .keys()
-        .filter(|s| !declared.contains(*s))
+
+    // Under-declaration: only files outside the declared area, mapped to scopes by
+    // the file/pin (direct) mappers. Impact scopes are excluded by construction.
+    let uncovered: Vec<String> = diff
+        .changed_files
+        .iter()
+        .filter(|f| !declared_coverage.is_match(f.as_str()))
         .cloned()
+        .collect();
+    let mut touched_uncovered: BTreeSet<String> = BTreeSet::new();
+    for mapper in mappers.direct {
+        for scope in mapper.map(&uncovered)?.into_keys() {
+            touched_uncovered.insert(scope);
+        }
+    }
+    let under_declared: Vec<String> = touched_uncovered
+        .into_iter()
+        .filter(|s| !declared.contains(s))
         .collect();
 
     let mut collisions = Vec::new();
@@ -418,6 +482,10 @@ mod tests {
         }
     }
 
+    fn cover(cfg: &Config, target: &Ticket) -> GlobSet {
+        coverage_globset(cfg, target).unwrap()
+    }
+
     #[test]
     fn path_glob_mapper_maps_files() {
         let cfg = config_with_scopes(&[("core", "core/**"), ("io", "io/**")]);
@@ -435,7 +503,18 @@ mod tests {
         let mapper = PathGlobMapper::new(&cfg).unwrap();
         let target = ticket("t", "in-progress", &["core"]);
         let all = vec![target.clone()];
-        let report = evaluate(&target, &all, diff(&["core/a.rs", "io/b.rs"]), &[&mapper]).unwrap();
+        let cov = cover(&cfg, &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs", "io/b.rs"]),
+            &Mappers {
+                direct: &[&mapper],
+                impact: &[],
+            },
+            &cov,
+        )
+        .unwrap();
         assert!(report.conflict);
         assert_eq!(report.under_declared, vec!["io"]);
     }
@@ -447,7 +526,18 @@ mod tests {
         let target = ticket("t", "in-progress", &["core"]);
         let other = ticket("u", "in-progress", &["core"]);
         let all = vec![target.clone(), other];
-        let report = evaluate(&target, &all, diff(&["core/a.rs"]), &[&mapper]).unwrap();
+        let cov = cover(&cfg, &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[&mapper],
+                impact: &[],
+            },
+            &cov,
+        )
+        .unwrap();
         assert!(report.conflict);
         assert_eq!(report.collisions.len(), 1);
         assert_eq!(report.collisions[0].ticket, "u");
@@ -459,7 +549,18 @@ mod tests {
         let mapper = PathGlobMapper::new(&cfg).unwrap();
         let target = ticket("t", "in-progress", &["core"]);
         let all = vec![target.clone()];
-        let report = evaluate(&target, &all, diff(&["core/a.rs"]), &[&mapper]).unwrap();
+        let cov = cover(&cfg, &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[&mapper],
+                impact: &[],
+            },
+            &cov,
+        )
+        .unwrap();
         assert!(!report.conflict);
     }
 
@@ -486,7 +587,18 @@ mod tests {
             ("core", ScopeCause::Direct),
             ("dep", ScopeCause::Transitive),
         ]);
-        let report = evaluate(&target, &all, diff(&["core/a.rs"]), &[&mapper]).unwrap();
+        let cov = cover(&Config::default(), &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[],
+                impact: &[&mapper],
+            },
+            &cov,
+        )
+        .unwrap();
         let c = &report.collisions[0];
         assert_eq!(c.ticket, "u");
         assert_eq!(c.scopes, vec!["dep"]);
@@ -511,7 +623,18 @@ mod tests {
             ("core", ScopeCause::Direct),
             ("dep", ScopeCause::Transitive),
         ]);
-        let report = evaluate(&target, &all, diff(&["core/a.rs"]), &[&mapper]).unwrap();
+        let cov = cover(&Config::default(), &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[],
+                impact: &[&mapper],
+            },
+            &cov,
+        )
+        .unwrap();
         assert_eq!(report.collisions[0].cause, ScopeCause::Direct);
     }
 
@@ -521,7 +644,18 @@ mod tests {
         let all = vec![target.clone()];
         let m1 = stub(&[("x", ScopeCause::Transitive)]);
         let m2 = stub(&[("x", ScopeCause::Direct)]);
-        let report = evaluate(&target, &all, diff(&["a"]), &[&m1, &m2]).unwrap();
+        let cov = cover(&Config::default(), &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["a"]),
+            &Mappers {
+                direct: &[],
+                impact: &[&m1, &m2],
+            },
+            &cov,
+        )
+        .unwrap();
         assert_eq!(report.affected_causes.get("x"), Some(&ScopeCause::Direct));
     }
 
