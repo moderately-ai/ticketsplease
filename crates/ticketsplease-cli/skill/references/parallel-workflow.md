@@ -34,16 +34,32 @@ A worker must pass the guard before its branch merges:
 ticketsplease guard tkt/<id> --base main --format json
 case exit:
   0 -> merge
-  6 -> read the JSON:
+  6 -> read the JSON; use `affected_causes` and each collision's `cause` to triage:
          under_declared non-empty -> the branch touched an area the ticket never claimed.
-             Either narrow the diff back into scope, or, if the extra area is genuinely
-             part of this ticket, `ticketsplease set <id> --add-scope <scope>` and re-guard.
-         collisions non-empty -> another open ticket owns an affected scope. Coordinate:
-             finish/merge the other ticket first, or split the work so the scopes don't overlap.
+             A `direct` cause is a genuine miss: narrow the diff back into scope, or, if the area
+             is truly part of this ticket, `ticketsplease set <id> --add-scope <scope>` and re-guard.
+             A `transitive` cause is a downstream crate reached only via the cargo reverse-dep graph
+             (an additive change can't break it) — don't declare it just to pass; re-gate with
+             `guard --direct-only` (alias `--no-reverse-deps`) to confirm there's no real overlap.
+         collisions non-empty -> another open ticket owns an affected scope. Per collision:
+             `direct` -> a real overlap; coordinate (merge the other ticket first, or split the work).
+             `transitive` -> only the reverse-dep graph connects you; for an additive change this is
+             usually a false alarm — confirm with `guard --direct-only`, which re-gates on direct
+             overlap only. Don't let transitive noise train you to ignore exit 6.
   other -> a setup problem (4 = no ticket resolved, 3 = bad input); fix and retry.
 ```
 
 The guard is the safety net that lets you dispatch aggressively: if two branches would collide, at least one fails the gate instead of producing a silent merge conflict.
+
+## Observing workers mid-flight
+
+Workers advance status on their own `tkt/<id>` branches, so an orchestrator on `main` can't see it via `list` (working-tree only) until merge. Three commands read across branches without a checkout:
+
+- `ticketsplease status --all-branches` — every `tkt/*` branch's ticket status at its tip; poll it to see who has reached `review`.
+- `ticketsplease watch <id> --until review --timeout <secs>` — block until a worker is ready to merge (exit 0) or give up (exit 7). It auto-resolves the `tkt/<id>` branch.
+- `ticketsplease show <id> --ref tkt/<id>` — read one ticket as committed on its branch.
+
+**Dual-writer note:** claim *before* the worker branches. `claim` flips the ticket to `in-progress` in `main`, so when the worker branches off `main` the base and branch agree on status; the worker's later `set --status review` then merges cleanly. Writing status on `main` *after* the worker has already changed it on its branch is what produces a trivial status merge conflict.
 
 ## Keeping the graph honest
 

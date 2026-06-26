@@ -41,6 +41,10 @@ pub enum Command {
     Show(ShowArgs),
     /// List tickets.
     List(ListArgs),
+    /// Report ticket status; with `--all-branches`, scan `tkt/*` branches.
+    Status(StatusArgs),
+    /// Block until a ticket reaches a target status.
+    Watch(WatchArgs),
     /// List dependency-satisfied, dispatchable tickets.
     Ready(ReadyArgs),
     /// Partition ready tickets into conflict-free parallel batches.
@@ -173,6 +177,10 @@ pub struct LinkArgs {
 pub struct ShowArgs {
     /// Ticket id.
     pub id: String,
+    /// Read the ticket as committed on this git ref (e.g. a `tkt/<id>` branch)
+    /// instead of the working tree.
+    #[arg(long)]
+    pub r#ref: Option<String>,
 }
 
 /// `list` arguments.
@@ -181,6 +189,42 @@ pub struct ListArgs {
     /// Filter by status.
     #[arg(long)]
     pub status: Option<String>,
+}
+
+/// `status` arguments.
+#[derive(Args)]
+pub struct StatusArgs {
+    /// Scan `refs/heads/<prefix>*` branches and report each ticket's tip status,
+    /// instead of the working tree.
+    #[arg(long)]
+    pub all_branches: bool,
+    /// Branch namespace to scan with `--all-branches`; a ticket id is the branch
+    /// name minus this prefix.
+    #[arg(long, default_value = "tkt/")]
+    pub prefix: String,
+}
+
+/// `watch` arguments.
+#[derive(Args)]
+pub struct WatchArgs {
+    /// Ticket id.
+    pub id: String,
+    /// Target status to wait for (e.g. `review`). Also returns on `done`.
+    #[arg(long)]
+    pub until: String,
+    /// Poll the ticket on this git ref instead of auto-resolving `<prefix><id>`
+    /// (falling back to the working tree).
+    #[arg(long)]
+    pub r#ref: Option<String>,
+    /// Branch namespace used to auto-resolve the ref when `--ref` is omitted.
+    #[arg(long, default_value = "tkt/")]
+    pub prefix: String,
+    /// Seconds between polls.
+    #[arg(long, default_value_t = 5)]
+    pub interval: u64,
+    /// Give up after this many seconds (exit 7). Omit to wait indefinitely.
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 /// `next` arguments.
@@ -237,6 +281,10 @@ pub struct GuardArgs {
     /// Explicit ticket id (otherwise inferred from the branch name).
     #[arg(long)]
     pub ticket: Option<String>,
+    /// Gate on direct file/crate overlap only; skip cargo reverse-dependency
+    /// expansion (and the transitive collisions/under-declarations it adds).
+    #[arg(long, visible_alias = "no-reverse-deps")]
+    pub direct_only: bool,
 }
 
 /// `self-update` arguments.
@@ -293,6 +341,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Link(a) => commands::link(repo, fmt, a),
         Command::Show(a) => commands::show(repo, fmt, a),
         Command::List(a) => commands::list(repo, fmt, a),
+        Command::Status(a) => commands::status(repo, fmt, a),
+        Command::Watch(a) => commands::watch(repo, fmt, a),
         Command::Lint(_) => commands::lint(repo, fmt),
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(_) => commands::tracks(repo, fmt),

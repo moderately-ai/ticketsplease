@@ -48,10 +48,24 @@ JSON: `{ "schema_version", "id", "depends_on", "removed", "changed" }`.
 ## show / list
 
 ```
-ticketsplease show <id>
+ticketsplease show <id> [--ref <branch>]
 ticketsplease list [--status <s>]
 ```
-`show --format human` prints the raw ticket file. `show --format json` → the ticket's fields. `list` → `{ "schema_version", "tickets": [ {id,title,status,priority} ] }`.
+`show --format human` prints the raw ticket file. `show --format json` → the ticket's fields. `--ref` reads the ticket as committed on a git ref (e.g. a `tkt/<id>` branch) instead of the working tree — no checkout needed. `list` → `{ "schema_version", "tickets": [ {id,title,status,priority} ] }`.
+
+## status
+
+```
+ticketsplease status [--all-branches] [--prefix tkt/]
+```
+Without flags, the working-tree status of every ticket. `--all-branches` scans `refs/heads/<prefix>*` and reports each ticket's status as committed on its branch tip — so an orchestrator on `main` sees workers' in-flight status before merge (a branch whose ticket file is absent on its tip is reported with `status: null`). JSON: `{ "schema_version", "source": "worktree"|"branches", "tickets": [ {branch?, id, status, assignee, lease_expires_at} ] }`.
+
+## watch
+
+```
+ticketsplease watch <id> --until <status> [--ref <branch>] [--prefix tkt/] [--interval 5] [--timeout <secs>]
+```
+Blocks, polling the ticket until it reaches `--until` (or `done`, which is always terminal), then exits 0. Without `--ref`, polls the `<prefix><id>` branch if it exists, else the working tree. **Exit 7** if `--timeout` seconds elapse first. The JSON payload is printed on both the success and timeout paths: `{ "schema_version", "id", "ref", "status", "reached": bool, "timed_out": bool }`.
 
 ## ready
 
@@ -96,11 +110,13 @@ release JSON: `{ "schema_version", "id", "released": bool }`.
 ## guard
 
 ```
-ticketsplease guard <branch> [--base <ref>] [--ticket <id>]
+ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--direct-only]
 ```
-Computes the branch's diff vs `--base` (default `default_base` in config; three-dot merge-base diff), maps changed files to scopes (path globs, plus the cargo crate graph when `backend = "rust"`), and reconciles against the ticket's declared scopes. The ticket is taken from `--ticket`, else inferred from the branch name. **Exit 6** when the branch under-declares a scope or collides with another open ticket.
+Computes the branch's diff vs `--base` (default `default_base` in config; three-dot merge-base diff), maps changed files to scopes (path globs, plus the cargo crate graph when `backend = "rust"`, plus `[external_scopes]` pins), and reconciles against the ticket's declared scopes. The ticket is taken from `--ticket`, else inferred from the branch name. **Exit 6** when the branch under-declares a scope or collides with another open ticket.
 
-JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "declared_scopes", "under_declared", "collisions": [ {ticket,scopes} ], "conflict": bool }`.
+Each collision carries a `cause`: `direct` (a real file/crate overlap) or `transitive` (reached only via the cargo reverse-dependency walk — safe for an additive change). The `affected_causes` map tags every affected scope the same way, so you can auto-triage exit 6 (e.g. ignore purely-`transitive` collisions for additive work) instead of hand-diffing. `--direct-only` (alias `--no-reverse-deps`) skips the reverse-dep expansion and gates on direct overlap only — clearing both transitive collisions and transitive under-declarations. `[external_scopes]` additionally flags a bumped `git = … rev = …` pin (matched by `repo`) or an in-tree fork path.
+
+JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "conflict": bool }`.
 
 ## lint
 

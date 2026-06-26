@@ -6,6 +6,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::config::{Config, CONFIG_FILE};
 use crate::error::{Error, Result};
@@ -88,6 +89,36 @@ impl Store {
             return Err(Error::NotFound(id.to_string()));
         }
         Ticket::load(&path)
+    }
+
+    /// Load a ticket as committed on a git ref (e.g. a `tkt/<id>` branch), via
+    /// `git show <ref>:<tickets_dir>/<id>.md` — no checkout, no working-tree state.
+    /// Lets an orchestrator on `main` observe a worker's in-flight status.
+    pub fn load_at_ref(&self, id: &str, git_ref: &str) -> Result<Ticket> {
+        let rel = format!("{}/{id}.md", self.config.tickets_dir);
+        let spec = format!("{git_ref}:{rel}");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["show", &spec])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let s = stderr.trim();
+            // A missing ref or a path absent on that ref is "not found"; anything
+            // else (e.g. not a git repo) is a usage/environment error.
+            if s.contains("does not exist")
+                || s.contains("exists on disk, but not in")
+                || s.contains("unknown revision")
+                || s.contains("invalid object name")
+            {
+                return Err(Error::NotFound(format!("{id} @ {git_ref}")));
+            }
+            return Err(Error::Invalid(format!("`git show {spec}` failed: {s}")));
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        Ticket::parse(&raw).map_err(|e| Error::Invalid(format!("{id} @ {git_ref}: {e}")))
     }
 
     /// Atomically overwrite a ticket file.
@@ -211,7 +242,13 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          # Optionally map a scope to its owning crate so the Rust backend can expand\n\
          # reverse-dependents (requires `cargo` at runtime).\n\
          [scope_crates]\n\
-         # \"core\" = \"my-core-crate\"\n"
+         # \"core\" = \"my-core-crate\"\n\
+         \n\
+         # Name a forked/external dependency (pinned via `git = … rev = …`) as a scope.\n\
+         # The guard flags a branch that bumps the pin (matched by `repo`) or edits an\n\
+         # in-tree fork `paths` glob, against tickets declaring the same scope.\n\
+         [external_scopes]\n\
+         # \"sqlparser-fork\" = {{ repo = \"tomsanbear/sqlparser\", paths = [] }}\n"
     )
 }
 

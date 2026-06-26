@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use guppy::graph::DependencyDirection;
 use guppy::{MetadataCommand, PackageId};
 
-use ticketsplease_core::guard::AffectedSetMapper;
+use ticketsplease_core::guard::{merge_cause, AffectedSetMapper, ScopeCause};
 use ticketsplease_core::{Error, Result};
 
 /// Maps changed files to scopes via the cargo crate graph and reverse-dependents.
@@ -19,12 +19,16 @@ pub struct CargoMapper {
     repo: PathBuf,
     /// Inverted `[scope_crates]`: crate name -> the scopes it backs.
     crate_to_scopes: BTreeMap<String, Vec<String>>,
+    /// When true, gate on the crates that own changed files only — skip the
+    /// reverse-dependency expansion (and the scopes it would add transitively).
+    direct_only: bool,
 }
 
 impl CargoMapper {
-    /// Build from the repo root and the config's `scope -> crate` map.
+    /// Build from the repo root and the config's `scope -> crate` map. When
+    /// `direct_only` is set, the reverse-dependency walk is skipped.
     #[must_use]
-    pub fn new(repo: &Path, scope_crates: &BTreeMap<String, String>) -> Self {
+    pub fn new(repo: &Path, scope_crates: &BTreeMap<String, String>, direct_only: bool) -> Self {
         let mut crate_to_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (scope, krate) in scope_crates {
             crate_to_scopes
@@ -35,15 +39,16 @@ impl CargoMapper {
         Self {
             repo: repo.to_path_buf(),
             crate_to_scopes,
+            direct_only,
         }
     }
 }
 
 impl AffectedSetMapper for CargoMapper {
-    fn map(&self, changed_files: &[String]) -> Result<BTreeSet<String>> {
+    fn map(&self, changed_files: &[String]) -> Result<BTreeMap<String, ScopeCause>> {
         // No crate→scope mapping configured ⇒ nothing this backend can add.
         if self.crate_to_scopes.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(BTreeMap::new());
         }
 
         let graph = MetadataCommand::new()
@@ -66,27 +71,45 @@ impl AffectedSetMapper for CargoMapper {
         }
 
         // Seed crates: the workspace member owning each changed file (longest match).
+        // Track names too, so reverse-dep results can be classified direct vs transitive.
         let mut seeds: BTreeSet<&PackageId> = BTreeSet::new();
+        let mut seed_names: BTreeSet<&str> = BTreeSet::new();
         for file in changed_files {
-            let mut best: Option<(usize, &PackageId)> = None;
-            for (rel, id, _) in &members {
+            let mut best: Option<(usize, &PackageId, &str)> = None;
+            for (rel, id, name) in &members {
                 if file_under(file, rel) {
                     let len = rel.len();
                     let better = match best {
-                        Some((blen, _)) => len > blen,
+                        Some((blen, _, _)) => len > blen,
                         None => true,
                     };
                     if better {
-                        best = Some((len, id));
+                        best = Some((len, id, name.as_str()));
                     }
                 }
             }
-            if let Some((_, id)) = best {
+            if let Some((_, id, name)) = best {
                 seeds.insert(id);
+                seed_names.insert(name);
             }
         }
         if seeds.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(BTreeMap::new());
+        }
+
+        let mut scopes: BTreeMap<String, ScopeCause> = BTreeMap::new();
+
+        // `--direct-only`: the changed crates themselves are a direct file overlap;
+        // skip the reverse-dependency walk entirely.
+        if self.direct_only {
+            for name in &seed_names {
+                if let Some(s) = self.crate_to_scopes.get(*name) {
+                    for scope in s {
+                        merge_cause(&mut scopes, scope.clone(), ScopeCause::Direct);
+                    }
+                }
+            }
+            return Ok(scopes);
         }
 
         // Reverse-reachable set: the seeds plus every crate that depends on them.
@@ -95,10 +118,18 @@ impl AffectedSetMapper for CargoMapper {
             .map_err(|e| Error::Invalid(format!("guppy reverse query failed: {e}")))?;
         let resolved = query.resolve();
 
-        let mut scopes = BTreeSet::new();
         for pkg in resolved.packages(DependencyDirection::Reverse) {
             if let Some(s) = self.crate_to_scopes.get(pkg.name()) {
-                scopes.extend(s.iter().cloned());
+                // A seed crate is a direct overlap; everything else is reached only
+                // by depending on a changed crate — transitive.
+                let cause = if seed_names.contains(pkg.name()) {
+                    ScopeCause::Direct
+                } else {
+                    ScopeCause::Transitive
+                };
+                for scope in s {
+                    merge_cause(&mut scopes, scope.clone(), cause);
+                }
             }
         }
         Ok(scopes)

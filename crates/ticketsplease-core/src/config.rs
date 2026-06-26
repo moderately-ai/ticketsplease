@@ -39,6 +39,24 @@ pub struct Config {
     /// Scope name -> owning crate (lets the Rust backend expand reverse-deps).
     #[serde(default)]
     pub scope_crates: BTreeMap<String, String>,
+    /// Scope name -> external/forked dependency descriptor. Lets the guard flag a
+    /// branch that bumps a pinned `git = … rev = …` dependency (or edits an
+    /// in-tree fork path) against tickets that declare the same external scope.
+    #[serde(default)]
+    pub external_scopes: BTreeMap<String, ExternalScope>,
+}
+
+/// An external/forked dependency that lives outside this repo (pinned via
+/// `git = "…" rev = "…"`), expressed as a named scope tickets can declare.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalScope {
+    /// Upstream repo identifier, matched as a substring against changed manifest
+    /// (`Cargo.toml`/`Cargo.lock`) lines — e.g. `"tomsanbear/sqlparser"`.
+    pub repo: String,
+    /// Optional in-tree globs for a vendored / path-dependency fork. Empty means
+    /// the scope fires only on a manifest pin change keyed by `repo`.
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// Language-backend selection for the conflict guard.
@@ -70,6 +88,7 @@ impl Default for Config {
             language: Language::default(),
             scopes: BTreeMap::new(),
             scope_crates: BTreeMap::new(),
+            external_scopes: BTreeMap::new(),
         }
     }
 }

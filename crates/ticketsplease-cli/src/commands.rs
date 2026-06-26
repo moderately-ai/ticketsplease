@@ -2,6 +2,8 @@
 //! versioned JSON payload under `--format json`.
 
 use std::path::Path;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,7 +19,7 @@ use ticketsplease_core::{
 
 use crate::cli::{
     ClaimArgs, CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs,
-    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, WhyArgs,
+    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -299,10 +301,13 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
     }
 }
 
-/// `show` — print a single ticket.
+/// `show` — print a single ticket, from the working tree or a git ref (`--ref`).
 pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let ticket = store.load(&args.id)?;
+    let ticket = match &args.r#ref {
+        Some(git_ref) => store.load_at_ref(&args.id, git_ref)?,
+        None => store.load(&args.id)?,
+    };
     match fmt {
         Format::Json => print_json(&ticket_json(&ticket)),
         Format::Human => {
@@ -357,6 +362,195 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `status` — report ticket status. With `--all-branches`, read each ticket as
+/// committed on its `<prefix>*` branch tip; otherwise from the working tree.
+pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    if !args.all_branches {
+        let tickets = store.load_all()?;
+        return match fmt {
+            Format::Json => {
+                let rows: Vec<Value> = tickets
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "id": t.id,
+                            "status": t.status.as_str(),
+                            "assignee": t.assignee,
+                            "lease_expires_at": t.lease_expires_at,
+                        })
+                    })
+                    .collect();
+                print_json(&json!({ "schema_version": 1, "source": "worktree", "tickets": rows }))
+            }
+            Format::Human => {
+                for t in &tickets {
+                    println!("{:<12} {}", t.status.as_str(), t.id);
+                }
+                Ok(())
+            }
+        };
+    }
+
+    let pattern = format!("refs/heads/{}*", args.prefix);
+    let branches = git_lines(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", &pattern],
+    )?;
+    let mut rows = Vec::new();
+    for branch in &branches {
+        let id = branch
+            .strip_prefix(&args.prefix)
+            .unwrap_or(branch)
+            .to_string();
+        match store.load_at_ref(&id, branch) {
+            Ok(t) => rows.push(json!({
+                "branch": branch,
+                "id": t.id,
+                "status": t.status.as_str(),
+                "assignee": t.assignee,
+                "lease_expires_at": t.lease_expires_at,
+            })),
+            // The ticket file may be absent on this branch tip — report, don't abort.
+            Err(_) => rows.push(json!({
+                "branch": branch,
+                "id": id,
+                "status": Value::Null,
+                "note": "ticket not found on branch tip",
+            })),
+        }
+    }
+    match fmt {
+        Format::Json => {
+            print_json(&json!({ "schema_version": 1, "source": "branches", "tickets": rows }))
+        }
+        Format::Human => {
+            if rows.is_empty() {
+                println!("(no {}* branches)", args.prefix);
+            }
+            for r in &rows {
+                println!(
+                    "{:<24} {:<12} {}",
+                    r["branch"].as_str().unwrap_or(""),
+                    r["status"].as_str().unwrap_or("(missing)"),
+                    r["id"].as_str().unwrap_or(""),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `watch` — block until a ticket reaches `--until` (or `done`), polling the
+/// working tree or a git ref. Times out (exit 7) when `--timeout` elapses.
+pub fn watch(repo: &Path, fmt: Format, args: &WatchArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let target: Status = args.until.parse()?;
+    // Resolve which ref to poll: explicit --ref, else the conventional
+    // `<prefix><id>` branch if it exists, else the working tree.
+    let resolved_ref: Option<String> = match &args.r#ref {
+        Some(r) => Some(r.clone()),
+        None => {
+            let candidate = format!("{}{}", args.prefix, args.id);
+            branch_exists(repo, &candidate).then_some(candidate)
+        }
+    };
+    let start = Instant::now();
+    loop {
+        let ticket = match &resolved_ref {
+            Some(r) => store.load_at_ref(&args.id, r)?,
+            None => store.load(&args.id)?,
+        };
+        // `done` is always terminal, so a ticket that skips past the target still ends the wait.
+        if ticket.status == target || ticket.status == Status::Done {
+            emit_watch(fmt, args, resolved_ref.as_deref(), ticket.status, true)?;
+            return Ok(());
+        }
+        if let Some(timeout) = args.timeout {
+            if start.elapsed().as_secs() >= timeout {
+                emit_watch(fmt, args, resolved_ref.as_deref(), ticket.status, false)?;
+                return Err(Error::Timeout(format!(
+                    "ticket `{}` did not reach `{}` within {timeout}s",
+                    args.id, args.until
+                )));
+            }
+        }
+        std::thread::sleep(Duration::from_secs(args.interval));
+    }
+}
+
+/// Emit the watch result (so stdout carries a payload even on the timeout path).
+/// `reached` is the only outcome bit: a non-reached emit is always a timeout.
+fn emit_watch(
+    fmt: Format,
+    args: &WatchArgs,
+    git_ref: Option<&str>,
+    status: Status,
+    reached: bool,
+) -> Result<()> {
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "id": args.id,
+            "ref": git_ref,
+            "status": status.as_str(),
+            "reached": reached,
+            "timed_out": !reached,
+        })),
+        Format::Human => {
+            let location = git_ref.unwrap_or("(working tree)");
+            if reached {
+                println!("{} reached `{}` (at {location})", args.id, status.as_str());
+            } else {
+                println!(
+                    "{} timed out at `{}` (at {location})",
+                    args.id,
+                    status.as_str()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether a local branch exists.
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run `git <args>` in `repo` and return its non-empty stdout lines.
+fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Invalid(format!(
+            "git {args:?} failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// `lint` — schema validation across all tickets. Exits non-zero on findings.
@@ -516,13 +710,32 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
 
     let path_mapper = guard::PathGlobMapper::new(&store.config)?;
     let cargo_mapper = if store.config.language.backend == Backend::Rust {
-        Some(CargoMapper::new(repo, &store.config.scope_crates))
+        Some(CargoMapper::new(
+            repo,
+            &store.config.scope_crates,
+            args.direct_only,
+        ))
     } else {
         None
+    };
+    // External-scope detection is language-agnostic (it reads manifest diffs) and
+    // runs even under --direct-only, since a pin bump is a direct change.
+    let external_mapper = if store.config.external_scopes.is_empty() {
+        None
+    } else {
+        Some(guard::ExternalScopeMapper::new(
+            repo,
+            &base,
+            &args.branch,
+            &store.config.external_scopes,
+        )?)
     };
     let mut mappers: Vec<&dyn guard::AffectedSetMapper> = vec![&path_mapper];
     if let Some(cm) = &cargo_mapper {
         mappers.push(cm);
+    }
+    if let Some(em) = &external_mapper {
+        mappers.push(em);
     }
 
     let report = guard::evaluate(target, &all, diff, &mappers)?;
@@ -583,6 +796,19 @@ fn print_guard_human(report: &guard::GuardReport) {
         "  affected scopes: {}",
         join_or_none(&report.affected_scopes)
     );
+    let transitive: Vec<&str> = report
+        .affected_causes
+        .iter()
+        .filter(|(_, c)| **c == guard::ScopeCause::Transitive)
+        .map(|(s, _)| s.as_str())
+        .collect();
+    if !transitive.is_empty() {
+        // These are reached only via reverse-deps; an additive change can't break them.
+        println!(
+            "    (transitive via reverse-deps: {})",
+            transitive.join(", ")
+        );
+    }
     println!(
         "  declared scopes: {}",
         join_or_none(&report.declared_scopes)
@@ -591,7 +817,12 @@ fn print_guard_human(report: &guard::GuardReport) {
         println!("  UNDER-DECLARED:  {}", report.under_declared.join(", "));
     }
     for c in &report.collisions {
-        println!("  COLLISION with `{}`: {}", c.ticket, c.scopes.join(", "));
+        println!(
+            "  COLLISION ({}) with `{}`: {}",
+            c.cause.as_str(),
+            c.ticket,
+            c.scopes.join(", ")
+        );
     }
     println!(
         "  verdict: {}",
@@ -645,6 +876,13 @@ fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
     for m in members {
         s.push_str(&format!("\"{}\" = \"{}\"\n", m.name, m.name));
     }
+    s.push_str(
+        "\n# Name a forked/external dependency (pinned via `git = … rev = …`) as a scope.\n\
+         # The guard flags a branch that bumps the pin (matched by `repo`) or edits an\n\
+         # in-tree fork `paths` glob, against tickets declaring the same scope.\n\
+         [external_scopes]\n\
+         # \"sqlparser-fork\" = { repo = \"tomsanbear/sqlparser\", paths = [] }\n",
+    );
     s
 }
 

@@ -439,3 +439,427 @@ fn git(repo: &Path, args: &[&str]) {
         .unwrap();
     assert!(status.success(), "git {args:?} failed");
 }
+
+/// Write a minimal 2-crate cargo workspace (crate-b depends on crate-a) into `repo`.
+fn write_cargo_fixture(repo: &Path) {
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crate-a\", \"crate-b\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("crate-a/src")).unwrap();
+    std::fs::write(
+        repo.join("crate-a/Cargo.toml"),
+        "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("crate-a/src/lib.rs"), "pub fn a() {}\n").unwrap();
+    std::fs::create_dir_all(repo.join("crate-b/src")).unwrap();
+    std::fs::write(
+        repo.join("crate-b/Cargo.toml"),
+        "[package]\nname = \"crate-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\ncrate-a = { path = \"../crate-a\" }\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("crate-b/src/lib.rs"), "pub fn b() {}\n").unwrap();
+}
+
+/// The reverse-dependency walk: editing crate-a (a leaf) flags crate-b (a
+/// dependent) transitively. `--direct-only` suppresses that expansion.
+#[test]
+fn guard_cargo_reverse_dep_is_tagged_transitive() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_cargo_fixture(repo);
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [language]\nbackend = \"rust\"\n[scopes]\n[scope_crates]\n\"a\" = \"crate-a\"\n\"b\" = \"crate-b\"\n",
+    )
+    .unwrap();
+    // `t` owns crate-a (declares scope a + b to isolate the collision), `u` owns crate-b.
+    tkt(repo)
+        .args([
+            "create", "--id", "t", "--title", "T", "--scope", "a", "--scope", "b",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "in-progress"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "u", "--title", "U", "--scope", "b"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "u", "--status", "in-progress"])
+        .assert()
+        .success();
+
+    git_init_commit(repo);
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(
+        repo.join("crate-a/src/lib.rs"),
+        "pub fn a() { /* edit */ }\n",
+    )
+    .unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "edit a",
+        ],
+    );
+
+    // Default: crate-b is reached only via reverse-deps -> transitive collision, exit 6.
+    let out = tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["affected_causes"]["a"], "direct");
+    assert_eq!(v["affected_causes"]["b"], "transitive");
+    assert_eq!(v["collisions"][0]["ticket"], "u");
+    assert_eq!(v["collisions"][0]["cause"], "transitive");
+
+    // --direct-only drops the reverse-dep expansion: no collision, clean.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--direct-only"])
+        .assert()
+        .success();
+    // The alias resolves to the same behaviour.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--no-reverse-deps"])
+        .assert()
+        .success();
+}
+
+const CARGO_PIN: &str = "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n\
+     [dependencies]\nsqlparser = { git = \"https://github.com/example/sqlparser\", rev = \"REV\" }\n";
+
+/// A branch that bumps a pinned external `git`/`rev` dependency is flagged against
+/// the matching external scope, even with the language backend off.
+#[test]
+fn guard_flags_external_scope_rev_bump() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [language]\nbackend = \"none\"\n\
+         [external_scopes]\n\"sqlparser-fork\" = { repo = \"example/sqlparser\" }\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("Cargo.toml"), CARGO_PIN.replace("REV", "aaaaaaa")).unwrap();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+
+    git_init_commit(repo);
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    // The only change on the branch: bump the pinned rev.
+    std::fs::write(repo.join("Cargo.toml"), CARGO_PIN.replace("REV", "bbbbbbb")).unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "bump rev",
+        ],
+    );
+
+    // Undeclared external scope -> exit 6, tagged direct.
+    let out = tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["affected_causes"]["sqlparser-fork"], "direct");
+    assert_eq!(v["under_declared"][0], "sqlparser-fork");
+
+    // Declaring the external scope clears the gate.
+    tkt(repo)
+        .args(["set", "t", "--add-scope", "sqlparser-fork"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t"])
+        .assert()
+        .success();
+}
+
+/// Two tickets declaring the same external scope name never share a `tracks` batch
+/// — the scheduler treats external scopes like any other named scope.
+#[test]
+fn tracks_separates_tickets_sharing_external_scope() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "p",
+            "--title",
+            "P",
+            "--scope",
+            "sqlparser-fork",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "q",
+            "--title",
+            "Q",
+            "--scope",
+            "sqlparser-fork",
+        ])
+        .assert()
+        .success();
+
+    let out = tkt(repo)
+        .args(["tracks", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let batches = v["batches"].as_array().unwrap();
+    assert_eq!(batches.len(), 2, "conflicting tickets need two batches");
+    for b in batches {
+        let ids: Vec<&str> = b
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !(ids.contains(&"p") && ids.contains(&"q")),
+            "p and q share a scope; must not share a batch"
+        );
+    }
+}
+
+/// `show --ref` and `status --all-branches` observe a worker's in-flight status
+/// committed on its branch, while the working tree (main) still shows the old one.
+#[test]
+fn cross_branch_state_is_observable() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+
+    // Branch tkt/t advances the ticket to review, committed on the branch only.
+    git(repo, &["checkout", "-q", "-b", "tkt/t"]);
+    tkt(repo)
+        .args(["set", "t", "--status", "review"])
+        .assert()
+        .success();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "review",
+        ],
+    );
+    git(repo, &["checkout", "-q", "main"]);
+
+    // Working tree (main) still shows todo; the branch tip shows review.
+    let wt: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(wt["status"], "todo");
+    let on_branch: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--ref", "tkt/t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(on_branch["status"], "review");
+
+    // status --all-branches reports the branch tip status from main.
+    let st: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["status", "--all-branches", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(st["source"], "branches");
+    let row = st["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["branch"] == "tkt/t")
+        .expect("tkt/t row present");
+    assert_eq!(row["status"], "review");
+    assert_eq!(row["id"], "t");
+}
+
+/// `watch` returns 0 immediately when the ticket is already at the target.
+#[test]
+fn watch_returns_when_already_at_target() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "review"])
+        .assert()
+        .success();
+
+    // No git branch -> polls the working tree, already at review.
+    let out = tkt(repo)
+        .args(["watch", "t", "--until", "review", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["reached"], true);
+    assert_eq!(v["status"], "review");
+}
+
+/// `watch` exits 7 (timeout) when the target is never reached.
+#[test]
+fn watch_times_out_with_exit_7() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+
+    let out = tkt(repo)
+        .args([
+            "watch",
+            "t",
+            "--until",
+            "review",
+            "--timeout",
+            "1",
+            "--interval",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["timed_out"], true);
+    assert_eq!(v["reached"], false);
+}
+
+/// `watch` with no `--ref` auto-resolves the conventional `tkt/<id>` branch and
+/// polls it — so an orchestrator on `main` sees the worker reach `review`.
+#[test]
+fn watch_auto_resolves_the_ticket_branch() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+
+    // Worker advances the ticket to review on its branch, then we return to main.
+    git(repo, &["checkout", "-q", "-b", "tkt/t"]);
+    tkt(repo)
+        .args(["set", "t", "--status", "review"])
+        .assert()
+        .success();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "review",
+        ],
+    );
+    git(repo, &["checkout", "-q", "main"]);
+
+    // No --ref: resolves tkt/t (exists) and reads review off its tip.
+    let out = tkt(repo)
+        .args(["watch", "t", "--until", "review", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["reached"], true);
+    assert_eq!(v["ref"], "tkt/t");
+    assert_eq!(v["status"], "review");
+}

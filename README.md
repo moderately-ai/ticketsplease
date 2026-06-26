@@ -14,7 +14,7 @@ tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes it
                                   # ticket's declared scope or collides with another
 ```
 
-`init` / `create` / `set` / `link` / `ready` / `next` / `lint` are the convenience surface around those two.
+`init` / `create` / `set` / `link` / `show` / `ready` / `next` / `lint` are the convenience surface around those two; `status --all-branches` and `watch` give an orchestrator visibility into workers running on their own branches.
 
 ## Install
 
@@ -46,6 +46,8 @@ tkt ready                             # what's dispatchable now
 tkt tracks                            # conflict-free parallel batches
 tkt next --parallel 4                 # four disjoint picks for four agents
 tkt guard my-branch                   # gate a branch before merge (exit 6 = conflict)
+tkt status --all-branches             # each worker's tip status across tkt/* branches
+tkt watch add-vector-index --until review --timeout 600  # block until a worker is ready (exit 7 on timeout)
 tkt lint                              # validate schema, links, and cycles
 ```
 
@@ -88,14 +90,19 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 
 [scope_crates]                 # scope -> owning crate, so the guard expands reverse-dependents
 "core" = "my-core-crate"
+
+[external_scopes]              # name a forked dep (pinned via git=…rev=…) as a scope
+"sqlparser-fork" = { repo = "tomsanbear/sqlparser", paths = [] }
 ```
 
-When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo).
+When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo). Each collision is tagged `cause: "direct"` (a real file/crate overlap) or `"transitive"` (reached only via the reverse-dep walk — safe for an additive change), and a per-scope `affected_causes` map lets a consumer triage which under-declarations and collisions are real rather than hand-diffing. Pass `guard --direct-only` (alias `--no-reverse-deps`) to gate on direct overlap only and skip the expansion entirely.
+
+`[external_scopes]` extends the guard beyond this repo: a branch that bumps a pinned `git = … rev = …` dependency (matched by `repo` against the changed manifest lines) — or edits an in-tree fork `paths` glob — is flagged against tickets declaring that external scope. Because external scopes are ordinary scope names, `tracks` already keeps two tickets touching the same fork in separate batches.
 
 ## The contract
 
 - **`--format json`** on every command yields a stable, versioned payload (`schema_version: 1`), deterministically ordered (sorted keys, no timestamps) — safe to diff and cache.
-- **Exit codes are the API:** `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` dependency cycle · `6` conflict.
+- **Exit codes are the API:** `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` dependency cycle · `6` conflict · `7` watch timeout.
 - Every command takes `--repo <path>`; everything is offline and atomic.
 
 ## The Claude skill
