@@ -60,9 +60,16 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ticketsplease guard tkt/<id> --format json   # exit 6 → do not merge
    ```
    - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's declared area; it clears this **pre-merge filter**. (This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
-   - Exit `6` → a **declared-area overlap, not a proven conflict.** The JSON says where: `under_declared` lists scopes the branch touched but the ticket never declared; `collisions` lists open tickets whose declared area it overlaps. Resolve by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), coordinating with the named ticket, or — if you own the merge — building+testing the combined result.
+   - Exit `6` → a **declared-area overlap, not a proven conflict.** The JSON says where: `under_declared` lists scopes the branch touched but the ticket never declared; `collisions` lists open tickets whose declared area it overlaps. Each collision (and each scope in `affected_causes`) is tagged `direct` (a real file/crate overlap) or `transitive` (reached only by the cargo reverse-dep walk — usually safe for an additive change); re-run `guard --direct-only` to gate on direct overlap alone. Resolve by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), coordinating with the named ticket, or — if you own the merge — building+testing the combined result.
 
 4. **Finish or release.** `claim` already set the ticket in-progress; on completion move it forward with `ticketsplease set <id> --status review|done`. If you abandon the work, `ticketsplease release <id> --as <worker-id>` drops the claim and returns it to the ready pool. Renew a long-running claim by re-running `claim` (it extends your lease).
+
+5. **Observe and coordinate in flight.** Workers advance status and leave notes on their own `tkt/<id>` branches; from `main` you watch the shared activity log without a checkout:
+   ```sh
+   ticketsplease events --watch --since <cursor> --format json   # wake on the next status/claim/comment, across all tickets
+   ticketsplease comment add <id> --as <worker> --body-file -     # leave a durable note (e.g. a blocked-reason)
+   ```
+   Events are `.git` refs, so they're visible the instant they're written — no commit needed — and `comment add` rings the same doorbell. Comments are append-only files (one per comment), conflict-free under concurrent authors. `tkt show <id>` folds a ticket's comments in. See `references/parallel-workflow.md` for the full observe/coordinate loop.
 
 For a single highest-leverage pick instead of a whole batch:
 ```sh
