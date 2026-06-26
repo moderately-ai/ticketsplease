@@ -80,9 +80,9 @@ Adding a comment also emits an **event** (below), so a watcher is notified live.
 ## events
 
 ```
-ticketsplease events [--since <event-id>] [--ticket <id>] [--type <kind>]
+ticketsplease events [--since <event-id>] [--ticket <id>] [--type <kind>] [--watch] [--interval 2] [--timeout <secs>]
 ```
-The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob, living entirely in `.git`. So events are visible across worktrees and a shared clone **immediately — no commit, no push, no merge** — and concurrent emits never collide (per-ref atomic create). The id is time-sortable; pass `--since <last-seen-id>` as a cursor for resumable tailing that never misses a transition. `--ticket` / `--type` filter. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`. (Empty when there's no git repo — the event log is the live signal; the comment files are the durable record.)
+The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob, living entirely in `.git`. So events are visible across worktrees and a shared clone **immediately — no commit, no push, no merge** — and concurrent emits never collide (per-ref atomic create). `comment add`, `set --status`, `claim`, and `release` all emit events, so this one stream is the full activity feed. The id is time-sortable; pass `--since <last-seen-id>` as a cursor for resumable tailing that never misses a transition. `--ticket` / `--type` filter. `--watch` blocks until at least one matching event appears (the wake-on-event an orchestrator loops, advancing `--since`), exiting **7** on `--timeout`. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`. (Empty when there's no git repo — the event log is the live signal; the comment files are the durable record.)
 
 ## ready
 

@@ -55,9 +55,11 @@ The guard is the safety net that lets you dispatch aggressively: if two branches
 
 Workers advance status on their own `tkt/<id>` branches, so an orchestrator on `main` can't see it via `list` (working-tree only) until merge. Three commands read across branches without a checkout:
 
-- `ticketsplease status --all-branches` — every `tkt/*` branch's ticket status at its tip; poll it to see who has reached `review`.
-- `ticketsplease watch <id> --until review --timeout <secs>` — block until a worker is ready to merge (exit 0) or give up (exit 7). It auto-resolves the `tkt/<id>` branch.
-- `ticketsplease show <id> --ref tkt/<id>` — read one ticket as committed on its branch.
+- `ticketsplease events --watch --since <cursor>` — the **multiplexed** wake-on-event across *all* tickets at once: returns the moment any worker changes status, claims, releases, or comments. Events live in `.git` refs, so you see them **without waiting for a commit** (unlike `status`/`show --ref`, which read committed branch state). Loop it, advancing `--since` to the last id you saw, to consume the stream without missing a transition. Prefer this to spawning N single-ticket watchers.
+- `ticketsplease comment add <id> --as <w> --body -` / `comment list <id> --ref tkt/<id>` — leave durable notes on a ticket (blocked-reasons, decisions, questions) and read a worker's notes from `main`. Each `comment add` also rings the event doorbell above.
+- `ticketsplease status --all-branches` — every `tkt/*` branch's ticket status at its committed tip; a simple snapshot when you don't need the live stream.
+- `ticketsplease watch <id> --until review --timeout <secs>` — block until one worker reaches a status (exit 0) or give up (exit 7). It auto-resolves the `tkt/<id>` branch.
+- `ticketsplease show <id> --ref tkt/<id>` — read one ticket (and its comments) as committed on its branch.
 
 **Dual-writer note:** claim *before* the worker branches. `claim` flips the ticket to `in-progress` in `main`, so when the worker branches off `main` the base and branch agree on status; the worker's later `set --status review` then merges cleanly. Writing status on `main` *after* the worker has already changed it on its branch is what produces a trivial status merge conflict.
 

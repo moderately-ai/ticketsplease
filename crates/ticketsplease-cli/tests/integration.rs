@@ -1121,3 +1121,103 @@ fn comment_emits_a_live_event_before_commit() {
     .unwrap();
     assert_eq!(by_ticket["events"].as_array().unwrap().len(), 2);
 }
+
+/// claim / set --status / release each drop an event, so the log is a full feed.
+#[test]
+fn status_claim_release_emit_events() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo); // claim's ref-CAS needs HEAD to be a real commit
+
+    tkt(repo)
+        .args(["claim", "t", "--as", "w1"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "review"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["release", "t", "--as", "w1", "--force"])
+        .assert()
+        .success();
+
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["events", "--ticket", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let kinds: Vec<&str> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"claim"), "claim event: {kinds:?}");
+    assert!(kinds.contains(&"status"), "status event: {kinds:?}");
+    assert!(kinds.contains(&"release"), "release event: {kinds:?}");
+}
+
+/// `events --watch` returns immediately when an event exists, and exits 7 on timeout.
+#[test]
+fn events_watch_wakes_and_times_out() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git(repo, &["init", "-q", "-b", "main"]);
+
+    // Nothing yet: --watch with a short timeout exits 7 with an empty payload.
+    let out = tkt(repo)
+        .args([
+            "events",
+            "--watch",
+            "--timeout",
+            "1",
+            "--interval",
+            "1",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["events"].as_array().unwrap().len(), 0);
+
+    // Emit one; --watch finds it on the first poll and exits 0.
+    tkt(repo)
+        .args(["comment", "add", "t", "--body", "x"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["events", "--watch", "--timeout", "5", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["events"].as_array().unwrap().len(), 1);
+}

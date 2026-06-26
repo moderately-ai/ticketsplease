@@ -11,6 +11,7 @@ use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::claim as claim_core;
 use ticketsplease_core::comment::Comment;
 use ticketsplease_core::config::Backend;
+use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::store::{self, CreateOutcome};
@@ -216,6 +217,7 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let mut ticket = store.load(&args.id)?;
     let before = ticket.render();
+    let status_before = ticket.status;
 
     if let Some(status) = &args.status {
         ticket.set_status(status.parse()?)?;
@@ -248,6 +250,15 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     let changed = ticket.render() != before;
     if changed {
         store.save(&ticket)?;
+    }
+    // A status transition is an activity event watchers care about.
+    if changed && ticket.status != status_before {
+        let _ = store.emit_event(
+            "status",
+            &ticket.id,
+            None,
+            json!({ "status": ticket.status.as_str(), "from": status_before.as_str() }),
+        );
     }
 
     match fmt {
@@ -401,9 +412,34 @@ fn comment_value(c: &Comment) -> Value {
 }
 
 /// `events` — the cross-branch activity log, filterable and resumable via `--since`.
+/// With `--watch`, blocks until at least one matching event appears (exit 7 on
+/// timeout) — a wake-on-event the orchestrator loops, advancing `--since`.
 pub fn events(repo: &Path, fmt: Format, args: &EventsArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let mut evs = store.events()?;
+    if !args.watch {
+        let evs = filter_events(store.events()?, args);
+        return print_events(fmt, &evs);
+    }
+    let start = Instant::now();
+    loop {
+        let evs = filter_events(store.events()?, args);
+        if !evs.is_empty() {
+            return print_events(fmt, &evs);
+        }
+        if let Some(timeout) = args.timeout {
+            if start.elapsed().as_secs() >= timeout {
+                // Emit an empty payload so stdout always carries JSON, then signal 7.
+                print_events(fmt, &[])?;
+                return Err(Error::Timeout(format!(
+                    "no matching event within {timeout}s"
+                )));
+            }
+        }
+        std::thread::sleep(Duration::from_secs(args.interval));
+    }
+}
+
+fn filter_events(mut evs: Vec<Event>, args: &EventsArgs) -> Vec<Event> {
     if let Some(since) = &args.since {
         evs.retain(|e| &e.id > since);
     }
@@ -413,14 +449,18 @@ pub fn events(repo: &Path, fmt: Format, args: &EventsArgs) -> Result<()> {
     if let Some(kind) = &args.kind {
         evs.retain(|e| &e.kind == kind);
     }
+    evs
+}
+
+fn print_events(fmt: Format, evs: &[Event]) -> Result<()> {
     match fmt {
         Format::Json => {
-            let events_json = serde_json::to_value(&evs)
+            let events_json = serde_json::to_value(evs)
                 .map_err(|e| Error::Internal(format!("serializing events: {e}")))?;
             print_json(&json!({ "schema_version": 1, "events": events_json }))
         }
         Format::Human => {
-            for e in &evs {
+            for e in evs {
                 println!(
                     "{}  {:<8} {}  {}",
                     e.id,
@@ -1071,6 +1111,12 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
 pub fn claim(repo: &Path, fmt: Format, args: &ClaimArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let outcome = claim_core::claim(&store, &args.id, &args.agent, args.ttl)?;
+    let _ = store.emit_event(
+        "claim",
+        &outcome.id,
+        Some(&outcome.assignee),
+        json!({ "stolen": outcome.stolen, "lease_expires_at": outcome.lease_expires_at }),
+    );
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
@@ -1095,6 +1141,9 @@ pub fn claim(repo: &Path, fmt: Format, args: &ClaimArgs) -> Result<()> {
 pub fn release(repo: &Path, fmt: Format, args: &ReleaseArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let released = claim_core::release(&store, &args.id, args.agent.as_deref(), args.force)?;
+    if released {
+        let _ = store.emit_event("release", &args.id, args.agent.as_deref(), Value::Null);
+    }
     match fmt {
         Format::Json => {
             print_json(&json!({ "schema_version": 1, "id": args.id, "released": released }))

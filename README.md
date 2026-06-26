@@ -14,7 +14,7 @@ tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes it
                                   # ticket's declared scope or collides with another
 ```
 
-`init` / `create` / `set` / `link` / `show` / `ready` / `next` / `lint` are the convenience surface around those two; `status --all-branches`, `watch`, and `comment` give an orchestrator visibility into — and an append-only, conflict-free annotation channel for — workers running on their own branches.
+`init` / `create` / `set` / `link` / `show` / `ready` / `next` / `lint` are the convenience surface around those two; `status --all-branches`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches.
 
 ## Install
 

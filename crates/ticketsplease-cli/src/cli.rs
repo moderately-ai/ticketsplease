@@ -289,6 +289,16 @@ pub struct EventsArgs {
     /// Only events of this kind (e.g. `comment`, `status`, `claim`).
     #[arg(long = "type")]
     pub kind: Option<String>,
+    /// Block until at least one matching event appears (wake-on-event); pair with
+    /// `--since <last-id>` and loop to consume the stream without missing any.
+    #[arg(long)]
+    pub watch: bool,
+    /// Poll interval in seconds while `--watch`ing.
+    #[arg(long, default_value_t = 2)]
+    pub interval: u64,
+    /// With `--watch`, give up after this many seconds (exit 7).
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 /// `next` arguments.
