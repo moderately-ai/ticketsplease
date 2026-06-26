@@ -19,16 +19,27 @@ pub struct CargoMapper {
     repo: PathBuf,
     /// Inverted `[scope_crates]`: crate name -> the scopes it backs.
     crate_to_scopes: BTreeMap<String, Vec<String>>,
+    /// Scopes that also have path globs. For these the [`PathGlobMapper`] is the
+    /// authority on a *direct* (file) touch, so the crate graph only ever marks
+    /// them transitive — otherwise a change to one sub-crate scope would falsely
+    /// mark every sibling scope sharing the crate as directly touched.
+    glob_scopes: BTreeSet<String>,
     /// When true, gate on the crates that own changed files only — skip the
     /// reverse-dependency expansion (and the scopes it would add transitively).
     direct_only: bool,
 }
 
 impl CargoMapper {
-    /// Build from the repo root and the config's `scope -> crate` map. When
-    /// `direct_only` is set, the reverse-dependency walk is skipped.
+    /// Build from the repo root, the config's `scope -> crate` map, and the set of
+    /// scopes that have path globs. When `direct_only` is set, the reverse-dependency
+    /// walk is skipped.
     #[must_use]
-    pub fn new(repo: &Path, scope_crates: &BTreeMap<String, String>, direct_only: bool) -> Self {
+    pub fn new(
+        repo: &Path,
+        scope_crates: &BTreeMap<String, String>,
+        glob_scopes: &BTreeSet<String>,
+        direct_only: bool,
+    ) -> Self {
         let mut crate_to_scopes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (scope, krate) in scope_crates {
             crate_to_scopes
@@ -39,7 +50,20 @@ impl CargoMapper {
         Self {
             repo: repo.to_path_buf(),
             crate_to_scopes,
+            glob_scopes: glob_scopes.clone(),
             direct_only,
+        }
+    }
+
+    /// The cause for a scope reached from the crate graph. A scope is `Direct` only
+    /// when its crate owns a changed file AND the scope has no globs (so the crate
+    /// mapping is its only signal); a glob-defined scope is left to the
+    /// `PathGlobMapper` and so is at most `Transitive` here.
+    fn crate_scope_cause(&self, scope: &str, is_seed: bool) -> ScopeCause {
+        if is_seed && !self.glob_scopes.contains(scope) {
+            ScopeCause::Direct
+        } else {
+            ScopeCause::Transitive
         }
     }
 }
@@ -100,12 +124,16 @@ impl AffectedSetMapper for CargoMapper {
         let mut scopes: BTreeMap<String, ScopeCause> = BTreeMap::new();
 
         // `--direct-only`: the changed crates themselves are a direct file overlap;
-        // skip the reverse-dependency walk entirely.
+        // skip the reverse-dependency walk. Only crate-only scopes are emitted —
+        // glob-defined scopes are the PathGlobMapper's authority, so an unmatched
+        // sibling sharing the crate must not appear.
         if self.direct_only {
             for name in &seed_names {
                 if let Some(s) = self.crate_to_scopes.get(*name) {
                     for scope in s {
-                        merge_cause(&mut scopes, scope.clone(), ScopeCause::Direct);
+                        if !self.glob_scopes.contains(scope) {
+                            merge_cause(&mut scopes, scope.clone(), ScopeCause::Direct);
+                        }
                     }
                 }
             }
@@ -120,14 +148,9 @@ impl AffectedSetMapper for CargoMapper {
 
         for pkg in resolved.packages(DependencyDirection::Reverse) {
             if let Some(s) = self.crate_to_scopes.get(pkg.name()) {
-                // A seed crate is a direct overlap; everything else is reached only
-                // by depending on a changed crate — transitive.
-                let cause = if seed_names.contains(pkg.name()) {
-                    ScopeCause::Direct
-                } else {
-                    ScopeCause::Transitive
-                };
+                let is_seed = seed_names.contains(pkg.name());
                 for scope in s {
+                    let cause = self.crate_scope_cause(scope, is_seed);
                     merge_cause(&mut scopes, scope.clone(), cause);
                 }
             }

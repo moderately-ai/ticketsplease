@@ -1234,6 +1234,7 @@ fn write_ast_workspace(repo: &Path) {
         "crates/ast/src/dialect",
         "crates/ast/src/precedence",
         "crates/ast/src/vocab",
+        "crates/ast/src/nodes",
         "crates/parser/src",
     ] {
         std::fs::create_dir_all(repo.join(d)).unwrap();
@@ -1251,6 +1252,7 @@ fn write_ast_workspace(repo: &Path) {
     )
     .unwrap();
     std::fs::write(repo.join("crates/ast/src/vocab/mod.rs"), "// vocab\n").unwrap();
+    std::fs::write(repo.join("crates/ast/src/nodes/mod.rs"), "// nodes\n").unwrap();
     std::fs::write(
         repo.join("crates/parser/Cargo.toml"),
         "[package]\nname = \"parser\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
@@ -1265,8 +1267,9 @@ const AST_CONFIG: &str = "schema_version = 1\ntickets_dir = \"tickets\"\ndefault
      [scopes]\n\
      \"ast-dialect-data\" = [\"crates/ast/src/dialect/**\", \"crates/ast/src/precedence/**\"]\n\
      \"ast-vocab\" = [\"crates/ast/src/vocab/**\", \"crates/ast/src/lib.rs\"]\n\
+     \"ast-nodes\" = [\"crates/ast/src/nodes/**\"]\n\
      \"parser-scope\" = [\"crates/parser/**\"]\n\
-     [scope_crates]\n\"ast-dialect-data\" = \"ast\"\n\"ast-vocab\" = \"ast\"\n\"parser-scope\" = \"parser\"\n";
+     [scope_crates]\n\"ast-dialect-data\" = \"ast\"\n\"ast-vocab\" = \"ast\"\n\"ast-nodes\" = \"ast\"\n\"parser-scope\" = \"parser\"\n";
 
 /// The reported bug: editing files inside the declared sub-crate scope of a
 /// widely-depended-on crate must NOT be CONFLICT just because sibling scopes and
@@ -1336,6 +1339,8 @@ fn guard_subcrate_scopes_do_not_trip_under_declaration() {
     assert_eq!(v["conflict"], false);
     assert_eq!(v["under_declared"].as_array().unwrap().len(), 0);
     assert_eq!(v["affected_causes"]["ast-dialect-data"], "direct");
+    // An untouched sibling sub-scope sharing the crate is impact, not a direct touch.
+    assert_eq!(v["affected_causes"]["ast-nodes"], "transitive");
 
     // Now genuinely escape into a sibling sub-scope (vocab/, undeclared, not a path).
     std::fs::write(repo.join("crates/ast/src/vocab/mod.rs"), "// escaped\n").unwrap();

@@ -1,6 +1,7 @@
 //! Command handlers. Each emits human-readable text by default and a stable,
 //! versioned JSON payload under `--format json`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -866,10 +867,12 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
     let diff = guard::BranchDiff::compute(repo, &base, &args.branch)?;
 
     let path_mapper = guard::PathGlobMapper::new(&store.config)?;
+    let glob_scopes: BTreeSet<String> = store.config.scopes.keys().cloned().collect();
     let cargo_mapper = if store.config.language.backend == Backend::Rust {
         Some(CargoMapper::new(
             repo,
             &store.config.scope_crates,
+            &glob_scopes,
             args.direct_only,
         ))
     } else {
