@@ -6,11 +6,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::comment::Comment;
 use crate::config::{Config, CONFIG_FILE};
 use crate::error::{Error, Result};
+use crate::event::Event;
+use crate::ids;
 use crate::ticket::Ticket;
 
 /// A repository handle: the root directory plus its loaded config.
@@ -206,6 +208,122 @@ impl Store {
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    /// Emit an activity event as a `refs/ticketsplease/events/<id>` ref pointing at
+    /// a JSON blob. Lives entirely in `.git` (no working-tree change, no commit), so
+    /// it is visible across worktrees and a shared clone immediately. Best-effort:
+    /// returns `Ok(None)` when there is no git repo (the doorbell is auxiliary to
+    /// the durable record). Concurrent emits never collide — the id is unique.
+    pub fn emit_event(
+        &self,
+        kind: &str,
+        ticket: &str,
+        by: Option<&str>,
+        data: serde_json::Value,
+    ) -> Result<Option<Event>> {
+        let event = Event {
+            id: ids::new_id(),
+            ticket: ticket.to_string(),
+            kind: kind.to_string(),
+            by: by.map(str::to_string),
+            at: ids::now_secs(),
+            data,
+        };
+        let payload = serde_json::to_string(&event)
+            .map_err(|e| Error::Internal(format!("serializing event: {e}")))?;
+        let blob = match self.git_hash_object(&payload)? {
+            Some(sha) => sha,
+            None => return Ok(None), // not a git repo — skip the doorbell
+        };
+        let refname = format!("refs/ticketsplease/events/{}", event.id);
+        // Create-only (empty old-value): the id is unique, so this never clobbers.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["update-ref", &refname, &blob, ""])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(Error::Invalid(format!(
+                "git update-ref (event) failed: {}",
+                err.trim()
+            )));
+        }
+        Ok(Some(event))
+    }
+
+    /// All activity events, sorted chronologically by id. Empty when there is no
+    /// git repo or no events yet.
+    pub fn events(&self) -> Result<Vec<Event>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/ticketsplease/events/",
+            ])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::new();
+        for refname in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+        {
+            let show = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(["cat-file", "-p", refname])
+                .output()
+                .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+            if show.status.success() {
+                let raw = String::from_utf8_lossy(&show.stdout);
+                if let Ok(ev) = serde_json::from_str::<Event>(&raw) {
+                    events.push(ev);
+                }
+            }
+        }
+        events.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(events)
+    }
+
+    /// Write `content` to the object store as a loose blob, returning its sha.
+    /// `Ok(None)` when this is not a git repo.
+    fn git_hash_object(&self, content: &str) -> Result<Option<String>> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Internal("git hash-object stdin unavailable".into()))?
+            .write_all(content.as_bytes())
+            .map_err(Error::Io)?;
+        let out = child.wait_with_output().map_err(Error::Io)?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("not a git repository") {
+                return Ok(None);
+            }
+            return Err(Error::Invalid(format!(
+                "git hash-object failed: {}",
+                err.trim()
+            )));
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
     }
 
     /// Atomically overwrite a ticket file.

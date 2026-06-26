@@ -8,14 +8,11 @@
 //! A comment file is itself a frontmatter document, so it round-trips and is
 //! hand-editable like a ticket.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use yaml_rust2::YamlLoader;
 
 use crate::error::{Error, Result};
 use crate::frontmatter::Document;
+use crate::ids;
 
 /// A single comment on a ticket.
 #[derive(Debug, Clone)]
@@ -36,16 +33,10 @@ impl Comment {
     /// Build a new comment with a freshly generated id and current timestamp.
     #[must_use]
     pub fn new(by: Option<String>, reply_to: Option<String>, body: &str) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        // millis orders the filename; a random suffix breaks ties between two
-        // authors writing within the same millisecond.
-        let id = format!("{:013}-{:08x}", now.as_millis(), random_u32());
         Self {
-            id,
+            id: ids::new_id(),
             by,
-            at: Some(now.as_secs()),
+            at: Some(ids::now_secs()),
             reply_to,
             // Canonicalize: a trailing newline is insignificant, and dropping it
             // keeps `new` / `parse` / `render` byte-consistent.
@@ -105,14 +96,6 @@ fn yaml_dq(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// A random `u32` with no extra dependency: `RandomState` is seeded from OS
-/// entropy, so a hasher built from a fresh one yields process-unpredictable bits.
-fn random_u32() -> u32 {
-    let mut h = RandomState::new().build_hasher();
-    h.write_u8(0);
-    h.finish() as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,8 +115,8 @@ mod tests {
         let a = Comment::new(None, None, "x");
         let b = Comment::new(None, None, "y");
         assert_ne!(a.id, b.id, "ids must be unique");
-        // Same-or-later millisecond prefix keeps lexical sort chronological.
-        assert!(b.id >= a.id || b.id[..13] >= a.id[..13]);
+        // The (non-decreasing) timestamp prefix keeps the lexical sort chronological.
+        assert!(b.id[..19] >= a.id[..19]);
     }
 
     #[test]

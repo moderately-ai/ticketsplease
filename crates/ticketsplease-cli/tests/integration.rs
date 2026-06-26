@@ -1044,3 +1044,80 @@ fn concurrent_comments_are_all_kept() {
         "all concurrent comments must survive (conflict-free)"
     );
 }
+
+/// The event doorbell: `comment add` emits an event ref in `.git`, visible via
+/// `tkt events` with no commit — and `--since` / `--ticket` / `--type` filter it.
+#[test]
+fn comment_emits_a_live_event_before_commit() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    // A git repo, but deliberately no commit — the event lives in .git refs.
+    git(repo, &["init", "-q", "-b", "main"]);
+
+    tkt(repo)
+        .args(["comment", "add", "t", "--as", "w1", "--body", "live note"])
+        .assert()
+        .success();
+
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["events", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let evs = v["events"].as_array().unwrap();
+    assert_eq!(evs.len(), 1, "the comment event is visible with no commit");
+    assert_eq!(evs[0]["kind"], "comment");
+    assert_eq!(evs[0]["ticket"], "t");
+    assert_eq!(evs[0]["by"], "w1");
+    let first_id = evs[0]["id"].as_str().unwrap().to_string();
+
+    // A second comment; --since the first cursor returns only the newer event.
+    tkt(repo)
+        .args(["comment", "add", "t", "--body", "second"])
+        .assert()
+        .success();
+    let since: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["events", "--since", &first_id, "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        since["events"].as_array().unwrap().len(),
+        1,
+        "--since returns only events newer than the cursor"
+    );
+
+    // --type filters by kind; no status events have been emitted.
+    let typed: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["events", "--type", "status", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(typed["events"].as_array().unwrap().len(), 0);
+
+    // --ticket filters by ticket; both comment events are for `t`.
+    let by_ticket: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["events", "--ticket", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(by_ticket["events"].as_array().unwrap().len(), 2);
+}

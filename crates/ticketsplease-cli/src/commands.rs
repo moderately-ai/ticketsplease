@@ -19,8 +19,8 @@ use ticketsplease_core::{
 };
 
 use crate::cli::{
-    ClaimArgs, CommentAddArgs, CommentListArgs, CreateArgs, GuardArgs, InitArgs, LinkArgs,
-    ListArgs, NextArgs, ReleaseArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs,
+    ClaimArgs, CommentAddArgs, CommentListArgs, CreateArgs, EventsArgs, GuardArgs, InitArgs,
+    LinkArgs, ListArgs, NextArgs, ReleaseArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs,
     StatusArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
@@ -340,6 +340,15 @@ pub fn comment_add(repo: &Path, fmt: Format, args: &CommentAddArgs) -> Result<()
     let body = body_input(args.body.as_deref(), args.body_file.as_deref())?
         .ok_or_else(|| Error::Invalid("provide --body or --body-file".into()))?;
     let comment = store.add_comment(&args.id, args.as_.clone(), args.reply_to.clone(), &body)?;
+    // Best-effort live doorbell for watchers: an event ref in .git, visible
+    // cross-worktree without waiting for the comment file to be committed. A
+    // no-git repo (the doorbell is auxiliary) just skips it.
+    let _ = store.emit_event(
+        "comment",
+        &args.id,
+        comment.by.as_deref(),
+        json!({ "comment_id": comment.id, "reply_to": comment.reply_to, "body": comment.body }),
+    );
     match fmt {
         Format::Json => {
             let mut v = comment_value(&comment);
@@ -389,6 +398,40 @@ fn comment_value(c: &Comment) -> Value {
         "reply_to": c.reply_to,
         "body": c.body,
     })
+}
+
+/// `events` — the cross-branch activity log, filterable and resumable via `--since`.
+pub fn events(repo: &Path, fmt: Format, args: &EventsArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let mut evs = store.events()?;
+    if let Some(since) = &args.since {
+        evs.retain(|e| &e.id > since);
+    }
+    if let Some(ticket) = &args.ticket {
+        evs.retain(|e| &e.ticket == ticket);
+    }
+    if let Some(kind) = &args.kind {
+        evs.retain(|e| &e.kind == kind);
+    }
+    match fmt {
+        Format::Json => {
+            let events_json = serde_json::to_value(&evs)
+                .map_err(|e| Error::Internal(format!("serializing events: {e}")))?;
+            print_json(&json!({ "schema_version": 1, "events": events_json }))
+        }
+        Format::Human => {
+            for e in &evs {
+                println!(
+                    "{}  {:<8} {}  {}",
+                    e.id,
+                    e.kind,
+                    e.ticket,
+                    e.by.as_deref().unwrap_or("")
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `list` — list tickets, optionally filtered by status.

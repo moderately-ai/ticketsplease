@@ -47,6 +47,8 @@ pub enum Command {
     Watch(WatchArgs),
     /// Add or list a ticket's comments (append-only, conflict-free).
     Comment(CommentArgs),
+    /// Tail the cross-branch activity event log (comments, status, claims).
+    Events(EventsArgs),
     /// List dependency-satisfied, dispatchable tickets.
     Ready(ReadyArgs),
     /// Partition ready tickets into conflict-free parallel batches.
@@ -275,6 +277,20 @@ pub struct CommentListArgs {
     pub r#ref: Option<String>,
 }
 
+/// `events` arguments.
+#[derive(Args)]
+pub struct EventsArgs {
+    /// Only events newer than this event id (a cursor for resumable tailing).
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Only events for this ticket.
+    #[arg(long)]
+    pub ticket: Option<String>,
+    /// Only events of this kind (e.g. `comment`, `status`, `claim`).
+    #[arg(long = "type")]
+    pub kind: Option<String>,
+}
+
 /// `next` arguments.
 #[derive(Args)]
 pub struct NextArgs {
@@ -395,6 +411,7 @@ pub fn run(cli: Cli) -> Result<()> {
             CommentCommand::Add(a) => commands::comment_add(repo, fmt, a),
             CommentCommand::List(a) => commands::comment_list(repo, fmt, a),
         },
+        Command::Events(a) => commands::events(repo, fmt, a),
         Command::Lint(_) => commands::lint(repo, fmt),
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(_) => commands::tracks(repo, fmt),

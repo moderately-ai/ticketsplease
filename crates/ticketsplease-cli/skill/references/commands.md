@@ -75,6 +75,15 @@ ticketsplease comment list <id> [--ref <branch>]
 ```
 `comment add` appends a comment as its own file under `<tickets_dir>/<id>.comments/<comment-id>.md` (one file per comment, so concurrent authors never conflict — no lock, no merge driver, in both shared-worktree and single-clone topologies). `--body-file -` reads stdin (shell-safe for rich markdown). The ticket must exist (else exit 4). `comment list` returns comments sorted chronologically; `--ref` reads them as committed on a branch (so an orchestrator on `main` sees a worker's comments). `tkt show <id>` also folds comments in (human: a `## Comments` section; JSON: a `comments` array). JSON: `{ "schema_version", "ticket", "comments": [ {id, by, at, reply_to, body} ] }`.
 
+Adding a comment also emits an **event** (below), so a watcher is notified live.
+
+## events
+
+```
+ticketsplease events [--since <event-id>] [--ticket <id>] [--type <kind>]
+```
+The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob, living entirely in `.git`. So events are visible across worktrees and a shared clone **immediately — no commit, no push, no merge** — and concurrent emits never collide (per-ref atomic create). The id is time-sortable; pass `--since <last-seen-id>` as a cursor for resumable tailing that never misses a transition. `--ticket` / `--type` filter. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`. (Empty when there's no git repo — the event log is the live signal; the comment files are the durable record.)
+
 ## ready
 
 ```
