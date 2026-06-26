@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::claim as claim_core;
+use ticketsplease_core::comment::Comment;
 use ticketsplease_core::config::Backend;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
@@ -18,8 +19,9 @@ use ticketsplease_core::{
 };
 
 use crate::cli::{
-    ClaimArgs, CreateArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs,
-    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, WatchArgs, WhyArgs,
+    ClaimArgs, CommentAddArgs, CommentListArgs, CreateArgs, GuardArgs, InitArgs, LinkArgs,
+    ListArgs, NextArgs, ReleaseArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs,
+    StatusArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -301,20 +303,92 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
     }
 }
 
-/// `show` — print a single ticket, from the working tree or a git ref (`--ref`).
+/// `show` — print a single ticket and its comments, from the working tree or a
+/// git ref (`--ref`).
 pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let ticket = match &args.r#ref {
-        Some(git_ref) => store.load_at_ref(&args.id, git_ref)?,
-        None => store.load(&args.id)?,
+    let (ticket, comments) = match &args.r#ref {
+        Some(git_ref) => (
+            store.load_at_ref(&args.id, git_ref)?,
+            store.comments_at_ref(&args.id, git_ref)?,
+        ),
+        None => (store.load(&args.id)?, store.comments(&args.id)?),
     };
     match fmt {
-        Format::Json => print_json(&ticket_json(&ticket)),
+        Format::Json => {
+            let mut v = ticket_json(&ticket);
+            v["comments"] = json!(comments.iter().map(comment_value).collect::<Vec<_>>());
+            print_json(&v)
+        }
         Format::Human => {
             print!("{}", ticket.render());
+            if !comments.is_empty() {
+                println!("\n## Comments");
+                for c in &comments {
+                    println!("\n— {} ({}):", c.by.as_deref().unwrap_or("?"), c.id);
+                    println!("{}", c.body);
+                }
+            }
             Ok(())
         }
     }
+}
+
+/// `comment add` — append a comment to a ticket (one conflict-free file per comment).
+pub fn comment_add(repo: &Path, fmt: Format, args: &CommentAddArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let body = body_input(args.body.as_deref(), args.body_file.as_deref())?
+        .ok_or_else(|| Error::Invalid("provide --body or --body-file".into()))?;
+    let comment = store.add_comment(&args.id, args.as_.clone(), args.reply_to.clone(), &body)?;
+    match fmt {
+        Format::Json => {
+            let mut v = comment_value(&comment);
+            v["schema_version"] = json!(1);
+            v["ticket"] = json!(args.id);
+            print_json(&v)
+        }
+        Format::Human => {
+            println!("Added comment {} to `{}`", comment.id, args.id);
+            Ok(())
+        }
+    }
+}
+
+/// `comment list` — a ticket's comments, from the working tree or a git ref.
+pub fn comment_list(repo: &Path, fmt: Format, args: &CommentListArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let comments = match &args.r#ref {
+        Some(git_ref) => store.comments_at_ref(&args.id, git_ref)?,
+        None => {
+            // Working-tree read: surface a typo'd ticket id as not-found.
+            store.load(&args.id)?;
+            store.comments(&args.id)?
+        }
+    };
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "ticket": args.id,
+            "comments": comments.iter().map(comment_value).collect::<Vec<_>>(),
+        })),
+        Format::Human => {
+            for c in &comments {
+                println!("— {} ({}):", c.by.as_deref().unwrap_or("?"), c.id);
+                println!("{}\n", c.body);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn comment_value(c: &Comment) -> Value {
+    json!({
+        "id": c.id,
+        "by": c.by,
+        "at": c.at,
+        "reply_to": c.reply_to,
+        "body": c.body,
+    })
 }
 
 /// `list` — list tickets, optionally filtered by status.

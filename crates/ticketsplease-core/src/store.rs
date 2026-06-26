@@ -8,6 +8,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::comment::Comment;
 use crate::config::{Config, CONFIG_FILE};
 use crate::error::{Error, Result};
 use crate::ticket::Ticket;
@@ -119,6 +120,92 @@ impl Store {
         }
         let raw = String::from_utf8_lossy(&output.stdout);
         Ticket::parse(&raw).map_err(|e| Error::Invalid(format!("{id} @ {git_ref}: {e}")))
+    }
+
+    /// Directory holding a ticket's comment files.
+    #[must_use]
+    pub fn comments_dir(&self, id: &str) -> PathBuf {
+        self.tickets_dir().join(format!("{id}.comments"))
+    }
+
+    /// Append a comment to a ticket — one file per comment, so concurrent authors
+    /// never collide. The ticket must exist. Returns the created comment.
+    pub fn add_comment(
+        &self,
+        ticket_id: &str,
+        by: Option<String>,
+        reply_to: Option<String>,
+        body: &str,
+    ) -> Result<Comment> {
+        if !self.path_for(ticket_id).exists() {
+            return Err(Error::NotFound(ticket_id.to_string()));
+        }
+        let dir = self.comments_dir(ticket_id);
+        fs::create_dir_all(&dir).map_err(Error::Io)?;
+        let comment = Comment::new(by, reply_to, body);
+        let path = dir.join(format!("{}.md", comment.id));
+        // The id is unique, so create-new is just a belt-and-suspenders guard.
+        create_exclusive(&path, &comment.render())?;
+        Ok(comment)
+    }
+
+    /// All comments on a ticket from the working tree, sorted chronologically.
+    pub fn comments(&self, ticket_id: &str) -> Result<Vec<Comment>> {
+        let dir = self.comments_dir(ticket_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", dir.display())))?
+        {
+            let path = entry.map_err(Error::Io)?.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                let raw = fs::read_to_string(&path).map_err(Error::Io)?;
+                out.push(
+                    Comment::parse(&raw)
+                        .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?,
+                );
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    /// Comments on a ticket as committed on a git ref (cross-branch read) — lists
+    /// the comment tree on the ref and reads each blob. A missing comments tree on
+    /// the ref means "no comments", not an error.
+    pub fn comments_at_ref(&self, ticket_id: &str, git_ref: &str) -> Result<Vec<Comment>> {
+        let rel = format!("{}/{ticket_id}.comments", self.config.tickets_dir);
+        let tree = format!("{git_ref}:{rel}");
+        let ls = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["ls-tree", "--name-only", &tree])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !ls.status.success() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for name in String::from_utf8_lossy(&ls.stdout)
+            .lines()
+            .filter(|l| l.ends_with(".md"))
+        {
+            let blob = format!("{git_ref}:{rel}/{name}");
+            let show = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_root)
+                .args(["show", &blob])
+                .output()
+                .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+            if show.status.success() {
+                let raw = String::from_utf8_lossy(&show.stdout);
+                out.push(Comment::parse(&raw)?);
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
     }
 
     /// Atomically overwrite a ticket file.

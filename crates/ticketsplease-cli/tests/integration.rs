@@ -863,3 +863,184 @@ fn watch_auto_resolves_the_ticket_branch() {
     assert_eq!(v["ref"], "tkt/t");
     assert_eq!(v["status"], "review");
 }
+
+/// Comments: add (inline + shell-safe stdin), list, fold into show, and a missing
+/// ticket is not-found.
+#[test]
+fn comments_add_list_and_show() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+
+    tkt(repo)
+        .args(["comment", "add", "t", "--as", "w1", "--body", "first note"])
+        .assert()
+        .success();
+    // Shell-hostile content via stdin (`--body-file -`) — no shell interpolation.
+    tkt(repo)
+        .args(["comment", "add", "t", "--as", "w2", "--body-file", "-"])
+        .write_stdin("second `note` with $(danger)")
+        .assert()
+        .success();
+
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["comment", "list", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let cs = v["comments"].as_array().unwrap();
+    assert_eq!(cs.len(), 2);
+    assert_eq!(cs[0]["by"], "w1"); // sorted chronologically by id
+    assert_eq!(cs[0]["body"], "first note");
+    assert_eq!(cs[1]["by"], "w2");
+    assert_eq!(cs[1]["body"], "second `note` with $(danger)");
+
+    // show folds comments into its JSON.
+    let shown: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(shown["comments"].as_array().unwrap().len(), 2);
+
+    // Commenting on a missing ticket is not-found (exit 4).
+    tkt(repo)
+        .args(["comment", "add", "ghost", "--body", "x"])
+        .assert()
+        .code(4);
+}
+
+/// A worker's comments on its branch are readable from `main` via `--ref`.
+#[test]
+fn comments_are_readable_across_branches() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+
+    git(repo, &["checkout", "-q", "-b", "tkt/t"]);
+    tkt(repo)
+        .args([
+            "comment",
+            "add",
+            "t",
+            "--as",
+            "w1",
+            "--body",
+            "from the branch",
+        ])
+        .assert()
+        .success();
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "comment",
+        ],
+    );
+    git(repo, &["checkout", "-q", "main"]);
+
+    // Working tree on main has no comments; --ref tkt/t sees it.
+    let wt: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["comment", "list", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(wt["comments"].as_array().unwrap().len(), 0);
+
+    let on_ref: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["comment", "list", "t", "--ref", "tkt/t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let cs = on_ref["comments"].as_array().unwrap();
+    assert_eq!(cs.len(), 1);
+    assert_eq!(cs[0]["body"], "from the branch");
+}
+
+/// The conflict-free guarantee: 8 concurrent authors all land, none lost.
+#[test]
+fn concurrent_comments_are_all_kept() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+
+    let bin = assert_cmd::cargo::cargo_bin("ticketsplease");
+    let repo_path = repo.to_path_buf();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let bin = bin.clone();
+            let repo = repo_path.clone();
+            std::thread::spawn(move || {
+                Proc::new(bin)
+                    .arg("--repo")
+                    .arg(&repo)
+                    .args([
+                        "comment",
+                        "add",
+                        "t",
+                        "--as",
+                        &format!("w{i}"),
+                        "--body",
+                        &format!("note {i}"),
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            })
+        })
+        .collect();
+    for h in handles {
+        assert!(
+            h.join().unwrap(),
+            "each concurrent comment add must succeed"
+        );
+    }
+
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["comment", "list", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        v["comments"].as_array().unwrap().len(),
+        8,
+        "all concurrent comments must survive (conflict-free)"
+    );
+}

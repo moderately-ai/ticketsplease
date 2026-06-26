@@ -67,6 +67,14 @@ ticketsplease watch <id> --until <status> [--ref <branch>] [--prefix tkt/] [--in
 ```
 Blocks, polling the ticket until it reaches `--until` (or `done`, which is always terminal), then exits 0. Without `--ref`, polls the `<prefix><id>` branch if it exists, else the working tree. **Exit 7** if `--timeout` seconds elapse first. The JSON payload is printed on both the success and timeout paths: `{ "schema_version", "id", "ref", "status", "reached": bool, "timed_out": bool }`.
 
+## comment add / list
+
+```
+ticketsplease comment add <id> [--as <author>] [--reply-to <comment-id>] (--body <text> | --body-file <f|->)
+ticketsplease comment list <id> [--ref <branch>]
+```
+`comment add` appends a comment as its own file under `<tickets_dir>/<id>.comments/<comment-id>.md` (one file per comment, so concurrent authors never conflict — no lock, no merge driver, in both shared-worktree and single-clone topologies). `--body-file -` reads stdin (shell-safe for rich markdown). The ticket must exist (else exit 4). `comment list` returns comments sorted chronologically; `--ref` reads them as committed on a branch (so an orchestrator on `main` sees a worker's comments). `tkt show <id>` also folds comments in (human: a `## Comments` section; JSON: a `comments` array). JSON: `{ "schema_version", "ticket", "comments": [ {id, by, at, reply_to, body} ] }`.
+
 ## ready
 
 ```

@@ -45,6 +45,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Block until a ticket reaches a target status.
     Watch(WatchArgs),
+    /// Add or list a ticket's comments (append-only, conflict-free).
+    Comment(CommentArgs),
     /// List dependency-satisfied, dispatchable tickets.
     Ready(ReadyArgs),
     /// Partition ready tickets into conflict-free parallel batches.
@@ -227,6 +229,52 @@ pub struct WatchArgs {
     pub timeout: Option<u64>,
 }
 
+/// `comment` subcommand group.
+#[derive(Args)]
+pub struct CommentArgs {
+    #[command(subcommand)]
+    pub command: CommentCommand,
+}
+
+/// Subcommands under `comment`.
+#[derive(Subcommand)]
+pub enum CommentCommand {
+    /// Append a comment to a ticket.
+    Add(CommentAddArgs),
+    /// List a ticket's comments.
+    List(CommentListArgs),
+}
+
+/// `comment add` arguments.
+#[derive(Args)]
+#[command(group = ArgGroup::new("comment_body").required(true).multiple(false).args(["body", "body_file"]))]
+pub struct CommentAddArgs {
+    /// Ticket id.
+    pub id: String,
+    /// Comment author, recorded as `by` (e.g. the worker name).
+    #[arg(long = "as")]
+    pub as_: Option<String>,
+    /// Reply to an existing comment id (threading).
+    #[arg(long = "reply-to")]
+    pub reply_to: Option<String>,
+    /// Comment text (markdown).
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Comment text from a file; `-` reads stdin (shell-safe for rich markdown).
+    #[arg(long = "body-file")]
+    pub body_file: Option<String>,
+}
+
+/// `comment list` arguments.
+#[derive(Args)]
+pub struct CommentListArgs {
+    /// Ticket id.
+    pub id: String,
+    /// Read comments as committed on this git ref instead of the working tree.
+    #[arg(long)]
+    pub r#ref: Option<String>,
+}
+
 /// `next` arguments.
 #[derive(Args)]
 pub struct NextArgs {
@@ -343,6 +391,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::List(a) => commands::list(repo, fmt, a),
         Command::Status(a) => commands::status(repo, fmt, a),
         Command::Watch(a) => commands::watch(repo, fmt, a),
+        Command::Comment(a) => match &a.command {
+            CommentCommand::Add(a) => commands::comment_add(repo, fmt, a),
+            CommentCommand::List(a) => commands::comment_list(repo, fmt, a),
+        },
         Command::Lint(_) => commands::lint(repo, fmt),
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(_) => commands::tracks(repo, fmt),

@@ -6,6 +6,7 @@
 //! crate and plugs in behind the scheduling/guard core.
 
 pub mod claim;
+pub mod comment;
 pub mod config;
 pub mod error;
 pub mod frontmatter;
