@@ -1374,3 +1374,63 @@ fn guard_subcrate_scopes_do_not_trip_under_declaration() {
         "only the escaped sub-scope, nothing else"
     );
 }
+
+/// `[language] reverse_dep_expansion = false` defaults the guard to path/crate-only
+/// (as if --direct-only), so a transitive collision no longer fires.
+#[test]
+fn guard_config_disables_reverse_dep_expansion() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_cargo_fixture(repo);
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [language]\nbackend = \"rust\"\nreverse_dep_expansion = false\n\
+         [scopes]\n[scope_crates]\n\"a\" = \"crate-a\"\n\"b\" = \"crate-b\"\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--scope", "a"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "in-progress"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "u", "--title", "U", "--scope", "b"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "u", "--status", "in-progress"])
+        .assert()
+        .success();
+
+    git_init_commit(repo);
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(
+        repo.join("crate-a/src/lib.rs"),
+        "pub fn a() { /* edit */ }\n",
+    )
+    .unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "edit a",
+        ],
+    );
+
+    // With expansion off, crate-b is never reached -> no transitive collision -> ok.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t"])
+        .assert()
+        .success();
+}

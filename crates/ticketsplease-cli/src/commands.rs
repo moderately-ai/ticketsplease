@@ -868,12 +868,15 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
 
     let path_mapper = guard::PathGlobMapper::new(&store.config)?;
     let glob_scopes: BTreeSet<String> = store.config.scopes.keys().cloned().collect();
+    // Config can default the reverse-dep walk off (foundational-crate workspaces);
+    // --direct-only forces it off per-invocation.
+    let direct_only = args.direct_only || !store.config.language.reverse_dep_expansion;
     let cargo_mapper = if store.config.language.backend == Backend::Rust {
         Some(CargoMapper::new(
             repo,
             &store.config.scope_crates,
             &glob_scopes,
-            args.direct_only,
+            direct_only,
         ))
     } else {
         None
@@ -1031,7 +1034,9 @@ fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
     let mut s = format!(
         "schema_version = 1\ntickets_dir = \"{tickets_dir}\"\ndefault_base = \"main\"\n\n\
          [language]\n# Auto-detected a cargo workspace; the guard expands a changed crate\n\
-         # through the cargo reverse-dependency graph.\nbackend = \"rust\"\n\n[scopes]\n"
+         # through the cargo reverse-dependency graph.\nbackend = \"rust\"\n\
+         # reverse_dep_expansion = false  # default true; off = path/crate-only,\n\
+         # handy when a foundational crate makes transitive collisions noisy.\n\n[scopes]\n"
     );
     for m in members {
         let glob = if m.rel_dir.is_empty() {

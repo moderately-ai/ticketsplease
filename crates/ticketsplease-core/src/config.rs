@@ -60,11 +60,26 @@ pub struct ExternalScope {
 }
 
 /// Language-backend selection for the conflict guard.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Language {
     /// Which diff -> scope backend to use.
     #[serde(default)]
     pub backend: Backend,
+    /// When false, the guard skips the cargo reverse-dependency expansion by
+    /// default (as if every `guard` ran with `--direct-only`) — useful in a
+    /// workspace with a foundational crate that most others depend on, where the
+    /// transitive impact is noise more often than signal. Default true.
+    #[serde(default = "default_true")]
+    pub reverse_dep_expansion: bool,
+}
+
+impl Default for Language {
+    fn default() -> Self {
+        Self {
+            backend: Backend::default(),
+            reverse_dep_expansion: true,
+        }
+    }
 }
 
 /// Supported language backends for diff -> scope mapping (R10).
@@ -113,10 +128,29 @@ fn default_schema_version() -> u32 {
     1
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_tickets_dir() -> String {
     DEFAULT_TICKETS_DIR.to_string()
 }
 
 fn default_base() -> String {
     "main".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_dep_expansion_defaults_on() {
+        // Guards the manual `Default` impl: a derived one would give `false`.
+        assert!(Config::default().language.reverse_dep_expansion);
+        let omitted: Config = toml::from_str("[language]\nbackend = \"rust\"\n").unwrap();
+        assert!(omitted.language.reverse_dep_expansion, "omitted -> true");
+        let off: Config = toml::from_str("[language]\nreverse_dep_expansion = false\n").unwrap();
+        assert!(!off.language.reverse_dep_expansion);
+    }
 }
