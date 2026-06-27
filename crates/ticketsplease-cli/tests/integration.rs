@@ -215,7 +215,8 @@ fn set_updates_body() {
     let out = tkt(repo).args(["show", "b"]).output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("replaced body") && !text.contains("original body"));
-    assert!(text.contains("id: b"), "frontmatter must be preserved");
+    let raw = std::fs::read_to_string(repo.join("tickets/b.md")).unwrap();
+    assert!(raw.contains("id: b"), "frontmatter must be preserved");
 
     tkt(repo)
         .args(["set", "b", "--append-body", "- a note"])
@@ -257,8 +258,9 @@ fn set_body_from_file_and_remove_tag() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("`record_dml_predicate`"));
     assert!(text.contains("$(danger)"));
+    let raw = std::fs::read_to_string(repo.join("tickets/f.md")).unwrap();
     assert!(
-        text.contains("tags: [keep]"),
+        raw.contains("tags: [keep]"),
         "remove-tag should leave [keep]"
     );
 }
@@ -296,7 +298,7 @@ fn create_from_batch() {
     let show = tkt(repo).args(["show", "b"]).output().unwrap();
     let text = String::from_utf8(show.stdout).unwrap();
     assert!(text.contains("spec for b"));
-    assert!(text.contains("dependencies: [a]"));
+    assert!(text.contains("deps:") && text.contains('a'));
 
     // Explicit ids make a re-run idempotent (no error, no duplicates).
     tkt(repo)
@@ -1559,4 +1561,127 @@ fn why_exits_6_on_conflict() {
     assert_eq!(out.status.code(), Some(6));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["conflict"], true);
+}
+
+/// `list` filters compose, the empty result is a friendly message (not silence),
+/// and an unparseable file degrades to a warning rather than failing the whole view.
+#[test]
+fn list_filters_empty_state_and_lenient() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--scope",
+            "core",
+            "--tag",
+            "x",
+            "--priority",
+            "p1",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "b",
+            "--title",
+            "B",
+            "--scope",
+            "io",
+            "--tag",
+            "y",
+            "--priority",
+            "p2",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "c",
+            "--title",
+            "C",
+            "--scope",
+            "core",
+            "--priority",
+            "p1",
+        ])
+        .assert()
+        .success();
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        let out = tkt(repo).args(args).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    assert_eq!(
+        ids(&["list", "--scope", "core", "--format", "json"]),
+        vec!["a", "c"]
+    );
+    assert_eq!(ids(&["list", "--tag", "x", "--format", "json"]), vec!["a"]);
+    assert_eq!(
+        ids(&["list", "--priority", "p1", "--format", "json"]),
+        vec!["a", "c"]
+    );
+    // Filters compose (AND): core + p1 + tag x is just `a`.
+    assert_eq!(
+        ids(&[
+            "list",
+            "--scope",
+            "core",
+            "--priority",
+            "p1",
+            "--tag",
+            "x",
+            "--format",
+            "json"
+        ]),
+        vec!["a"]
+    );
+
+    // Empty result set is a message, not blank output.
+    let out = tkt(repo)
+        .args(["list", "--status", "done"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success());
+    assert!(text.contains("(no matching tickets)"), "got: {text:?}");
+
+    // A corrupt ticket file degrades to a warning; the good tickets still list.
+    std::fs::write(repo.join("tickets/bad.md"), "not valid frontmatter\n").unwrap();
+    let out = tkt(repo)
+        .args(["list", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "lenient list must not fail on a bad file"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<&str> = v["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert!(listed.contains(&"a") && listed.contains(&"b") && listed.contains(&"c"));
+    assert!(
+        !v["warnings"].as_array().unwrap().is_empty(),
+        "the unparseable file should surface as a warning"
+    );
 }

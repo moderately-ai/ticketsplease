@@ -1,7 +1,7 @@
 ---
 id: ux-lint-one-shot
 title: lint short-circuits graph checks when files fail to parse
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]

@@ -341,7 +341,25 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
             print_json(&v)
         }
         Format::Human => {
-            print!("{}", ticket.render());
+            println!("{}  {}", ticket.id, ticket.title);
+            println!("  status:   {}", ticket.status);
+            println!("  priority: {}", ticket.priority);
+            let line = |label: &str, items: &[String]| {
+                if !items.is_empty() {
+                    println!("  {label}: {}", items.join(", "));
+                }
+            };
+            line("deps:    ", &ticket.dependencies);
+            line("scopes:  ", &ticket.scopes);
+            line("paths:   ", &ticket.paths);
+            line("tags:    ", &ticket.tags);
+            if let Some(a) = &ticket.assignee {
+                println!("  assignee: {a}");
+            }
+            let body = ticket.body().trim_end();
+            if !body.trim().is_empty() {
+                println!("\n{body}");
+            }
             if !comments.is_empty() {
                 println!("\n## Comments");
                 for c in &comments {
@@ -486,44 +504,52 @@ fn print_events(fmt: Format, evs: &[Event]) -> Result<()> {
 /// `list` — list tickets, optionally filtered by status.
 pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let filter = args
+    let status = args
         .status
         .as_deref()
         .map(str::parse::<Status>)
         .transpose()?;
-    let tickets: Vec<Ticket> = store
-        .load_all()?
+    let priority = args
+        .priority
+        .as_deref()
+        .map(str::parse::<Priority>)
+        .transpose()?;
+    let (all, warnings) = store.load_all_lenient()?;
+    let tickets: Vec<Ticket> = all
         .into_iter()
-        .filter(|t| match filter {
-            Some(f) => t.status == f,
-            None => true,
-        })
+        .filter(|t| status.map_or(true, |f| t.status == f))
+        .filter(|t| priority.map_or(true, |p| t.priority == p))
+        .filter(|t| args.scope.as_ref().map_or(true, |s| t.scopes.contains(s)))
+        .filter(|t| args.tag.as_ref().map_or(true, |tg| t.tags.contains(tg)))
         .collect();
 
     match fmt {
         Format::Json => {
-            let rows: Vec<Value> = tickets
-                .iter()
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "title": t.title,
-                        "status": t.status.as_str(),
-                        "priority": t.priority.as_str(),
-                    })
-                })
-                .collect();
-            print_json(&json!({ "schema_version": 1, "tickets": rows }))
+            let rows: Vec<Value> = tickets.iter().map(ticket_summary).collect();
+            print_json(&json!({
+                "schema_version": 1,
+                "tickets": rows,
+                "warnings": warnings,
+            }))
         }
         Format::Human => {
-            for t in &tickets {
-                println!(
-                    "{:<3} {:<12} {}  {}",
-                    t.priority.as_str(),
-                    t.status.as_str(),
-                    t.id,
-                    t.title
-                );
+            if tickets.is_empty() {
+                println!("(no matching tickets)");
+            } else {
+                let w = tickets.iter().map(|t| t.id.len()).max().unwrap_or(0);
+                for t in &tickets {
+                    println!(
+                        "{:<3} {:<12} {:<w$}  {}",
+                        t.priority.as_str(),
+                        t.status.as_str(),
+                        t.id,
+                        t.title
+                    );
+                }
+                println!("({} ticket(s))", tickets.len());
+            }
+            for warn in &warnings {
+                eprintln!("warning: skipped {warn}");
             }
             Ok(())
         }
@@ -535,7 +561,7 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
 pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
     let store = Store::open(repo)?;
     if !args.all_branches {
-        let tickets = store.load_all()?;
+        let (tickets, warnings) = store.load_all_lenient()?;
         return match fmt {
             Format::Json => {
                 let rows: Vec<Value> = tickets
@@ -549,11 +575,22 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
                         })
                     })
                     .collect();
-                print_json(&json!({ "schema_version": 1, "source": "worktree", "tickets": rows }))
+                print_json(&json!({
+                    "schema_version": 1,
+                    "source": "worktree",
+                    "tickets": rows,
+                    "warnings": warnings,
+                }))
             }
             Format::Human => {
+                if tickets.is_empty() {
+                    println!("(no tickets)");
+                }
                 for t in &tickets {
                     println!("{:<12} {}", t.status.as_str(), t.id);
+                }
+                for warn in &warnings {
+                    eprintln!("warning: skipped {warn}");
                 }
                 Ok(())
             }
@@ -723,10 +760,10 @@ fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>> {
 pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
     let store = Store::open(repo)?;
     let mut diagnostics = lint_core::lint(&store)?;
-    // If every file parses, also validate links (dangling deps, cycles).
-    if let Ok(tickets) = store.load_all() {
-        diagnostics.extend(schedule::link_diagnostics(&tickets));
-    }
+    // One-shot: validate links (dangling deps, cycles) on the parseable subset even
+    // when some files fail to parse, so all problem classes surface in one run.
+    let (parseable, _) = store.load_all_lenient()?;
+    diagnostics.extend(schedule::link_diagnostics(&parseable));
     let problems = diagnostics.len();
 
     match fmt {
@@ -772,6 +809,9 @@ pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
             print_json(&json!({ "schema_version": 1, "ready": rows }))
         }
         Format::Human => {
+            if ready.is_empty() {
+                println!("(no ready tickets — none are todo/ready with all dependencies done)");
+            }
             for t in &ready {
                 println!(
                     "{:<3} {:<12} {}  {}",
@@ -835,6 +875,9 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
             print_json(&json!({ "schema_version": 1, "picks": rows }))
         }
         Format::Human => {
+            if picks.is_empty() {
+                println!("(no ready tickets to recommend)");
+            }
             for p in &picks {
                 println!("{}  (score {})  {}", p.ticket.id, p.score, p.ticket.title);
                 for c in &p.conflicts_with {
@@ -1225,6 +1268,9 @@ fn ticket_summary(ticket: &Ticket) -> Value {
         "status": ticket.status.as_str(),
         "priority": ticket.priority.as_str(),
         "scopes": ticket.scopes,
+        "paths": ticket.paths,
+        "dependencies": ticket.dependencies,
+        "tags": ticket.tags,
     })
 }
 

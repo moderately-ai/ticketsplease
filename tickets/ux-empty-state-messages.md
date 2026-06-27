@@ -1,7 +1,7 @@
 ---
 id: ux-empty-state-messages
 title: Empty-state commands print 0 bytes
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

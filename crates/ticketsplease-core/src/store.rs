@@ -85,6 +85,23 @@ impl Store {
         Ok(tickets)
     }
 
+    /// Load every parseable ticket, returning warnings for files that failed to
+    /// parse instead of aborting. Use for *display* commands (list/status) so one
+    /// malformed file can't black out the whole board; scheduling commands keep
+    /// the strict [`load_all`](Self::load_all).
+    pub fn load_all_lenient(&self) -> Result<(Vec<Ticket>, Vec<String>)> {
+        let mut tickets = Vec::new();
+        let mut warnings = Vec::new();
+        for path in self.ticket_files()? {
+            match Ticket::load(&path) {
+                Ok(t) => tickets.push(t),
+                Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
+            }
+        }
+        tickets.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok((tickets, warnings))
+    }
+
     /// Load a single ticket by id.
     pub fn load(&self, id: &str) -> Result<Ticket> {
         let path = self.path_for(id);

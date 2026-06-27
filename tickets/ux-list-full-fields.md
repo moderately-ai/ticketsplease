@@ -1,7 +1,7 @@
 ---
 id: ux-list-full-fields
 title: list omits scopes/paths/deps/tags -> N+1 show to filter
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

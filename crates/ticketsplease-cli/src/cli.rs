@@ -193,6 +193,15 @@ pub struct ListArgs {
     /// Filter by status.
     #[arg(long)]
     pub status: Option<String>,
+    /// Filter to tickets declaring this scope.
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Filter to tickets carrying this tag.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Filter by priority (p0..p3).
+    #[arg(long)]
+    pub priority: Option<String>,
 }
 
 /// `status` arguments.

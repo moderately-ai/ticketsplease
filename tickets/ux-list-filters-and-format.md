@@ -1,7 +1,7 @@
 ---
 id: ux-list-filters-and-format
 title: list lacks filters, sort, count, and column alignment
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]

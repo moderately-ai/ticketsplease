@@ -1,7 +1,7 @@
 ---
 id: ux-aggregate-commands-degrade
 title: One malformed ticket black-holes every aggregate command
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [core, cli]
