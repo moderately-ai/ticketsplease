@@ -98,18 +98,25 @@ JSON: `{ "schema_version", "ready": [ {id,title,status,priority,scopes} ] }`.
 ```
 ticketsplease tracks
 ```
-Partitions the ready set into conflict-free batches: no two tickets in a batch share a scope or sit in the same dependency component. Dispatch one batch fully in parallel.
+Partitions the ready set into conflict-free batches: no two tickets in a batch share a scope. Dependency *ordering* is already handled — only dispatchable tickets (every dependency done) are batched, so none of them depend on each other and a shared scope (file overlap) is the only batch hazard. Dispatch one batch fully in parallel.
 
 JSON: `{ "schema_version", "batches": [ [ {id,title,status,priority,scopes} ] ] }`.
 
 ## next
 
 ```
-ticketsplease next [--parallel N]
+ticketsplease next [--parallel N] [--allow-overlap]
 ```
-The single highest-scored dispatchable ticket, or N mutually conflict-free picks. Score favours priority, downstream critical-path length, and transitive unblock count.
+The single highest-scored dispatchable ticket, or N picks. Score favours priority, downstream critical-path length, and remaining (non-done) downstream unblock count. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N by score even when their scopes overlap, annotating each with `conflicts_with` (which other picks share which scopes) so you can decide whether the shared-crate work is tolerable.
 
-JSON: `{ "schema_version", "picks": [ {id,title,status,priority,scopes,score} ] }`.
+JSON: `{ "schema_version", "picks": [ {id,title,status,priority,scopes,score, "conflicts_with": [ {ticket,scopes} ]} ] }`.
+
+## why
+
+```
+ticketsplease why <a> <b>
+```
+Explains whether two tickets can run in parallel. They cannot if they share a scope (file overlap) **or** one transitively depends on the other (ordering). This is intentionally broader than what `tracks` gates on: `tracks` only batches dispatchable tickets — among which no dependency relationship can exist — so it gates on scope alone, whereas `why` answers the question for any two tickets. JSON: `{ "schema_version", "a", "b", "conflict": bool, "shared_scopes": [...], "dependency_ordered": bool }`.
 
 ## claim / release
 

@@ -81,8 +81,8 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 
 - `ticketsplease ready` — dependency-satisfied tickets, priority-ordered (a ticket is ready when its status is todo/ready and every dependency is done).
 - `ticketsplease tracks` — conflict-free parallel batches (the headline feature).
-- `ticketsplease why <a> <b>` — explain whether two tickets can co-run, and if not, the exact reason (shared scope and/or same dependency component). Use it when the scheduler's grouping is surprising.
-- `ticketsplease next [--parallel N]` — scored recommendation(s); the score favours priority, critical-path position, and how much downstream work the ticket unblocks.
+- `ticketsplease why <a> <b>` — explain whether two tickets can co-run, and if not, the exact reason (a shared scope, or one transitively depends on the other). Use it when the scheduler's grouping is surprising.
+- `ticketsplease next [--parallel N] [--allow-overlap]` — scored recommendation(s); the score favours priority, critical-path position, and how much remaining downstream work the ticket unblocks. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N even when scopes overlap, annotating each with the shared scopes so you can judge the file overlap yourself.
 - `ticketsplease list [--status <s>]`, `ticketsplease show <id>`.
 
 ## Creating and editing tickets

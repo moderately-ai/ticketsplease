@@ -16,7 +16,7 @@ while there is ready work:
     on success `ticketsplease set <id> --status done`; on abandon `ticketsplease release <id> --as <worker>`
 ```
 
-Why only `batches[0]`? Every member of a single batch is scope-disjoint, so the whole front is safe to run at once. Later batches conflict with the front (they share a scope or a dependency component) and should wait until the front merges and the graph is recomputed.
+Why only `batches[0]`? Every member of a single batch is scope-disjoint, so the whole front is safe to run at once. Later batches share a scope with a front member and should wait until the front merges and the graph is recomputed. (Dependency ordering is handled separately — only tickets whose dependencies are all done are ever offered, so batching gates on scope overlap alone.)
 
 ## Push or pull
 
