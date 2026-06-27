@@ -1,7 +1,7 @@
 ---
 id: ux-batch-atomic-idempotent
 title: create --from is non-atomic and not idempotent for auto-ids
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, core]

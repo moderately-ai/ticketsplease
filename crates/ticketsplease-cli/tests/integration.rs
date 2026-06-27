@@ -2330,3 +2330,134 @@ fn reclaim_renewal_emits_no_duplicate_event() {
         "a renewal must not add a second claim event"
     );
 }
+
+/// Batch create validates the whole batch before writing: a bad element aborts with
+/// nothing written (no partial application).
+#[test]
+fn batch_create_is_atomic_on_a_bad_element() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let specs = r#"[{"id":"good","title":"Good"},{"id":"bad","title":"Bad","status":"bogus"}]"#;
+    let path = repo.join("b.json");
+    std::fs::write(&path, specs).unwrap();
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .code(3);
+    assert!(
+        !repo.join("tickets/good.md").exists(),
+        "a bad element must abort the batch before writing the good one"
+    );
+}
+
+/// Batch create with auto-ids is idempotent: re-running is unchanged, not a clone.
+#[test]
+fn batch_create_auto_ids_are_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let specs = r#"[{"title":"Auto One"}]"#;
+    let path = repo.join("b.json");
+    std::fs::write(&path, specs).unwrap();
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .success();
+    // Re-run: the same ticket is reported unchanged, and no `-2` duplicate appears.
+    let out = tkt(repo)
+        .args([
+            "create",
+            "--from",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["created"], false, "re-run must be unchanged");
+    assert!(repo.join("tickets/auto-one.md").exists());
+    assert!(
+        !repo.join("tickets/auto-one-2.md").exists(),
+        "idempotent re-run must not clone the ticket"
+    );
+}
+
+/// Batch JSON with an unknown key fails loudly instead of silently dropping it.
+#[test]
+fn batch_create_rejects_unknown_keys() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // `dependson` is a typo for `depends_on`.
+    let specs = r#"[{"title":"X","dependson":["y"]}]"#;
+    let path = repo.join("b.json");
+    std::fs::write(&path, specs).unwrap();
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .code(3);
+}
+
+/// Single and batch create share one result shape: a `results` array.
+#[test]
+fn create_emits_a_uniform_results_array() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let out = tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"], "t");
+    assert_eq!(results[0]["created"], true);
+}
+
+/// set can now edit title and paths, and add a dependency (with cycle rejection).
+#[test]
+fn set_edits_title_paths_and_dependencies() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+
+    tkt(repo)
+        .args(["set", "a", "--title", "Renamed", "--add-path", "src/a/**"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "a", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(v["title"], "Renamed");
+    assert_eq!(v["paths"][0], "src/a/**");
+
+    // set --add-dependency adds an edge...
+    tkt(repo)
+        .args(["set", "a", "--add-dependency", "b"])
+        .assert()
+        .success();
+    // ...and rejects one that would close a cycle.
+    tkt(repo)
+        .args(["set", "b", "--add-dependency", "a"])
+        .assert()
+        .code(5);
+}

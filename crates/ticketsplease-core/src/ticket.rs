@@ -253,6 +253,31 @@ impl Ticket {
         Ok(())
     }
 
+    /// Set the title (surgical write).
+    pub fn set_title(&mut self, title: &str) -> Result<()> {
+        self.doc.set_scalar("title", title)?;
+        self.title = title.to_string();
+        Ok(())
+    }
+
+    /// Add an explicit path glob (idempotent). Returns whether anything changed.
+    pub fn add_path(&mut self, path: &str) -> Result<bool> {
+        let changed = self.doc.add_list_item("paths", path)?;
+        if changed {
+            self.paths.push(path.to_string());
+        }
+        Ok(changed)
+    }
+
+    /// Remove an explicit path glob (idempotent). Returns whether anything changed.
+    pub fn remove_path(&mut self, path: &str) -> Result<bool> {
+        let changed = self.doc.remove_list_item("paths", path)?;
+        if changed {
+            self.paths.retain(|p| p != path);
+        }
+        Ok(changed)
+    }
+
     /// Add a dependency (idempotent). Returns whether anything changed.
     pub fn add_dependency(&mut self, id: &str) -> Result<bool> {
         let changed = self.doc.add_list_item("dependencies", id)?;

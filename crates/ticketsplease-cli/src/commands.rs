@@ -124,29 +124,61 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
         let contents = build(id)?;
         (id.clone(), store.create_exact(id, &contents)?)
     } else {
-        let base = store::slugify(title);
-        (store.create_unique(&base, build)?, CreateOutcome::Created)
+        // Auto-id is content-addressed-idempotent, so re-running the same create is a
+        // no-op rather than spawning `<slug>-2` (matches batch create).
+        store.create_unique_idempotent(&store::slugify(title), build)?
     };
 
+    // Single and batch create share one result shape: a `results` array of
+    // per-ticket {id, created, path}. A consumer reads `.results[]` either way.
+    emit_create_results(fmt, &store, &[(id, outcome)])
+}
+
+/// Emit the shared create result envelope for one or many tickets.
+fn emit_create_results(
+    fmt: Format,
+    store: &Store,
+    items: &[(String, CreateOutcome)],
+) -> Result<()> {
     match fmt {
-        Format::Json => print_json(&json!({
-            "schema_version": 1,
-            "id": id,
-            "created": outcome == CreateOutcome::Created,
-            "path": store.path_for(&id).display().to_string(),
-        })),
+        Format::Json => {
+            let results: Vec<Value> = items
+                .iter()
+                .map(|(id, outcome)| {
+                    json!({
+                        "id": id,
+                        "created": *outcome == CreateOutcome::Created,
+                        "path": store.path_for(id).display().to_string(),
+                    })
+                })
+                .collect();
+            print_json(&json!({ "schema_version": 1, "results": results }))
+        }
         Format::Human => {
-            match outcome {
-                CreateOutcome::Created => println!("Created ticket `{id}`"),
-                CreateOutcome::Unchanged => println!("Ticket `{id}` already exists (unchanged)"),
+            for (id, outcome) in items {
+                match outcome {
+                    CreateOutcome::Created => println!("Created ticket `{id}`"),
+                    CreateOutcome::Unchanged => {
+                        println!("Ticket `{id}` already exists (unchanged)")
+                    }
+                }
+            }
+            if items.len() > 1 {
+                let created = items
+                    .iter()
+                    .filter(|(_, o)| *o == CreateOutcome::Created)
+                    .count();
+                println!("({created} created, {} unchanged)", items.len() - created);
             }
             Ok(())
         }
     }
 }
 
-/// One element of a `create --from` batch.
+/// One element of a `create --from` batch. Unknown keys are rejected so a typo like
+/// `dependson` fails loudly instead of silently dropping the field.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TicketSpec {
     title: String,
     #[serde(default)]
@@ -167,58 +199,106 @@ struct TicketSpec {
     body: String,
 }
 
-/// Batch-create from a JSON array of specs (file path, or `-` for stdin). Each
-/// ticket is written atomically; an explicit `id` makes that element idempotent.
+/// A batch spec with its fields parsed once (shared by the validate and write passes).
+struct ParsedSpec {
+    id: Option<String>,
+    title: String,
+    status: Status,
+    priority: Priority,
+    depends_on: Vec<String>,
+    scopes: Vec<String>,
+    paths: Vec<String>,
+    tags: Vec<String>,
+    body: String,
+}
+
+impl ParsedSpec {
+    /// Render this spec's ticket contents for a chosen id.
+    fn render(&self, id: &str) -> Result<String> {
+        Ticket::new(
+            id,
+            &self.title,
+            self.status,
+            self.priority,
+            &self.depends_on,
+            &self.scopes,
+            &self.paths,
+            &self.tags,
+            &self.body,
+        )
+        .map(|t| t.render())
+    }
+}
+
+/// Batch-create from a JSON array of specs (file path, or `-` for stdin). The batch
+/// is validated in full before any write (a bad element aborts before partial state),
+/// auto-ids are content-addressed-idempotent (re-running is a no-op, not a clone),
+/// and the result reports created vs unchanged per element.
 fn create_batch(store: &Store, fmt: Format, from: &str) -> Result<()> {
     let raw = read_text(from)?;
-    let specs: Vec<TicketSpec> = serde_json::from_str(&raw).map_err(|e| {
+    let raw_specs: Vec<TicketSpec> = serde_json::from_str(&raw).map_err(|e| {
         Error::Invalid(format!(
             "invalid --from JSON (expected an array of ticket specs): {e}"
         ))
     })?;
 
-    let mut created = Vec::new();
-    for spec in &specs {
-        let status: Status = spec.status.as_deref().unwrap_or("todo").parse()?;
-        let priority: Priority = spec.priority.as_deref().unwrap_or("p2").parse()?;
-        let depends_on = norm_list(&spec.depends_on);
-        let scopes = norm_list(&spec.scopes);
-        let paths = norm_list(&spec.paths);
-        let tags = norm_list(&spec.tags);
-        let build = |id: &str| -> Result<String> {
-            Ticket::new(
-                id,
-                &spec.title,
-                status,
-                priority,
-                &depends_on,
-                &scopes,
-                &paths,
-                &tags,
-                &spec.body,
-            )
-            .map(|t| t.render())
-        };
-        let id = if let Some(id) = &spec.id {
-            store.create_exact(id, &build(id)?)?;
-            id.clone()
-        } else {
-            store.create_unique(&store::slugify(&spec.title), build)?
-        };
-        created.push(id);
-    }
+    // Parse every element up front so a bad status/priority aborts before any write.
+    let specs: Vec<ParsedSpec> = raw_specs
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            Ok(ParsedSpec {
+                status: parse_field(s.status.as_deref().unwrap_or("todo"), i)?,
+                priority: parse_field(s.priority.as_deref().unwrap_or("p2"), i)?,
+                id: s.id,
+                title: s.title,
+                depends_on: norm_list(&s.depends_on),
+                scopes: norm_list(&s.scopes),
+                paths: norm_list(&s.paths),
+                tags: norm_list(&s.tags),
+                body: s.body,
+            })
+        })
+        .collect::<Result<_>>()?;
 
-    match fmt {
-        Format::Json => print_json(&json!({ "schema_version": 1, "created": created })),
-        Format::Human => {
-            println!(
-                "Created {} ticket(s): {}",
-                created.len(),
-                created.join(", ")
-            );
-            Ok(())
+    // Validate pass (no writes): render each ticket, and reject an explicit id that is
+    // invalid or already on disk with different content — so the batch is all-or-nothing
+    // for these failure modes rather than applying partially.
+    for spec in &specs {
+        if let Some(id) = &spec.id {
+            store::validate_slug(id)?;
+            let contents = spec.render(id)?;
+            let path = store.path_for(id);
+            if path.exists() && std::fs::read_to_string(&path).map_err(Error::Io)? != contents {
+                return Err(Error::Invalid(format!(
+                    "ticket `{id}` already exists with different content"
+                )));
+            }
+        } else {
+            // Render at the base id just to surface any Ticket::new error before writing.
+            spec.render(&store::slugify(&spec.title))?;
         }
     }
+
+    // Write pass.
+    let mut results = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let item = if let Some(id) = &spec.id {
+            (id.clone(), store.create_exact(id, &spec.render(id)?)?)
+        } else {
+            store.create_unique_idempotent(&store::slugify(&spec.title), |id| spec.render(id))?
+        };
+        results.push(item);
+    }
+
+    emit_create_results(fmt, store, &results)
+}
+
+/// Parse a status/priority field, tagging the error with the batch element index.
+fn parse_field<T: std::str::FromStr<Err = Error>>(value: &str, index: usize) -> Result<T> {
+    value
+        .parse()
+        .map_err(|e: Error| Error::Invalid(format!("element {index}: {}", e.message())))
 }
 
 /// `set` — surgically update a ticket's fields.
@@ -228,6 +308,9 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     let before = ticket.render();
     let status_before = ticket.status;
 
+    if let Some(title) = &args.title {
+        ticket.set_title(title)?;
+    }
     if let Some(status) = &args.status {
         ticket.set_status(status.parse()?)?;
     }
@@ -245,6 +328,30 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     }
     for tag in norm_list(&args.remove_tag) {
         ticket.remove_tag(&tag)?;
+    }
+    for path in norm_list(&args.add_path) {
+        ticket.add_path(&path)?;
+    }
+    for path in norm_list(&args.remove_path) {
+        ticket.remove_path(&path)?;
+    }
+    let mut deps_added = false;
+    for dep in norm_list(&args.add_dependency) {
+        if dep == ticket.id {
+            return Err(Error::Invalid("a ticket cannot depend on itself".into()));
+        }
+        deps_added |= ticket.add_dependency(&dep)?;
+    }
+    for dep in norm_list(&args.remove_dependency) {
+        ticket.remove_dependency(&dep)?;
+    }
+    // Reject a dependency edit that would close a cycle, exactly like `link`.
+    if deps_added {
+        let mut all = store.load_all()?;
+        if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
+            *slot = ticket.clone();
+        }
+        schedule::ensure_acyclic(&all)?;
     }
     if let Some(body) = body_input(args.body.as_deref(), args.body_file.as_deref())? {
         ticket.set_body(&body);

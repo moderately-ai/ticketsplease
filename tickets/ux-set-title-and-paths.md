@@ -1,7 +1,7 @@
 ---
 id: ux-set-title-and-paths
 title: set cannot edit title or paths (asymmetry with create)
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

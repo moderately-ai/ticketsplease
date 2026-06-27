@@ -442,15 +442,38 @@ impl Store {
         base_id: &str,
         render: impl Fn(&str) -> Result<String>,
     ) -> Result<String> {
+        self.create_unique_idempotent(base_id, render)
+            .map(|(id, _)| id)
+    }
+
+    /// Like [`Self::create_unique`], but idempotent by content: if an existing
+    /// `<base_id>`/`<base_id>-N` already holds byte-identical content, return it
+    /// `Unchanged` instead of minting a duplicate — so re-running the same auto-id
+    /// create (or batch) is a no-op rather than a clone. A differing ticket at a
+    /// candidate id is skipped to the next suffix, as before.
+    pub fn create_unique_idempotent(
+        &self,
+        base_id: &str,
+        render: impl Fn(&str) -> Result<String>,
+    ) -> Result<(String, CreateOutcome)> {
         for n in 1u32.. {
             let id = if n == 1 {
                 base_id.to_string()
             } else {
                 format!("{base_id}-{n}")
             };
-            match create_exclusive(&self.path_for(&id), &render(&id)?) {
-                Ok(()) => return Ok(id),
-                Err(Error::Io(ref e)) if e.kind() == ErrorKind::AlreadyExists => continue,
+            let path = self.path_for(&id);
+            let contents = render(&id)?;
+            match create_exclusive(&path, &contents) {
+                Ok(()) => return Ok((id, CreateOutcome::Created)),
+                Err(Error::Io(ref e)) if e.kind() == ErrorKind::AlreadyExists => {
+                    // Same content at this id -> it's the same ticket (idempotent);
+                    // different content -> a distinct ticket, try the next suffix.
+                    let existing = fs::read_to_string(&path).map_err(Error::Io)?;
+                    if existing == contents {
+                        return Ok((id, CreateOutcome::Unchanged));
+                    }
+                }
                 Err(e) => return Err(e),
             }
         }

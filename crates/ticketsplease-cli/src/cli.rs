@@ -132,6 +132,9 @@ pub struct CreateArgs {
 pub struct SetArgs {
     /// Ticket id.
     pub id: String,
+    /// New title.
+    #[arg(long)]
+    pub title: Option<String>,
     /// New status.
     #[arg(long)]
     pub status: Option<String>,
@@ -150,6 +153,19 @@ pub struct SetArgs {
     /// Tags to remove (repeatable or comma-separated).
     #[arg(long = "remove-tag", value_delimiter = ',')]
     pub remove_tag: Vec<String>,
+    /// Explicit path globs to add (repeatable or comma-separated).
+    #[arg(long = "add-path", value_delimiter = ',')]
+    pub add_path: Vec<String>,
+    /// Explicit path globs to remove (repeatable or comma-separated).
+    #[arg(long = "remove-path", value_delimiter = ',')]
+    pub remove_path: Vec<String>,
+    /// Dependencies to add (repeatable or comma-separated); rejected if it would
+    /// create a cycle, like `link`.
+    #[arg(long = "add-dependency", value_delimiter = ',')]
+    pub add_dependency: Vec<String>,
+    /// Dependencies to remove (repeatable or comma-separated).
+    #[arg(long = "remove-dependency", value_delimiter = ',')]
+    pub remove_dependency: Vec<String>,
     /// Replace the body with this text (markdown bullets are fine).
     #[arg(long, allow_hyphen_values = true)]
     pub body: Option<String>,

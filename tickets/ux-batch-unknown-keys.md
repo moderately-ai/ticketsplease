@@ -1,7 +1,7 @@
 ---
 id: ux-batch-unknown-keys
 title: Batch JSON silently drops unknown keys
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]
