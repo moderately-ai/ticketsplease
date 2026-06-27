@@ -1,7 +1,7 @@
 ---
 id: ux-status-parse-ergonomics
 title: "Status parse: no valid-values hint, case-sensitive"
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

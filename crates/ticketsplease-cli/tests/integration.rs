@@ -1434,3 +1434,46 @@ fn guard_config_disables_reverse_dep_expansion() {
         .assert()
         .success();
 }
+
+/// ux-sanitize-ticket-id + ux-trim-list-values + ux-status-parse-ergonomics.
+#[test]
+fn create_rejects_bad_ids_and_normalizes_input() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    // Path-traversal / non-slug ids are rejected at exit 3 (no file escapes the repo).
+    tkt(repo)
+        .args(["create", "--title", "x", "--id", "../../pwned"])
+        .assert()
+        .code(3);
+    tkt(repo)
+        .args(["create", "--title", "x", "--id", "Has Space"])
+        .assert()
+        .code(3);
+    assert!(!std::path::Path::new("/tmp/pwned.md").exists());
+
+    // Comma lists are trimmed + deduped; status parses case-insensitively.
+    tkt(repo)
+        .args([
+            "create", "--id", "t", "--title", "T", "--scope", "a, b ,a", "--status", "TODO",
+        ])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let scopes: Vec<&str> = v["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(scopes, vec!["a", "b"]);
+    assert_eq!(v["status"], "todo");
+}

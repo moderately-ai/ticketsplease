@@ -1,7 +1,7 @@
 ---
 id: ux-sanitize-ticket-id
 title: Sanitize/validate --id (path traversal + crash)
-status: todo
+status: done
 priority: p0
 dependencies: []
 scopes: [core, cli]

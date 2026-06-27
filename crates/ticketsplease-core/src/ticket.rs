@@ -63,14 +63,18 @@ impl Status {
 impl FromStr for Status {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
-        Ok(match s {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
             "todo" => Status::Todo,
             "ready" => Status::Ready,
             "in-progress" => Status::InProgress,
             "blocked" => Status::Blocked,
             "review" => Status::Review,
             "done" => Status::Done,
-            other => return Err(Error::Invalid(format!("unknown status `{other}`"))),
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "unknown status `{s}` (expected todo|ready|in-progress|blocked|review|done)"
+                )))
+            }
         })
     }
 }
@@ -113,14 +117,14 @@ impl Priority {
 impl FromStr for Priority {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
-        Ok(match s {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
             "p0" => Priority::P0,
             "p1" => Priority::P1,
             "p2" => Priority::P2,
             "p3" => Priority::P3,
-            other => {
+            _ => {
                 return Err(Error::Invalid(format!(
-                    "unknown priority `{other}` (expected p0..p3)"
+                    "unknown priority `{s}` (expected p0..p3)"
                 )))
             }
         })
@@ -426,6 +430,21 @@ mod tests {
         let again = Ticket::parse(&out).unwrap();
         assert_eq!(again.status, Status::Done);
         assert_eq!(again.dependencies, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn status_and_priority_parse_case_insensitively() {
+        assert_eq!("TODO".parse::<Status>().unwrap(), Status::Todo);
+        assert_eq!(
+            " In-Progress ".parse::<Status>().unwrap(),
+            Status::InProgress
+        );
+        assert_eq!("P0".parse::<Priority>().unwrap(), Priority::P0);
+        let err = "doing".parse::<Status>().unwrap_err().to_string();
+        assert!(
+            err.contains("expected todo|ready"),
+            "lists valid values: {err}"
+        );
     }
 
     #[test]

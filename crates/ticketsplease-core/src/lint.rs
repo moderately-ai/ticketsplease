@@ -51,6 +51,16 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                         ),
                     });
                 }
+                if crate::store::validate_slug(&ticket.id).is_err() {
+                    diags.push(Diagnostic {
+                        file: file.clone(),
+                        id: Some(ticket.id.clone()),
+                        message: format!(
+                            "id `{}` is not a valid slug (lowercase letters, digits, single hyphens)",
+                            ticket.id
+                        ),
+                    });
+                }
                 if let Some(prev) = seen.insert(ticket.id.clone(), file.clone()) {
                     diags.push(Diagnostic {
                         file,

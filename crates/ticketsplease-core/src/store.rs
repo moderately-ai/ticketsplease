@@ -334,6 +334,7 @@ impl Store {
     /// Create a ticket with an explicit id (idempotent + atomic). Re-creating
     /// with byte-identical content is a no-op; differing content is an error.
     pub fn create_exact(&self, id: &str, contents: &str) -> Result<CreateOutcome> {
+        validate_slug(id)?;
         let path = self.path_for(id);
         match create_exclusive(&path, contents) {
             Ok(()) => Ok(CreateOutcome::Created),
@@ -403,6 +404,27 @@ pub fn init_repo(
         tickets_dir: dir,
         wrote_config,
     })
+}
+
+/// Validate a ticket id is a safe slug: lowercase ASCII alphanumerics joined by
+/// single hyphens (no leading/trailing/double hyphen, no path separators). This is
+/// the gate that stops an explicit `--id` from escaping the tickets directory
+/// (`../x`), crashing on a separator, or producing a non-portable filename.
+pub fn validate_slug(id: &str) -> Result<()> {
+    let valid = !id.is_empty()
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && !id.contains("--")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "invalid ticket id `{id}` (use lowercase letters, digits, and single hyphens)"
+        )))
+    }
 }
 
 /// Derive a slug id from a title: lowercase ASCII alphanumerics, with other runs
@@ -494,5 +516,17 @@ mod tests {
         assert_eq!(slugify("  Hello,  World!! "), "hello-world");
         assert_eq!(slugify("***"), "ticket");
         assert_eq!(slugify("Already-slug"), "already-slug");
+    }
+
+    #[test]
+    fn validate_slug_accepts_good_rejects_bad() {
+        for ok in ["a", "a1", "ux-sanitize-ticket-id", "build-index-2"] {
+            assert!(validate_slug(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "../x", "a/b", "UPPER", "a b", "a--b", "-x", "x-", "", "Add", "a.b",
+        ] {
+            assert!(validate_slug(bad).is_err(), "{bad} should be rejected");
+        }
     }
 }

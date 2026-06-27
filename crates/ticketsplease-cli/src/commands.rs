@@ -100,6 +100,10 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
         .ok_or_else(|| Error::Invalid("provide --title or --from".into()))?;
     let status: Status = args.status.parse()?;
     let priority: Priority = args.priority.parse()?;
+    let depends_on = norm_list(&args.depends_on);
+    let scopes = norm_list(&args.scopes);
+    let paths = norm_list(&args.paths);
+    let tags = norm_list(&args.tags);
 
     let build = |id: &str| -> Result<String> {
         Ticket::new(
@@ -107,10 +111,10 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
             title,
             status,
             priority,
-            &args.depends_on,
-            &args.scopes,
-            &args.paths,
-            &args.tags,
+            &depends_on,
+            &scopes,
+            &paths,
+            &tags,
             &args.body,
         )
         .map(|t| t.render())
@@ -177,16 +181,20 @@ fn create_batch(store: &Store, fmt: Format, from: &str) -> Result<()> {
     for spec in &specs {
         let status: Status = spec.status.as_deref().unwrap_or("todo").parse()?;
         let priority: Priority = spec.priority.as_deref().unwrap_or("p2").parse()?;
+        let depends_on = norm_list(&spec.depends_on);
+        let scopes = norm_list(&spec.scopes);
+        let paths = norm_list(&spec.paths);
+        let tags = norm_list(&spec.tags);
         let build = |id: &str| -> Result<String> {
             Ticket::new(
                 id,
                 &spec.title,
                 status,
                 priority,
-                &spec.depends_on,
-                &spec.scopes,
-                &spec.paths,
-                &spec.tags,
+                &depends_on,
+                &scopes,
+                &paths,
+                &tags,
                 &spec.body,
             )
             .map(|t| t.render())
@@ -226,17 +234,17 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     if let Some(priority) = &args.priority {
         ticket.set_priority(priority.parse()?)?;
     }
-    for scope in &args.add_scope {
-        ticket.add_scope(scope)?;
+    for scope in norm_list(&args.add_scope) {
+        ticket.add_scope(&scope)?;
     }
-    for scope in &args.remove_scope {
-        ticket.remove_scope(scope)?;
+    for scope in norm_list(&args.remove_scope) {
+        ticket.remove_scope(&scope)?;
     }
-    for tag in &args.add_tag {
-        ticket.add_tag(tag)?;
+    for tag in norm_list(&args.add_tag) {
+        ticket.add_tag(&tag)?;
     }
-    for tag in &args.remove_tag {
-        ticket.remove_tag(tag)?;
+    for tag in norm_list(&args.remove_tag) {
+        ticket.remove_tag(&tag)?;
     }
     if let Some(body) = body_input(args.body.as_deref(), args.body_file.as_deref())? {
         ticket.set_body(&body);
@@ -1078,6 +1086,19 @@ fn body_input(text: Option<&str>, file: Option<&str>) -> Result<Option<String>> 
     } else {
         Ok(None)
     }
+}
+
+/// Normalize a comma-split arg list: trim each token, drop empties and duplicates.
+/// (clap's `value_delimiter` splits on commas but keeps surrounding whitespace.)
+fn norm_list(items: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let t = item.trim();
+        if !t.is_empty() && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 fn read_text(path: &str) -> Result<String> {

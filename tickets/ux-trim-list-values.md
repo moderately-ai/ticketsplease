@@ -1,7 +1,7 @@
 ---
 id: ux-trim-list-values
 title: Comma-separated list values aren't trimmed; empties kept
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, core]
