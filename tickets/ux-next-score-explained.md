@@ -1,7 +1,7 @@
 ---
 id: ux-next-score-explained
 title: next score is opaque
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]

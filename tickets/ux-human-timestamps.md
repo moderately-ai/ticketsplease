@@ -1,7 +1,7 @@
 ---
 id: ux-human-timestamps
 title: No human-readable timestamps anywhere
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]

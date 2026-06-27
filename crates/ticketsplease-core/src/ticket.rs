@@ -253,6 +253,14 @@ impl Ticket {
         Ok(())
     }
 
+    /// Set the id (surgical write). Used by `rename`; the caller is responsible for
+    /// moving the file to match the new id.
+    pub fn set_id(&mut self, id: &str) -> Result<()> {
+        self.doc.set_scalar("id", id)?;
+        self.id = id.to_string();
+        Ok(())
+    }
+
     /// Set the title (surgical write).
     pub fn set_title(&mut self, title: &str) -> Result<()> {
         self.doc.set_scalar("title", title)?;

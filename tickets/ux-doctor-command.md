@@ -1,7 +1,7 @@
 ---
 id: ux-doctor-command
 title: Add a `tkt doctor` setup check
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]

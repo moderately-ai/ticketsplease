@@ -1,7 +1,7 @@
 ---
 id: ux-delete-archive-command
 title: No delete / close / archive command
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

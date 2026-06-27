@@ -54,6 +54,10 @@ pub enum Command {
     /// Partition ready tickets into conflict-free parallel batches.
     Tracks(TracksArgs),
     /// Recommend the next ticket(s) to work on.
+    ///
+    /// Picks are ranked by a score that prioritises urgent, unblocking work:
+    /// 1000 x priority (p0=3..p3=0) + 10 x critical-path length + count of
+    /// not-done tickets this one unblocks. Higher is more impactful to do next.
     Next(NextArgs),
     /// Atomically claim a ticket for an agent (race-safe, lease-based).
     Claim(ClaimArgs),
@@ -61,6 +65,12 @@ pub enum Command {
     Release(ReleaseArgs),
     /// Show current claims (assignee, lease expiry, live/expired).
     Claims(ClaimsArgs),
+    /// Delete a ticket (removes its file and comments).
+    Delete(DeleteArgs),
+    /// Rename a ticket's id: move the file, rewrite the id, repoint dependents.
+    Rename(RenameArgs),
+    /// Check repository setup (config, git, scope globs, base ref).
+    Doctor,
     /// Explain why two tickets can or cannot run in parallel.
     Why(WhyArgs),
     /// Guard a branch against scope under-declaration and collisions.
@@ -124,6 +134,9 @@ pub struct CreateArgs {
     /// Markdown body.
     #[arg(long, default_value = "")]
     pub body: String,
+    /// Preview what would be created without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// `set` arguments.
@@ -179,6 +192,9 @@ pub struct SetArgs {
     /// Append the body from a file; `-` reads stdin.
     #[arg(long = "append-body-file")]
     pub append_body_file: Option<String>,
+    /// Preview the change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// `link` arguments.
@@ -220,6 +236,9 @@ pub struct ListArgs {
     /// Filter by priority (p0..p3).
     #[arg(long)]
     pub priority: Option<String>,
+    /// Hide completed (done) tickets.
+    #[arg(long)]
+    pub hide_done: bool,
 }
 
 /// `status` arguments.
@@ -388,6 +407,22 @@ pub struct ReleaseArgs {
     pub force: bool,
 }
 
+/// `delete` arguments.
+#[derive(Args)]
+pub struct DeleteArgs {
+    /// Ticket id to delete.
+    pub id: String,
+}
+
+/// `rename` arguments.
+#[derive(Args)]
+pub struct RenameArgs {
+    /// Current ticket id.
+    pub old: String,
+    /// New ticket id (slug).
+    pub new: String,
+}
+
 /// `claims` arguments.
 #[derive(Args)]
 pub struct ClaimsArgs {
@@ -443,7 +478,16 @@ macro_rules! empty_args {
     };
 }
 
-empty_args!(ReadyArgs, TracksArgs, LintArgs, MigrateArgs,);
+empty_args!(ReadyArgs, LintArgs, MigrateArgs,);
+
+/// `tracks` arguments.
+#[derive(Args)]
+pub struct TracksArgs {
+    /// Cap each conflict-free batch to at most N tickets, splitting larger batches —
+    /// so an orchestrator with N workers gets worker-sized fronts.
+    #[arg(long)]
+    pub parallel: Option<usize>,
+}
 
 /// `skill` subcommand group.
 #[derive(Args)]
@@ -487,11 +531,14 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Events(a) => commands::events(repo, fmt, a),
         Command::Lint(_) => commands::lint(repo, fmt),
         Command::Ready(_) => commands::ready(repo, fmt),
-        Command::Tracks(_) => commands::tracks(repo, fmt),
+        Command::Tracks(a) => commands::tracks(repo, fmt, a),
         Command::Next(a) => commands::next(repo, fmt, a),
         Command::Claim(a) => commands::claim(repo, fmt, a),
         Command::Release(a) => commands::release(repo, fmt, a),
         Command::Claims(a) => commands::claims(repo, fmt, a),
+        Command::Delete(a) => commands::delete(repo, fmt, a),
+        Command::Rename(a) => commands::rename(repo, fmt, a),
+        Command::Doctor => commands::doctor(repo, fmt),
         Command::Why(a) => commands::why(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => commands::migrate(repo, fmt),

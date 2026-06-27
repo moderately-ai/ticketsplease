@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::claim as claim_core;
 use ticketsplease_core::comment::Comment;
-use ticketsplease_core::config::{Backend, CONFIG_FILE};
+use ticketsplease_core::config::{Backend, Config, CONFIG_FILE};
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
@@ -21,9 +21,9 @@ use ticketsplease_core::{
 };
 
 use crate::cli::{
-    ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, EventsArgs, GuardArgs,
-    InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs, SelfUpdateArgs, SetArgs, ShowArgs,
-    SkillInstallArgs, StatusArgs, WatchArgs, WhyArgs,
+    ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
+    GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs, RenameArgs, SelfUpdateArgs,
+    SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -92,7 +92,7 @@ pub fn self_update(fmt: Format, args: &SelfUpdateArgs) -> Result<()> {
 pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let store = Store::open(repo)?;
     if let Some(from) = &args.from {
-        return create_batch(&store, fmt, from);
+        return create_batch(&store, fmt, from, args.dry_run);
     }
     let title = args
         .title
@@ -120,6 +120,13 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
         .map(|t| t.render())
     };
 
+    if args.dry_run {
+        let id = args.id.clone().unwrap_or_else(|| store::slugify(title));
+        build(&id)?; // surface a build error in the preview too
+        let outcome = outcome_for_preview(&store, &id);
+        return emit_create_results(fmt, &store, &[(id, outcome)], true);
+    }
+
     let (id, outcome) = if let Some(id) = &args.id {
         let contents = build(id)?;
         (id.clone(), store.create_exact(id, &contents)?)
@@ -131,14 +138,26 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
 
     // Single and batch create share one result shape: a `results` array of
     // per-ticket {id, created, path}. A consumer reads `.results[]` either way.
-    emit_create_results(fmt, &store, &[(id, outcome)])
+    emit_create_results(fmt, &store, &[(id, outcome)], false)
 }
 
-/// Emit the shared create result envelope for one or many tickets.
+/// Preview outcome for `--dry-run`: a ticket that already exists would be unchanged,
+/// otherwise it would be created.
+fn outcome_for_preview(store: &Store, id: &str) -> CreateOutcome {
+    if store.path_for(id).exists() {
+        CreateOutcome::Unchanged
+    } else {
+        CreateOutcome::Created
+    }
+}
+
+/// Emit the shared create result envelope for one or many tickets. With `dry_run`,
+/// nothing was written and the verbs are conditional.
 fn emit_create_results(
     fmt: Format,
     store: &Store,
     items: &[(String, CreateOutcome)],
+    dry_run: bool,
 ) -> Result<()> {
     match fmt {
         Format::Json => {
@@ -152,14 +171,18 @@ fn emit_create_results(
                     })
                 })
                 .collect();
-            print_json(&json!({ "schema_version": 1, "results": results }))
+            print_json(&json!({ "schema_version": 1, "results": results, "dry_run": dry_run }))
         }
         Format::Human => {
             for (id, outcome) in items {
-                match outcome {
-                    CreateOutcome::Created => println!("Created ticket `{id}`"),
-                    CreateOutcome::Unchanged => {
+                match (outcome, dry_run) {
+                    (CreateOutcome::Created, false) => println!("Created ticket `{id}`"),
+                    (CreateOutcome::Created, true) => println!("Would create ticket `{id}`"),
+                    (CreateOutcome::Unchanged, false) => {
                         println!("Ticket `{id}` already exists (unchanged)")
+                    }
+                    (CreateOutcome::Unchanged, true) => {
+                        println!("Ticket `{id}` already exists (no change)")
                     }
                 }
             }
@@ -168,7 +191,8 @@ fn emit_create_results(
                     .iter()
                     .filter(|(_, o)| *o == CreateOutcome::Created)
                     .count();
-                println!("({created} created, {} unchanged)", items.len() - created);
+                let verb = if dry_run { "would create" } else { "created" };
+                println!("({created} {verb}, {} unchanged)", items.len() - created);
             }
             Ok(())
         }
@@ -234,7 +258,7 @@ impl ParsedSpec {
 /// is validated in full before any write (a bad element aborts before partial state),
 /// auto-ids are content-addressed-idempotent (re-running is a no-op, not a clone),
 /// and the result reports created vs unchanged per element.
-fn create_batch(store: &Store, fmt: Format, from: &str) -> Result<()> {
+fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result<()> {
     let raw = read_text(from)?;
     let raw_specs: Vec<TicketSpec> = serde_json::from_str(&raw).map_err(|e| {
         Error::Invalid(format!(
@@ -280,6 +304,22 @@ fn create_batch(store: &Store, fmt: Format, from: &str) -> Result<()> {
         }
     }
 
+    // Preview without writing: report the would-be outcome per element.
+    if dry_run {
+        let results: Vec<(String, CreateOutcome)> = specs
+            .iter()
+            .map(|spec| {
+                let id = spec
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| store::slugify(&spec.title));
+                let outcome = outcome_for_preview(store, &id);
+                (id, outcome)
+            })
+            .collect();
+        return emit_create_results(fmt, store, &results, true);
+    }
+
     // Write pass.
     let mut results = Vec::with_capacity(specs.len());
     for spec in &specs {
@@ -291,7 +331,7 @@ fn create_batch(store: &Store, fmt: Format, from: &str) -> Result<()> {
         results.push(item);
     }
 
-    emit_create_results(fmt, store, &results)
+    emit_create_results(fmt, store, &results, false)
 }
 
 /// Parse a status/priority field, tagging the error with the batch element index.
@@ -368,17 +408,18 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     }
 
     let changed = ticket.render() != before;
-    if changed {
+    // --dry-run computes `changed` but writes nothing and fires no event.
+    if changed && !args.dry_run {
         store.save(&ticket)?;
-    }
-    // A status transition is an activity event watchers care about.
-    if changed && ticket.status != status_before {
-        let _ = store.emit_event(
-            "status",
-            &ticket.id,
-            None,
-            json!({ "status": ticket.status.as_str(), "from": status_before.as_str() }),
-        );
+        // A status transition is an activity event watchers care about.
+        if ticket.status != status_before {
+            let _ = store.emit_event(
+                "status",
+                &ticket.id,
+                None,
+                json!({ "status": ticket.status.as_str(), "from": status_before.as_str() }),
+            );
+        }
     }
 
     match fmt {
@@ -386,13 +427,15 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
             "schema_version": 1,
             "id": ticket.id,
             "changed": changed,
+            "dry_run": args.dry_run,
         })),
         Format::Human => {
-            println!(
-                "{} `{}`",
-                if changed { "Updated" } else { "No change to" },
-                ticket.id
-            );
+            let verb = match (changed, args.dry_run) {
+                (true, false) => "Updated",
+                (true, true) => "Would update",
+                (false, _) => "No change to",
+            };
+            println!("{verb} `{}`", ticket.id);
             Ok(())
         }
     }
@@ -486,8 +529,12 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
             }
             if !comments.is_empty() {
                 println!("\n## Comments");
+                let now = now_epoch();
                 for c in &comments {
-                    println!("\n— {} ({}):", c.by.as_deref().unwrap_or("?"), c.id);
+                    let when =
+                        c.at.map(|a| format!(" · {}", humanize_epoch(a, now)))
+                            .unwrap_or_default();
+                    println!("\n— {}{when}:", c.by.as_deref().unwrap_or("?"));
                     println!("{}", c.body);
                 }
             }
@@ -543,8 +590,14 @@ pub fn comment_list(repo: &Path, fmt: Format, args: &CommentListArgs) -> Result<
             "comments": comments.iter().map(comment_value).collect::<Vec<_>>(),
         })),
         Format::Human => {
+            let now = now_epoch();
             for c in &comments {
-                println!("— {} ({}):", c.by.as_deref().unwrap_or("?"), c.id);
+                let when = c.at.map(|a| humanize_epoch(a, now));
+                println!(
+                    "— {}{}:",
+                    c.by.as_deref().unwrap_or("?"),
+                    when.map(|w| format!(" · {w}")).unwrap_or_default()
+                );
                 println!("{}\n", c.body);
             }
             Ok(())
@@ -611,10 +664,11 @@ fn print_events(fmt: Format, evs: &[Event]) -> Result<()> {
             print_json(&json!({ "schema_version": 1, "events": events_json }))
         }
         Format::Human => {
+            let now = now_epoch();
             for e in evs {
                 println!(
-                    "{}  {:<8} {}  {}",
-                    e.id,
+                    "{:<10} {:<8} {}  {}",
+                    humanize_epoch(e.at, now),
                     e.kind,
                     e.ticket,
                     e.by.as_deref().unwrap_or("")
@@ -645,6 +699,7 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
         .filter(|t| priority.map_or(true, |p| t.priority == p))
         .filter(|t| args.scope.as_ref().map_or(true, |s| t.scopes.contains(s)))
         .filter(|t| args.tag.as_ref().map_or(true, |tg| t.tags.contains(tg)))
+        .filter(|t| !args.hide_done || t.status != Status::Done)
         .collect();
 
     match fmt {
@@ -972,10 +1027,19 @@ pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
 }
 
 /// `tracks` — conflict-free parallel batches of ready tickets.
-pub fn tracks(repo: &Path, fmt: Format) -> Result<()> {
+pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
-    let batches = schedule::tracks(&tickets)?;
+    let mut batches = schedule::tracks(&tickets)?;
+    // --parallel caps each conflict-free batch to N tickets, splitting larger ones so
+    // an orchestrator with N workers gets worker-sized fronts. Tickets within a batch
+    // are already disjoint, so any chunking preserves conflict-freedom.
+    if let Some(n) = args.parallel.filter(|&n| n > 0) {
+        batches = batches
+            .into_iter()
+            .flat_map(|b| b.chunks(n).map(<[&Ticket]>::to_vec).collect::<Vec<_>>())
+            .collect();
+    }
     match fmt {
         Format::Json => {
             let arr: Vec<Value> = batches
@@ -1518,9 +1582,7 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
     } else {
         store.load_all_lenient()?
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let now = now_epoch();
     let claimed: Vec<&Ticket> = tickets.iter().filter(|t| t.assignee.is_some()).collect();
     match fmt {
         Format::Json => {
@@ -1547,11 +1609,21 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
                 println!("(no active claims)");
             }
             for t in &claimed {
-                let state = if t.lease_live(now) { "live" } else { "expired" };
+                let lease = t.lease_expires_at.map_or_else(
+                    || "no lease".to_string(),
+                    |exp| {
+                        let rel = humanize_epoch(exp, now);
+                        if t.lease_live(now) {
+                            format!("live, expires {rel}")
+                        } else {
+                            format!("expired {rel}")
+                        }
+                    },
+                );
                 println!(
-                    "{:<16} {:<8} {}",
+                    "{:<16} {:<28} {}",
                     t.assignee.as_deref().unwrap_or("?"),
-                    state,
+                    lease,
                     t.id
                 );
             }
@@ -1561,6 +1633,198 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `delete` — remove a ticket file (and its comments). git history preserves it.
+pub fn delete(repo: &Path, fmt: Format, args: &DeleteArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let path = store.path_for(&args.id);
+    if !path.exists() {
+        return Err(Error::NotFound(args.id.clone()));
+    }
+    std::fs::remove_file(&path).map_err(Error::Io)?;
+    let comments = store.comments_dir(&args.id);
+    if comments.exists() {
+        std::fs::remove_dir_all(&comments).map_err(Error::Io)?;
+    }
+    match fmt {
+        Format::Json => print_json(&json!({ "schema_version": 1, "id": args.id, "deleted": true })),
+        Format::Human => {
+            println!("Deleted `{}`", args.id);
+            Ok(())
+        }
+    }
+}
+
+/// `rename` — change a ticket's id: write the new file, repoint every dependent, move
+/// the comments, then remove the old file. New file first so an interruption never
+/// loses the ticket.
+pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    store::validate_slug(&args.new)?;
+    if args.old == args.new {
+        return Err(Error::Invalid("old and new ids are the same".into()));
+    }
+    let mut ticket = store.load(&args.old)?; // NotFound if missing
+    if store.path_for(&args.new).exists() {
+        return Err(Error::Conflict(format!(
+            "ticket `{}` already exists",
+            args.new
+        )));
+    }
+    ticket.set_id(&args.new)?;
+    store.create_exact(&args.new, &ticket.render())?;
+
+    // Repoint every ticket that depended on the old id.
+    let mut repointed = Vec::new();
+    for mut t in store.load_all()? {
+        if t.id == args.new {
+            continue;
+        }
+        if t.dependencies.iter().any(|d| d == &args.old) {
+            t.remove_dependency(&args.old)?;
+            t.add_dependency(&args.new)?;
+            store.save(&t)?;
+            repointed.push(t.id.clone());
+        }
+    }
+
+    // Move the comments directory, then drop the old file.
+    let old_comments = store.comments_dir(&args.old);
+    if old_comments.exists() {
+        std::fs::rename(&old_comments, store.comments_dir(&args.new)).map_err(Error::Io)?;
+    }
+    std::fs::remove_file(store.path_for(&args.old)).map_err(Error::Io)?;
+
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "old": args.old,
+            "new": args.new,
+            "repointed": repointed,
+        })),
+        Format::Human => {
+            println!("Renamed `{}` -> `{}`", args.old, args.new);
+            if !repointed.is_empty() {
+                println!("  repointed dependents: {}", repointed.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `doctor` — validate repository setup: config present, git repo with a commit,
+/// scope globs compile, and the base ref resolves. Exits non-zero on any failure.
+pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
+    let mut checks: Vec<(String, bool, String)> = Vec::new();
+    let mut check = |name: &str, ok: bool, detail: String| {
+        checks.push((name.to_string(), ok, detail));
+    };
+
+    // Config + scope globs depend on a loadable config.
+    let config = Config::load(repo);
+    match &config {
+        Ok(cfg) => {
+            check("config", true, format!("{CONFIG_FILE} loaded"));
+            match guard::PathGlobMapper::new(cfg) {
+                Ok(_) => check(
+                    "scope_globs",
+                    true,
+                    format!("{} scope(s) compile", cfg.scopes.len()),
+                ),
+                Err(e) => check("scope_globs", false, e.message()),
+            }
+            let base = &cfg.default_base;
+            let base_ok = git_ref_exists(repo, base);
+            check(
+                "base_ref",
+                base_ok,
+                if base_ok {
+                    format!("`{base}` resolves")
+                } else {
+                    format!("base ref `{base}` does not resolve")
+                },
+            );
+        }
+        Err(e) => {
+            check("config", false, e.message());
+            check("scope_globs", false, "skipped (no config)".to_string());
+            check("base_ref", false, "skipped (no config)".to_string());
+        }
+    }
+
+    let in_git = git_ref_exists(repo, "HEAD");
+    check(
+        "git_repo",
+        in_git,
+        if in_git {
+            "git repo with at least one commit".to_string()
+        } else {
+            "not a git repo, or no commit yet (run `git init` + commit)".to_string()
+        },
+    );
+
+    let ok = checks.iter().all(|(_, c, _)| *c);
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = checks
+                .iter()
+                .map(|(name, c, detail)| json!({ "check": name, "ok": c, "detail": detail }))
+                .collect();
+            print_json(&json!({ "schema_version": 1, "ok": ok, "checks": rows }))?;
+        }
+        Format::Human => {
+            for (name, c, detail) in &checks {
+                println!("{} {name}: {detail}", if *c { "✓" } else { "✗" });
+            }
+        }
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid("setup checks failed".into()))
+    }
+}
+
+/// Current time in epoch seconds (for relative-time rendering).
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A compact relative time for human output: `just now`, `5m ago`, `in 2h`, `3d ago`.
+/// Both arguments are epoch seconds.
+fn humanize_epoch(at: u64, now: u64) -> String {
+    let future = at > now;
+    let delta = if future { at - now } else { now - at };
+    let mag = if delta < 60 {
+        "<1m".to_string()
+    } else if delta < 3600 {
+        format!("{}m", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h", delta / 3600)
+    } else {
+        format!("{}d", delta / 86_400)
+    };
+    if future {
+        format!("in {mag}")
+    } else if delta < 60 {
+        "just now".to_string()
+    } else {
+        format!("{mag} ago")
+    }
+}
+
+/// Whether a git ref (or `HEAD`) resolves in `repo`.
+fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", git_ref])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn ticket_summary(ticket: &Ticket) -> Value {

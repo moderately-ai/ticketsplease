@@ -1,7 +1,7 @@
 ---
 id: ux-rename-command
 title: No rename / change-id command
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

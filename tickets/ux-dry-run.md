@@ -1,7 +1,7 @@
 ---
 id: ux-dry-run
 title: No --dry-run for create/set/batch
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]

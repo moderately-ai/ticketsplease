@@ -2461,3 +2461,180 @@ fn set_edits_title_paths_and_dependencies() {
         .assert()
         .code(5);
 }
+
+/// delete removes a ticket file; list --hide-done filters completed tickets.
+#[test]
+fn delete_removes_a_ticket_and_hide_done_filters() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    tkt(repo).args(["delete", "a"]).assert().success();
+    assert!(!repo.join("tickets/a.md").exists());
+    assert!(repo.join("tickets/b.md").exists());
+    tkt(repo).args(["delete", "ghost"]).assert().code(4);
+
+    tkt(repo)
+        .args(["set", "b", "--status", "done"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["list", "--hide-done", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["tickets"].as_array().unwrap().is_empty(),
+        "hide-done should drop the done ticket"
+    );
+}
+
+/// rename moves the file, rewrites the id, and repoints dependents.
+#[test]
+fn rename_moves_file_and_repoints_dependents() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "old", "--title", "Old"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "dependent", "--title", "Dep"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["link", "dependent", "--depends-on", "old"])
+        .assert()
+        .success();
+    tkt(repo).args(["rename", "old", "new"]).assert().success();
+
+    assert!(!repo.join("tickets/old.md").exists());
+    assert!(repo.join("tickets/new.md").exists());
+    let raw = std::fs::read_to_string(repo.join("tickets/new.md")).unwrap();
+    assert!(raw.contains("id: new"));
+    // The dependent was repointed, so lint sees no dangling reference.
+    tkt(repo).args(["lint"]).assert().success();
+    let dep = std::fs::read_to_string(repo.join("tickets/dependent.md")).unwrap();
+    assert!(dep.contains("dependencies: [new]"));
+}
+
+/// doctor passes in a configured git repo and fails (cleanly) without git.
+#[test]
+fn doctor_checks_setup() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // No git yet -> the git_repo check fails.
+    tkt(repo).args(["doctor"]).assert().failure();
+    git_init_commit(repo);
+    let out = tkt(repo)
+        .args(["doctor", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "doctor should pass once git is set up"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+}
+
+/// --dry-run previews create/set without writing.
+#[test]
+fn dry_run_previews_without_writing() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let out = tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "t",
+            "--title",
+            "T",
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert!(
+        !repo.join("tickets/t.md").exists(),
+        "dry-run create must not write the file"
+    );
+
+    // Real create, then dry-run set leaves the ticket unchanged on disk.
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "done", "--dry-run"])
+        .assert()
+        .success();
+    let raw = std::fs::read_to_string(repo.join("tickets/t.md")).unwrap();
+    assert!(raw.contains("status: todo"), "dry-run set must not persist");
+}
+
+/// tracks --parallel caps each batch to N tickets.
+#[test]
+fn tracks_parallel_caps_batch_size() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // Three disjoint (different scopes) ready tickets land in one conflict-free batch.
+    for (id, scope) in [("a", "s1"), ("b", "s2"), ("c", "s3")] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id, "--scope", scope])
+            .assert()
+            .success();
+    }
+    let out = tkt(repo)
+        .args(["tracks", "--parallel", "2", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let batches = v["batches"].as_array().unwrap();
+    assert!(
+        batches.iter().all(|b| b.as_array().unwrap().len() <= 2),
+        "each batch must be capped to 2: {v}"
+    );
+    let total: usize = batches.iter().map(|b| b.as_array().unwrap().len()).sum();
+    assert_eq!(total, 3, "all tickets still appear");
+}
+
+/// Human event output carries a relative timestamp, not just a raw id.
+#[test]
+fn events_human_output_has_relative_time() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "t", "--as", "w1"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["events", "--ticket", "t"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("ago") || text.contains("just now"),
+        "events should show a relative time: {text:?}"
+    );
+}

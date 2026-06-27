@@ -1,7 +1,7 @@
 ---
 id: ux-tracks-parallel
 title: tracks has no --parallel N (cap to worker count)
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]
