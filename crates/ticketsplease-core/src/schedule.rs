@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::lint::Diagnostic;
-use crate::ticket::{Priority, Ticket};
+use crate::ticket::{Priority, Status, Ticket};
 
 /// Validated view over a set of tickets.
 struct Graph<'a> {
@@ -41,11 +41,17 @@ impl<'a> Graph<'a> {
         if let Some(cycle) = find_cycle(&by_id) {
             return Err(Error::Cycle(cycle.join(" -> ")));
         }
+        // Reverse edges for `next` scoring: id -> NOT-done tickets that depend on it.
+        // Done dependents are excluded so "downstream work this unblocks" counts only
+        // work that is actually still waiting.
         let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for t in tickets {
             dependents.entry(t.id.as_str()).or_default();
         }
         for t in tickets {
+            if t.status == Status::Done {
+                continue;
+            }
             for d in &t.dependencies {
                 dependents
                     .entry(d.as_str())
@@ -66,7 +72,7 @@ impl<'a> Graph<'a> {
             && t.dependencies.iter().all(|d| {
                 self.by_id
                     .get(d.as_str())
-                    .is_some_and(|dep| dep.status == crate::ticket::Status::Done)
+                    .is_some_and(|dep| dep.status == Status::Done)
             })
     }
 
@@ -84,8 +90,10 @@ pub fn ready(tickets: &[Ticket]) -> Result<Vec<&Ticket>> {
 }
 
 /// Partition the ready set into conflict-free parallel batches (R6): two tickets
-/// sharing any scope, or in the same weakly-connected dependency component, never
-/// share a batch. Deterministic greedy (Welsh–Powell) colouring.
+/// that share a scope never share a batch. Dependency *ordering* needs no handling
+/// here — only dispatchable tickets (every dependency already done) are batched, so
+/// by construction none of them depend on each other; the sole parallel hazard left
+/// is file overlap, i.e. a shared scope. Deterministic greedy (Welsh–Powell) colouring.
 pub fn tracks(tickets: &[Ticket]) -> Result<Vec<Vec<&Ticket>>> {
     let graph = Graph::build(tickets)?;
     let nodes = graph.dispatchable(tickets);
@@ -94,11 +102,10 @@ pub fn tracks(tickets: &[Ticket]) -> Result<Vec<Vec<&Ticket>>> {
         return Ok(Vec::new());
     }
 
-    let comp = components(tickets);
     let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
     for i in 0..n {
         for j in (i + 1)..n {
-            if conflicts(nodes[i], nodes[j], &comp) {
+            if conflicts(nodes[i], nodes[j]) {
                 adj[i].insert(j);
                 adj[j].insert(i);
             }
@@ -138,18 +145,34 @@ pub fn tracks(tickets: &[Ticket]) -> Result<Vec<Vec<&Ticket>>> {
     Ok(batches)
 }
 
-/// A scored next-pick with its components, for explainability.
+/// A scored next-pick.
 pub struct Pick<'a> {
     /// The recommended ticket.
     pub ticket: &'a Ticket,
     /// Total score (higher is better).
     pub score: i64,
+    /// Other picks in the returned set that share a scope with this one. Empty
+    /// unless `allow_overlap` let an overlapping pick through — it lets the
+    /// implementor judge whether the shared-crate overlap is tolerable.
+    pub conflicts_with: Vec<PickConflict>,
+}
+
+/// A scope overlap between two returned picks (surfaced under `allow_overlap`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PickConflict {
+    /// The other pick's ticket id.
+    pub ticket: String,
+    /// Scopes shared with that pick.
+    pub scopes: Vec<String>,
 }
 
 /// Recommend the next ticket(s): score by priority, downstream critical-path
-/// length, and transitive unblock count. With `parallel > 1`, return that many
-/// mutually conflict-free picks, highest-scored first (R7).
-pub fn next(tickets: &[Ticket], parallel: usize) -> Result<Vec<Pick<'_>>> {
+/// length, and remaining-downstream unblock count. With `parallel > 1`, return that
+/// many picks, highest-scored first (R7). By default the picks are scope-disjoint
+/// (conflict-minimizing); with `allow_overlap` the top-scored picks are returned
+/// even when their scopes overlap, each annotated with the overlap so the caller
+/// can decide whether the shared-crate work is tolerable.
+pub fn next(tickets: &[Ticket], parallel: usize, allow_overlap: bool) -> Result<Vec<Pick<'_>>> {
     let graph = Graph::build(tickets)?;
     let mut nodes = graph.dispatchable(tickets);
     if nodes.is_empty() {
@@ -172,20 +195,41 @@ pub fn next(tickets: &[Ticket], parallel: usize) -> Result<Vec<Pick<'_>>> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    // Highest-scored first. Default: skip a candidate that shares a scope with an
+    // already-chosen pick. allow_overlap: take the top N regardless of overlap.
     let want = parallel.max(1);
-    let comp = components(tickets);
-    let mut picks: Vec<Pick> = Vec::new();
+    let mut chosen: Vec<&Ticket> = Vec::new();
     for t in nodes {
-        if picks.len() >= want {
+        if chosen.len() >= want {
             break;
         }
-        if picks.iter().all(|p| !conflicts(p.ticket, t, &comp)) {
-            picks.push(Pick {
-                ticket: t,
-                score: scores[t.id.as_str()],
-            });
+        if allow_overlap || chosen.iter().all(|&c| !conflicts(c, t)) {
+            chosen.push(t);
         }
     }
+
+    // Surface, per pick, the scopes it shares with the other picks in the set.
+    let picks = chosen
+        .iter()
+        .map(|&t| {
+            let conflicts_with = chosen
+                .iter()
+                .filter(|&&o| o.id != t.id)
+                .filter_map(|&o| {
+                    let scopes = shared_scopes(t, o);
+                    (!scopes.is_empty()).then(|| PickConflict {
+                        ticket: o.id.clone(),
+                        scopes,
+                    })
+                })
+                .collect();
+            Pick {
+                ticket: t,
+                score: scores[t.id.as_str()],
+                conflicts_with,
+            }
+        })
+        .collect();
     Ok(picks)
 }
 
@@ -214,8 +258,11 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
     out
 }
 
-/// Why two tickets can (or cannot) share a parallel batch — the same criteria
-/// `tracks` uses, surfaced for explainability (`tkt why`).
+/// Why two tickets can (or cannot) run in parallel, surfaced for explainability
+/// (`tkt why`). Two tickets cannot run in parallel if they share a scope (file
+/// overlap) or one transitively depends on the other (ordering). Note this is
+/// broader than what `tracks` gates on: `tracks` only batches dispatchable tickets,
+/// among which no dependency relationship can exist, so it gates on scope alone.
 #[derive(Debug, Clone, Serialize)]
 pub struct Why {
     /// First ticket id.
@@ -224,9 +271,9 @@ pub struct Why {
     pub b: String,
     /// Scopes both tickets declare (a shared-scope conflict).
     pub shared_scopes: Vec<String>,
-    /// Whether they sit in the same weakly-connected dependency component.
-    pub same_dependency_component: bool,
-    /// True if either criterion holds — they cannot run in the same batch.
+    /// Whether one transitively depends on the other (a hard ordering constraint).
+    pub dependency_ordered: bool,
+    /// True if either criterion holds — they cannot run in parallel.
     pub conflict: bool,
 }
 
@@ -235,29 +282,23 @@ pub fn why(tickets: &[Ticket], a_id: &str, b_id: &str) -> Result<Why> {
     let by_id: BTreeMap<&str, &Ticket> = tickets.iter().map(|t| (t.id.as_str(), t)).collect();
     let a = by_id
         .get(a_id)
+        .copied()
         .ok_or_else(|| Error::NotFound(a_id.to_string()))?;
     let b = by_id
         .get(b_id)
+        .copied()
         .ok_or_else(|| Error::NotFound(b_id.to_string()))?;
 
-    let a_scopes: BTreeSet<&str> = a.scopes.iter().map(String::as_str).collect();
-    let shared_scopes: Vec<String> = b
-        .scopes
-        .iter()
-        .filter(|s| a_scopes.contains(s.as_str()))
-        .cloned()
-        .collect();
+    let shared = shared_scopes(a, b);
+    let dependency_ordered =
+        a_id != b_id && (depends_on(&by_id, a_id, b_id) || depends_on(&by_id, b_id, a_id));
 
-    let comp = components(tickets);
-    let same_dependency_component =
-        a_id != b_id && comp.get(a_id).copied() == comp.get(b_id).copied();
-
-    let conflict = !shared_scopes.is_empty() || same_dependency_component;
+    let conflict = !shared.is_empty() || dependency_ordered;
     Ok(Why {
         a: a_id.to_string(),
         b: b_id.to_string(),
-        shared_scopes,
-        same_dependency_component,
+        shared_scopes: shared,
+        dependency_ordered,
         conflict,
     })
 }
@@ -278,41 +319,40 @@ fn shares_scope(a: &Ticket, b: &Ticket) -> bool {
     b.scopes.iter().any(|s| set.contains(s.as_str()))
 }
 
-fn conflicts(a: &Ticket, b: &Ticket, comp: &BTreeMap<&str, usize>) -> bool {
-    shares_scope(a, b) || comp.get(a.id.as_str()).copied() == comp.get(b.id.as_str()).copied()
-}
-
-/// Weakly-connected component id for every ticket (union-find over dep edges).
-fn components(tickets: &[Ticket]) -> BTreeMap<&str, usize> {
-    let mut ids: Vec<&str> = tickets.iter().map(|t| t.id.as_str()).collect();
-    ids.sort_unstable();
-    let index: BTreeMap<&str, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let mut parent: Vec<usize> = (0..ids.len()).collect();
-    for t in tickets {
-        let Some(&ti) = index.get(t.id.as_str()) else {
-            continue;
-        };
-        for d in &t.dependencies {
-            if let Some(&di) = index.get(d.as_str()) {
-                let a = uf_find(&mut parent, ti);
-                let b = uf_find(&mut parent, di);
-                if a != b {
-                    parent[a] = b;
-                }
-            }
-        }
-    }
-    ids.iter()
-        .map(|&id| (id, uf_find(&mut parent, index[id])))
+/// The scopes both tickets declare (sorted, deduped).
+fn shared_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
+    let a_set: BTreeSet<&str> = a.scopes.iter().map(String::as_str).collect();
+    let b_set: BTreeSet<&str> = b.scopes.iter().map(String::as_str).collect();
+    a_set
+        .intersection(&b_set)
+        .map(|s| (*s).to_string())
         .collect()
 }
 
-fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
-    while parent[x] != x {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
+/// Two dispatchable tickets conflict (cannot share a batch) iff they share a scope
+/// — the only parallel hazard once dependency ordering is satisfied by the
+/// dispatchable filter.
+fn conflicts(a: &Ticket, b: &Ticket) -> bool {
+    shares_scope(a, b)
+}
+
+/// Whether `from` transitively depends on `to` (directed reachability over dep
+/// edges). The `seen` set also keeps it terminating on a (lint-flagged) cycle.
+fn depends_on(by_id: &BTreeMap<&str, &Ticket>, from: &str, to: &str) -> bool {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut stack: Vec<&str> = vec![from];
+    while let Some(n) = stack.pop() {
+        let Some(t) = by_id.get(n) else { continue };
+        for d in &t.dependencies {
+            if d == to {
+                return true;
+            }
+            if seen.insert(d.as_str()) {
+                stack.push(d.as_str());
+            }
+        }
     }
-    x
+    false
 }
 
 /// Longest downstream chain length (in nodes) starting at `node`.
@@ -472,7 +512,7 @@ mod tests {
             t("a", "todo", "p2", &[], &["x"]),
             t("b", "todo", "p0", &[], &["y"]),
         ];
-        let picks = next(&tickets, 1).unwrap();
+        let picks = next(&tickets, 1, false).unwrap();
         assert_eq!(picks[0].ticket.id, "b");
     }
 
@@ -498,8 +538,41 @@ mod tests {
         ];
         let w = why(&tickets, "a", "b").unwrap();
         assert!(w.conflict);
-        assert!(w.same_dependency_component);
+        assert!(w.dependency_ordered);
         assert!(w.shared_scopes.is_empty());
+    }
+
+    #[test]
+    fn why_siblings_of_a_shared_dependency_can_run_in_parallel() {
+        // a and b both depend on base but not on each other, with disjoint scopes:
+        // no ordering between them, so no conflict (the old weak-component said yes).
+        let tickets = vec![
+            t("base", "todo", "p1", &[], &["base"]),
+            t("a", "todo", "p1", &["base"], &["x"]),
+            t("b", "todo", "p1", &["base"], &["y"]),
+        ];
+        let w = why(&tickets, "a", "b").unwrap();
+        assert!(!w.dependency_ordered);
+        assert!(!w.conflict);
+    }
+
+    #[test]
+    fn done_dependency_does_not_serialize_independent_dependents() {
+        // base is DONE; a and b depend only on it and have disjoint scopes, so once
+        // base is merged they are independent and should run in parallel (one batch).
+        let tickets = vec![
+            t("base", "done", "p1", &[], &["base-scope"]),
+            t("a", "todo", "p1", &["base"], &["x"]),
+            t("b", "todo", "p1", &["base"], &["y"]),
+        ];
+        let batches = tracks(&tickets).unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "a and b should share one batch; got {batches:?}"
+        );
+        // And `why` should not order them: neither depends on the other.
+        assert!(!why(&tickets, "a", "b").unwrap().dependency_ordered);
     }
 
     #[test]
@@ -509,10 +582,29 @@ mod tests {
             t("b", "todo", "p0", &[], &["core"]), // conflicts with a
             t("c", "todo", "p1", &[], &["io"]),
         ];
-        let picks = next(&tickets, 2).unwrap();
+        let picks = next(&tickets, 2, false).unwrap();
         let ids: BTreeSet<&str> = picks.iter().map(|p| p.ticket.id.as_str()).collect();
-        // Cannot pick both a and b together.
+        // Cannot pick both a and b together (they share scope `core`).
         assert!(!(ids.contains("a") && ids.contains("b")));
         assert_eq!(picks.len(), 2);
+        // Disjoint picks report no conflicts.
+        assert!(picks.iter().all(|p| p.conflicts_with.is_empty()));
+    }
+
+    #[test]
+    fn next_allow_overlap_returns_overlapping_picks_annotated() {
+        let tickets = vec![
+            t("a", "todo", "p0", &[], &["core"]),
+            t("b", "todo", "p0", &[], &["core"]), // shares `core` with a
+        ];
+        let picks = next(&tickets, 2, true).unwrap();
+        let ids: BTreeSet<&str> = picks.iter().map(|p| p.ticket.id.as_str()).collect();
+        // With --allow-overlap both top-scored picks come back, despite the overlap.
+        assert!(ids.contains("a") && ids.contains("b"));
+        // ...and each is annotated with the shared scope so the caller can judge it.
+        let a = picks.iter().find(|p| p.ticket.id == "a").unwrap();
+        assert_eq!(a.conflicts_with.len(), 1);
+        assert_eq!(a.conflicts_with[0].ticket, "b");
+        assert_eq!(a.conflicts_with[0].scopes, vec!["core"]);
     }
 }

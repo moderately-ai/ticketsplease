@@ -803,7 +803,7 @@ pub fn tracks(repo: &Path, fmt: Format) -> Result<()> {
 pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
-    let picks = schedule::next(&tickets, args.parallel)?;
+    let picks = schedule::next(&tickets, args.parallel, args.allow_overlap)?;
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = picks
@@ -811,6 +811,11 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
                 .map(|p| {
                     let mut v = ticket_summary(p.ticket);
                     v["score"] = json!(p.score);
+                    v["conflicts_with"] = json!(p
+                        .conflicts_with
+                        .iter()
+                        .map(|c| json!({ "ticket": c.ticket, "scopes": c.scopes }))
+                        .collect::<Vec<_>>());
                     v
                 })
                 .collect();
@@ -819,6 +824,9 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
         Format::Human => {
             for p in &picks {
                 println!("{}  (score {})  {}", p.ticket.id, p.score, p.ticket.title);
+                for c in &p.conflicts_with {
+                    println!("    overlaps `{}` on: {}", c.ticket, c.scopes.join(", "));
+                }
             }
             Ok(())
         }
@@ -1096,7 +1104,7 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
             "b": w.b,
             "conflict": w.conflict,
             "shared_scopes": w.shared_scopes,
-            "same_dependency_component": w.same_dependency_component,
+            "dependency_ordered": w.dependency_ordered,
         })),
         Format::Human => {
             if w.conflict {
@@ -1104,8 +1112,8 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
                 if !w.shared_scopes.is_empty() {
                     reasons.push(format!("shared scope(s): {}", w.shared_scopes.join(", ")));
                 }
-                if w.same_dependency_component {
-                    reasons.push("same dependency component".to_string());
+                if w.dependency_ordered {
+                    reasons.push("one depends on the other".to_string());
                 }
                 println!(
                     "`{}` and `{}` cannot share a batch — {}.",

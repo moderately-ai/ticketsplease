@@ -304,9 +304,13 @@ pub struct EventsArgs {
 /// `next` arguments.
 #[derive(Args)]
 pub struct NextArgs {
-    /// Return up to N mutually conflict-free picks.
+    /// Return up to N picks (scope-disjoint by default).
     #[arg(long, default_value_t = 1)]
     pub parallel: usize,
+    /// Allow picks whose scopes overlap (you resolve the shared-crate work); each
+    /// pick is annotated with the scopes it shares with the others.
+    #[arg(long)]
+    pub allow_overlap: bool,
 }
 
 /// `why` arguments.
