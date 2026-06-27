@@ -1,7 +1,7 @@
 ---
 id: ux-lease-type-consistency
 title: "lease_expires_at: quoted string in frontmatter vs int in JSON"
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

@@ -1,7 +1,7 @@
 ---
 id: ux-claim-dependency-aware
 title: claim succeeds on a ticket whose dependencies aren't done
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]

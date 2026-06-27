@@ -1,7 +1,7 @@
 ---
 id: ux-claims-view
 title: No who-holds-what view / cannot steal a live lease
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

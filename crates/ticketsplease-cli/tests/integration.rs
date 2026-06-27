@@ -2099,3 +2099,234 @@ fn why_rejects_comparing_a_ticket_to_itself() {
         .success();
     tkt(repo).args(["why", "x", "x"]).assert().code(3);
 }
+
+/// claim refuses a ticket whose dependencies aren't all done (matches ready/next).
+#[test]
+fn claim_refuses_unfinished_dependencies() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "base", "--title", "Base"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "web",
+            "--title",
+            "Web",
+            "--depends-on",
+            "base",
+        ])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    // base is not done -> claiming web is refused (exit 6).
+    tkt(repo)
+        .args(["claim", "web", "--as", "w1"])
+        .assert()
+        .code(6);
+    // Once base is done, web is claimable.
+    tkt(repo)
+        .args(["set", "base", "--status", "done"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["claim", "web", "--as", "w1"])
+        .assert()
+        .success();
+}
+
+/// next --claim atomically claims the best free pick; --claim requires --as.
+#[test]
+fn next_claim_dispatches_atomically() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--priority", "p0"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    // --claim without --as is a usage error.
+    tkt(repo).args(["next", "--claim"]).assert().code(3);
+    // --claim --as claims the top pick and reports it.
+    let out = tkt(repo)
+        .args(["next", "--claim", "--as", "w1", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["assignee"], "w1");
+    assert_eq!(v["id"], "a");
+    // a is now claimed (in-progress), so it's no longer ready.
+    assert!(ready_ids(repo).is_empty());
+}
+
+/// `claims` lists holders + live/expired; `claim --force` steals a live lease.
+#[test]
+fn claims_view_and_force_steal() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "t", "--as", "alice"])
+        .assert()
+        .success();
+
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["claims", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let claims = v["claims"].as_array().unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0]["assignee"], "alice");
+    assert_eq!(claims[0]["live"], true);
+
+    // A live lease can't be claimed by another without --force...
+    tkt(repo)
+        .args(["claim", "t", "--as", "bob"])
+        .assert()
+        .code(6);
+    // ...but --force steals it.
+    let out = tkt(repo)
+        .args(["claim", "t", "--as", "bob", "--force", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["assignee"], "bob");
+    assert_eq!(v["stolen"], true);
+}
+
+/// set --status done clears the claim (assignee + lease), so a done ticket is not
+/// reported as owned.
+#[test]
+fn done_clears_the_claim() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "t", "--as", "w1"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "done"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(v["status"], "done");
+    assert!(v["assignee"].is_null(), "done must clear assignee");
+    assert!(v["lease_expires_at"].is_null(), "done must clear the lease");
+}
+
+/// Claiming a `todo` ticket then releasing it restores `todo`, not `ready`; the lease
+/// is written as a bare integer in frontmatter (matching the JSON type).
+#[test]
+fn release_restores_status_and_lease_is_unquoted() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "t", "--as", "w1"])
+        .assert()
+        .success();
+    // While claimed, the lease is a bare integer (no surrounding quotes).
+    let raw = std::fs::read_to_string(repo.join("tickets/t.md")).unwrap();
+    let lease_line = raw
+        .lines()
+        .find(|l| l.starts_with("lease_expires_at:"))
+        .unwrap();
+    assert!(
+        !lease_line.contains('"'),
+        "lease must be unquoted: {lease_line:?}"
+    );
+    // Release restores the pre-claim status (todo), not ready.
+    tkt(repo)
+        .args(["release", "t", "--as", "w1"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        v["status"], "todo",
+        "release should restore the original status"
+    );
+}
+
+/// Re-claiming as the current holder is a renewal: no duplicate claim event.
+#[test]
+fn reclaim_renewal_emits_no_duplicate_event() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "t", "--as", "w1"])
+        .assert()
+        .success();
+    // Renew the same claim.
+    let out = tkt(repo)
+        .args(["claim", "t", "--as", "w1", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["renewed"], true);
+
+    let events: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["events", "--ticket", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let claim_events = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "claim")
+        .count();
+    assert_eq!(
+        claim_events, 1,
+        "a renewal must not add a second claim event"
+    );
+}

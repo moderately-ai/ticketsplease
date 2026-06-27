@@ -1,7 +1,7 @@
 ---
 id: ux-reclaim-event-noise
 title: Idempotent re-claim still logs a duplicate claim event
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

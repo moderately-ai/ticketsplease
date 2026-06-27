@@ -1,7 +1,7 @@
 ---
 id: ux-next-claim-atomic
 title: No atomic dispatch+claim (next->claim TOCTOU)
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, core]

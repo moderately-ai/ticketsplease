@@ -140,8 +140,19 @@ impl Document {
     /// Surgically set a scalar key's value, preserving everything else. Appends
     /// the key at the end of the frontmatter if absent.
     pub fn set_scalar(&mut self, key: &str, value: &str) -> Result<()> {
+        self.set_scalar_rendered(key, &render_yaml_scalar(value))
+    }
+
+    /// Set a scalar to a value written verbatim, bypassing string quoting. The caller
+    /// MUST guarantee `value` is already a YAML-safe plain scalar (e.g. a decimal
+    /// integer) — used for numeric fields like `lease_expires_at` so the frontmatter
+    /// carries an integer that round-trips to the same JSON integer type.
+    pub fn set_scalar_raw(&mut self, key: &str, value: &str) -> Result<()> {
+        self.set_scalar_rendered(key, value)
+    }
+
+    fn set_scalar_rendered(&mut self, key: &str, rendered: &str) -> Result<()> {
         let ending = self.default_ending();
-        let rendered = render_yaml_scalar(value);
         let mut out = String::with_capacity(self.fm.len() + rendered.len() + key.len() + 4);
         let mut done = false;
         for line in self.fm.split_inclusive('\n') {
@@ -149,7 +160,7 @@ impl Document {
                 guard_simple_scalar(line, key)?;
                 out.push_str(key);
                 out.push_str(": ");
-                out.push_str(&rendered);
+                out.push_str(rendered);
                 out.push_str(line_ending(line));
                 done = true;
             } else {
@@ -162,7 +173,7 @@ impl Document {
             }
             out.push_str(key);
             out.push_str(": ");
-            out.push_str(&rendered);
+            out.push_str(rendered);
             out.push_str(ending);
         }
         self.fm = out;

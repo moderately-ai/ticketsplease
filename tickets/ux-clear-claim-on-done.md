@@ -1,7 +1,7 @@
 ---
 id: ux-clear-claim-on-done
 title: set --status done leaves a stale claim (assignee/lease)
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]

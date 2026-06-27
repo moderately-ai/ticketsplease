@@ -161,6 +161,9 @@ pub struct Ticket {
     pub assignee: Option<String>,
     /// Claim lease expiry (epoch seconds), if claimed.
     pub lease_expires_at: Option<u64>,
+    /// The status the ticket held before it was claimed, so `release` can restore it
+    /// instead of unconditionally landing in `ready`. Present only while claimed.
+    pub claimed_from: Option<Status>,
     doc: Document,
     /// The file this ticket was loaded from, if any. `save` writes back here so a
     /// ticket whose frontmatter `id` has drifted from its filename updates in place
@@ -202,6 +205,7 @@ impl Ticket {
             tags: string_list(y, "tags"),
             assignee: optional_string(y, "assignee"),
             lease_expires_at: optional_string(y, "lease_expires_at").and_then(|s| s.parse().ok()),
+            claimed_from: optional_string(y, "claimed_from").and_then(|s| s.parse().ok()),
             doc,
             source_path: None,
         })
@@ -305,23 +309,45 @@ impl Ticket {
 
     /// Record a claim: set status in-progress, assignee, and the lease expiry.
     pub fn set_claim(&mut self, assignee: &str, lease_expires_at: u64) -> Result<()> {
+        // Remember the pre-claim status so `release` can restore it. Don't overwrite
+        // it when renewing a claim that is already in-progress.
+        if self.status != Status::InProgress {
+            self.doc.set_scalar("claimed_from", self.status.as_str())?;
+            self.claimed_from = Some(self.status);
+        }
         self.set_status(Status::InProgress)?;
         self.doc.set_scalar("assignee", assignee)?;
+        // Write the lease as a bare integer so frontmatter matches the JSON type.
         self.doc
-            .set_scalar("lease_expires_at", &lease_expires_at.to_string())?;
+            .set_scalar_raw("lease_expires_at", &lease_expires_at.to_string())?;
         self.assignee = Some(assignee.to_string());
         self.lease_expires_at = Some(lease_expires_at);
         Ok(())
     }
 
-    /// Clear a claim: drop assignee + lease and return the ticket to `ready`.
+    /// Clear a claim. If the ticket is still `in-progress` (the claim never advanced),
+    /// restore the pre-claim status (`claimed_from`, default `ready`); if the worker
+    /// already moved it on (review/blocked/done), keep that — releasing must not
+    /// revert real progress.
     pub fn clear_claim(&mut self) -> Result<()> {
-        self.set_status(Status::Ready)?;
+        if self.status == Status::InProgress {
+            let restore = self.claimed_from.unwrap_or(Status::Ready);
+            self.set_status(restore)?;
+        }
+        self.clear_lease();
+        Ok(())
+    }
+
+    /// Drop the claim fields (assignee, lease, pre-claim marker) without touching the
+    /// status. Used when a ticket reaches a terminal status — completion ends the
+    /// claim, but must keep the `done` status rather than reverting to `ready`.
+    pub fn clear_lease(&mut self) {
         self.doc.remove_key("assignee");
         self.doc.remove_key("lease_expires_at");
+        self.doc.remove_key("claimed_from");
         self.assignee = None;
         self.lease_expires_at = None;
-        Ok(())
+        self.claimed_from = None;
     }
 
     /// Whether this ticket's claim lease is still live at `now` (epoch seconds).

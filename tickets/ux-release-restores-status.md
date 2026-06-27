@@ -1,7 +1,7 @@
 ---
 id: ux-release-restores-status
 title: release always lands a ticket in `ready`, losing original status
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

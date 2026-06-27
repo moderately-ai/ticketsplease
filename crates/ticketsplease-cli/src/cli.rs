@@ -59,6 +59,8 @@ pub enum Command {
     Claim(ClaimArgs),
     /// Release a claimed ticket back to the ready pool.
     Release(ReleaseArgs),
+    /// Show current claims (assignee, lease expiry, live/expired).
+    Claims(ClaimsArgs),
     /// Explain why two tickets can or cannot run in parallel.
     Why(WhyArgs),
     /// Guard a branch against scope under-declaration and collisions.
@@ -320,6 +322,16 @@ pub struct NextArgs {
     /// pick is annotated with the scopes it shares with the others.
     #[arg(long)]
     pub allow_overlap: bool,
+    /// Atomically claim the first pick that is still free (race-safe dispatch).
+    /// Requires `--as`. Tries picks in order so a lost race falls through to the next.
+    #[arg(long)]
+    pub claim: bool,
+    /// Identity to claim as (with `--claim`).
+    #[arg(long = "as")]
+    pub agent: Option<String>,
+    /// Lease length in seconds for `--claim`.
+    #[arg(long, default_value_t = ticketsplease_core::claim::DEFAULT_TTL_SECS)]
+    pub ttl: u64,
 }
 
 /// `why` arguments.
@@ -342,6 +354,9 @@ pub struct ClaimArgs {
     /// Lease length in seconds; once it expires the claim is reclaimable by others.
     #[arg(long, default_value_t = ticketsplease_core::claim::DEFAULT_TTL_SECS)]
     pub ttl: u64,
+    /// Steal the claim even if another agent holds a live lease.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `release` arguments.
@@ -355,6 +370,17 @@ pub struct ReleaseArgs {
     /// Release even if the claim is held by another agent.
     #[arg(long)]
     pub force: bool,
+}
+
+/// `claims` arguments.
+#[derive(Args)]
+pub struct ClaimsArgs {
+    /// Include claims recorded on `<prefix>*` branch tips, not just the working tree.
+    #[arg(long)]
+    pub all_branches: bool,
+    /// Branch namespace to scan with --all-branches.
+    #[arg(long, default_value = "tkt/")]
+    pub prefix: String,
 }
 
 /// `guard` arguments.
@@ -449,6 +475,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Next(a) => commands::next(repo, fmt, a),
         Command::Claim(a) => commands::claim(repo, fmt, a),
         Command::Release(a) => commands::release(repo, fmt, a),
+        Command::Claims(a) => commands::claims(repo, fmt, a),
         Command::Why(a) => commands::why(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => commands::migrate(repo, fmt),

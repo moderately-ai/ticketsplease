@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,9 +21,9 @@ use ticketsplease_core::{
 };
 
 use crate::cli::{
-    ClaimArgs, CommentAddArgs, CommentListArgs, CreateArgs, EventsArgs, GuardArgs, InitArgs,
-    LinkArgs, ListArgs, NextArgs, ReleaseArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs,
-    StatusArgs, WatchArgs, WhyArgs,
+    ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, EventsArgs, GuardArgs,
+    InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs, SelfUpdateArgs, SetArgs, ShowArgs,
+    SkillInstallArgs, StatusArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -254,6 +254,10 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
         args.append_body_file.as_deref(),
     )? {
         ticket.append_body(&text);
+    }
+    // Completion implicitly ends a claim — a done ticket must not keep looking owned.
+    if ticket.status == Status::Done {
+        ticket.clear_lease();
     }
 
     let changed = ticket.render() != before;
@@ -891,6 +895,35 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
     let picks = schedule::next(&tickets, args.parallel, args.allow_overlap)?;
+
+    // Atomic dispatch: claim the first pick still free. Trying picks in order makes a
+    // lost race (another worker grabbed the top pick) fall through to the next instead
+    // of forcing the caller to re-run `next`.
+    if args.claim {
+        let agent = args
+            .agent
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("next --claim requires --as <worker>".to_string()))?;
+        for p in &picks {
+            match claim_core::claim(&store, &p.ticket.id, agent, args.ttl, false) {
+                Ok(outcome) => {
+                    emit_claim_event(&store, &outcome);
+                    return print_claim(fmt, &outcome);
+                }
+                // Raced away or became unclaimable — try the next pick.
+                Err(Error::Conflict(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        return match fmt {
+            Format::Json => print_json(&json!({ "schema_version": 1, "claimed": Value::Null })),
+            Format::Human => {
+                println!("(nothing available to claim)");
+                Ok(())
+            }
+        };
+    }
+
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = picks
@@ -1303,13 +1336,27 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
 /// `claim` — atomically take ownership of a ticket via the git-ref lock + lease.
 pub fn claim(repo: &Path, fmt: Format, args: &ClaimArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let outcome = claim_core::claim(&store, &args.id, &args.agent, args.ttl)?;
+    let outcome = claim_core::claim(&store, &args.id, &args.agent, args.ttl, args.force)?;
+    emit_claim_event(&store, &outcome);
+    print_claim(fmt, &outcome)
+}
+
+/// Emit the `claim` doorbell event, unless this was the holder renewing their own
+/// claim — a renewal changes no ownership, so logging it only adds reclaim noise.
+fn emit_claim_event(store: &Store, outcome: &claim_core::ClaimOutcome) {
+    if outcome.renewed {
+        return;
+    }
     let _ = store.emit_event(
         "claim",
         &outcome.id,
         Some(&outcome.assignee),
         json!({ "stolen": outcome.stolen, "lease_expires_at": outcome.lease_expires_at }),
     );
+}
+
+/// Render a claim outcome (shared by `claim` and `next --claim`).
+fn print_claim(fmt: Format, outcome: &claim_core::ClaimOutcome) -> Result<()> {
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
@@ -1317,10 +1364,13 @@ pub fn claim(repo: &Path, fmt: Format, args: &ClaimArgs) -> Result<()> {
             "assignee": outcome.assignee,
             "lease_expires_at": outcome.lease_expires_at,
             "stolen": outcome.stolen,
+            "renewed": outcome.renewed,
         })),
         Format::Human => {
             let note = if outcome.stolen {
-                " (took over an expired claim)"
+                " (took over a prior claim)"
+            } else if outcome.renewed {
+                " (renewed)"
             } else {
                 ""
             };
@@ -1346,6 +1396,60 @@ pub fn release(repo: &Path, fmt: Format, args: &ReleaseArgs) -> Result<()> {
                 println!("Released `{}`", args.id);
             } else {
                 println!("Ticket `{}` was not claimed (nothing to release)", args.id);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `claims` — who holds what: assignee, lease expiry, and live/expired state. With
+/// `--all-branches`, also surfaces claims recorded on `<prefix>*` branch tips.
+pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let (tickets, warnings) = if args.all_branches {
+        store.load_all_cross_branch(&args.prefix)?
+    } else {
+        store.load_all_lenient()?
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let claimed: Vec<&Ticket> = tickets.iter().filter(|t| t.assignee.is_some()).collect();
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = claimed
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "assignee": t.assignee,
+                        "lease_expires_at": t.lease_expires_at,
+                        "live": t.lease_live(now),
+                        "status": t.status.as_str(),
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "schema_version": 1,
+                "claims": rows,
+                "warnings": warnings,
+            }))
+        }
+        Format::Human => {
+            if claimed.is_empty() {
+                println!("(no active claims)");
+            }
+            for t in &claimed {
+                let state = if t.lease_live(now) { "live" } else { "expired" };
+                println!(
+                    "{:<16} {:<8} {}",
+                    t.assignee.as_deref().unwrap_or("?"),
+                    state,
+                    t.id
+                );
+            }
+            for w in &warnings {
+                eprintln!("warning: skipped {w}");
             }
             Ok(())
         }

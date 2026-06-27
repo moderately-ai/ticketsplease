@@ -42,8 +42,12 @@ pub struct ClaimOutcome {
     pub id: String,
     pub assignee: String,
     pub lease_expires_at: u64,
-    /// Whether this claim took over a prior claim whose lease had expired.
+    /// Whether this claim took over a prior claim (an expired lease, or a live one
+    /// via `--force`).
     pub stolen: bool,
+    /// Whether this was the current holder renewing their own claim (no ownership
+    /// change). Lets the caller skip emitting a duplicate claim event.
+    pub renewed: bool,
 }
 
 /// Seconds since the Unix epoch. A lease is mutation state, not query output, so
@@ -58,7 +62,13 @@ fn now_secs() -> u64 {
 /// Claim `id` for `agent` with a `ttl_secs` lease, marking it in-progress. Fails
 /// with `Conflict` (exit 6) when another agent holds a live claim, or `Invalid`
 /// when the ticket's status means it is not up for grabs.
-pub fn claim(store: &Store, id: &str, agent: &str, ttl_secs: u64) -> Result<ClaimOutcome> {
+pub fn claim(
+    store: &Store,
+    id: &str,
+    agent: &str,
+    ttl_secs: u64,
+    force: bool,
+) -> Result<ClaimOutcome> {
     let ticket = store.load(id)?; // NotFound (exit 4) if the id is unknown
     if !matches!(
         ticket.status,
@@ -71,25 +81,53 @@ pub fn claim(store: &Store, id: &str, agent: &str, ttl_secs: u64) -> Result<Clai
         )));
     }
 
+    // Don't start work whose prerequisites aren't done — this mirrors `ready`/`next`,
+    // which exclude such tickets from dispatch. Dangling deps are lint's concern, not
+    // a claim blocker, so only existing, non-done dependencies gate.
+    let blocking: Vec<String> = ticket
+        .dependencies
+        .iter()
+        .filter_map(|dep| store.load(dep).ok())
+        .filter(|d| d.status != Status::Done)
+        .map(|d| d.id.clone())
+        .collect();
+    if !blocking.is_empty() {
+        return Err(Error::Conflict(format!(
+            "ticket `{id}` has unfinished dependencies: {} (finish them before claiming)",
+            blocking.join(", ")
+        )));
+    }
+
     acquire_mutex(store, id)?;
-    let result = claim_locked(store, id, agent, ttl_secs);
+    let result = claim_locked(store, id, agent, ttl_secs, force);
     release_mutex(&store.repo_root, id);
     result
 }
 
-/// The claim decision, made while holding the mutex so no one else can be
-/// mid-write. Returns whether an expired prior claim was taken over.
-fn claim_locked(store: &Store, id: &str, agent: &str, ttl_secs: u64) -> Result<ClaimOutcome> {
+/// The claim decision, made while holding the mutex so no one else can be mid-write.
+fn claim_locked(
+    store: &Store,
+    id: &str,
+    agent: &str,
+    ttl_secs: u64,
+    force: bool,
+) -> Result<ClaimOutcome> {
     let mut ticket = store.load(id)?;
     let now = now_secs();
+    let renewed = ticket.assignee.as_deref() == Some(agent);
     let stolen = match (ticket.assignee.as_deref(), ticket.lease_expires_at) {
         // Refreshing my own claim — always fine, extends the lease.
         (Some(holder), _) if holder == agent => false,
-        // Someone else holds a live lease — they own it.
+        // Someone else holds a live lease — they own it, unless we force-steal it.
         (Some(holder), Some(exp)) if exp > now => {
-            return Err(Error::Conflict(format!(
-                "ticket `{id}` is already claimed by `{holder}` (lease still live)"
-            )));
+            if force {
+                true
+            } else {
+                return Err(Error::Conflict(format!(
+                    "ticket `{id}` is already claimed by `{holder}` (lease still live; \
+                     use --force to steal)"
+                )));
+            }
         }
         // Someone else, but the lease has expired (or none was set) — take over.
         (Some(_), _) => true,
@@ -105,6 +143,7 @@ fn claim_locked(store: &Store, id: &str, agent: &str, ttl_secs: u64) -> Result<C
         assignee: agent.to_string(),
         lease_expires_at: lease,
         stolen,
+        renewed,
     })
 }
 
