@@ -70,7 +70,8 @@ fn crud_scheduling_and_exit_codes() {
         .assert()
         .code(3); // invalid
 
-    // A cycle makes scheduling fail with code 5.
+    // A dependency cycle is rejected at link write time (exit 5), not deferred to
+    // scheduling.
     tkt(repo)
         .args(["create", "--id", "x", "--title", "X", "--scope", "core"])
         .assert()
@@ -83,11 +84,13 @@ fn crud_scheduling_and_exit_codes() {
         .args(["link", "x", "--depends-on", "y"])
         .assert()
         .success();
+    // Closing the loop would create x -> y -> x; reject it before it corrupts the graph.
     tkt(repo)
         .args(["link", "y", "--depends-on", "x"])
         .assert()
-        .success();
-    tkt(repo).args(["ready"]).assert().code(5);
+        .code(5);
+    // The rejected edge was never persisted, so scheduling stays healthy.
+    tkt(repo).args(["ready"]).assert().success();
 }
 
 #[test]
@@ -1515,7 +1518,9 @@ fn error_contract_and_exit_codes() {
     tkt(repo).args(["claim", "d", "--as", "w"]).assert().code(6);
 }
 
-/// ux-lint-cycle-exit-code: lint exits 5 on a cycle, matching ready/tracks.
+/// ux-lint-cycle-exit-code: lint exits 5 on a cycle, matching ready/tracks. `link`
+/// now rejects a cycle at write time, so the corrupt graph is created by hand-editing
+/// the files (the state a careless manual edit would leave behind).
 #[test]
 fn lint_exits_5_on_cycle() {
     let dir = TempDir::new().unwrap();
@@ -1533,10 +1538,10 @@ fn lint_exits_5_on_cycle() {
         .args(["link", "a", "--depends-on", "b"])
         .assert()
         .success();
-    tkt(repo)
-        .args(["link", "b", "--depends-on", "a"])
-        .assert()
-        .success();
+    // Hand-edit b to depend on a, closing the cycle behind `link`'s guard.
+    let bp = repo.join("tickets/b.md");
+    let raw = std::fs::read_to_string(&bp).unwrap();
+    std::fs::write(&bp, raw.replace("dependencies: []", "dependencies: [a]")).unwrap();
     tkt(repo).args(["lint"]).assert().code(5);
 }
 
@@ -1940,4 +1945,157 @@ fn set_writes_back_to_the_file_read_even_if_id_drifted() {
     );
     let updated = std::fs::read_to_string(&path).unwrap();
     assert!(updated.contains("status: done"));
+}
+
+/// link rejects an edge that closes a multi-node cycle at write time (exit 5).
+#[test]
+fn link_rejects_a_multi_node_cycle() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    for id in ["a", "b", "c"] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id])
+            .assert()
+            .success();
+    }
+    tkt(repo)
+        .args(["link", "a", "--depends-on", "b"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["link", "b", "--depends-on", "c"])
+        .assert()
+        .success();
+    // c -> a closes a -> b -> c -> a.
+    tkt(repo)
+        .args(["link", "c", "--depends-on", "a"])
+        .assert()
+        .code(5);
+    // The graph stayed acyclic, so lint is clean.
+    tkt(repo).args(["lint"]).assert().success();
+}
+
+/// A dangling dependency can be removed after its target is deleted — `--remove`
+/// never validates the target.
+#[test]
+fn link_remove_clears_a_dangling_dependency() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["link", "a", "--depends-on", "b"])
+        .assert()
+        .success();
+    std::fs::remove_file(repo.join("tickets/b.md")).unwrap();
+    // The reference is now dangling; lint flags it.
+    tkt(repo).args(["lint"]).assert().failure();
+    // Removal must succeed without the target existing.
+    tkt(repo)
+        .args(["link", "a", "--depends-on", "b", "--remove"])
+        .assert()
+        .success();
+    tkt(repo).args(["lint"]).assert().success();
+}
+
+/// create and link treat a dangling dependency the same way: both permit it, and
+/// lint reports it (one consistent model).
+#[test]
+fn create_and_link_treat_dangling_deps_consistently() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // create with a forward/dangling dep: permitted.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--depends-on",
+            "ghost",
+        ])
+        .assert()
+        .success();
+    // link with a dangling dep: also permitted (previously rejected with exit 4).
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["link", "b", "--depends-on", "ghost"])
+        .assert()
+        .success();
+    // lint reports both dangling references.
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let missing: Vec<&str> = v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "missing-dep")
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        missing.contains(&"a") && missing.contains(&"b"),
+        "both dangling deps should lint: {v}"
+    );
+}
+
+/// lint flags a ticket that declares a scope not defined in the config.
+#[test]
+fn lint_flags_unknown_scope_reference() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    // `cre` is a typo for `core`.
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--scope", "cre"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "non-cycle lint findings are exit 3"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "unknown-scope" && d["id"] == "t"),
+        "unknown scope should be flagged: {v}"
+    );
+}
+
+/// `why x x` is a usage error, not a ticket trivially conflicting with itself.
+#[test]
+fn why_rejects_comparing_a_ticket_to_itself() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "x", "--title", "X", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo).args(["why", "x", "x"]).assert().code(3);
 }

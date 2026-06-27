@@ -1,7 +1,7 @@
 ---
 id: ux-dependency-validation-consistency
 title: create --depends-on accepts dangling deps; link rejects them
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]

@@ -294,14 +294,27 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
     }
     let store = Store::open(repo)?;
     let mut ticket = store.load(&args.id)?;
-    // The dependency target must exist (otherwise the link is dangling).
-    let _target = store.load(&args.depends_on)?;
 
     let changed = if args.remove {
+        // Removal never validates the target: a dangling reference (its ticket was
+        // deleted) must be cleanable without hand-editing the file.
         ticket.remove_dependency(&args.depends_on)?
     } else {
         ticket.add_dependency(&args.depends_on)?
     };
+
+    // Adding an edge that closes a dependency cycle is rejected here (exit 5) rather
+    // than left to corrupt the graph until `ready`/`tracks`/`next` trips over it. A
+    // dangling target is permitted, mirroring `create --depends-on` — `lint` reports
+    // both dangling deps and cycles on the parseable set.
+    if changed && !args.remove {
+        let mut all = store.load_all()?;
+        if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
+            *slot = ticket.clone();
+        }
+        schedule::ensure_acyclic(&all)?;
+    }
+
     if changed {
         store.save(&ticket)?;
     }

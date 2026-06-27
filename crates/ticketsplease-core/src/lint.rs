@@ -1,11 +1,12 @@
 //! Schema-level linting of tickets. Link validation and cycle detection live in
 //! the scheduling layer (milestone M3) and reuse these diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
 
+use crate::config::CONFIG_FILE;
 use crate::error::{Error, Result};
 use crate::store::Store;
 use crate::ticket::Ticket;
@@ -18,7 +19,7 @@ pub struct Diagnostic {
     /// The ticket id, when parseable.
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
-    /// `duplicate-id` | `missing-dep` | `cycle`.
+    /// `unknown-scope` | `duplicate-id` | `missing-dep` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -29,6 +30,17 @@ pub struct Diagnostic {
 pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    // A scope is "defined" if it has a glob mapping, an owning crate, or an external
+    // descriptor. A ticket declaring an undefined scope (a typo) would otherwise only
+    // surface as a baffling later guard CONFLICT, so flag it like a dangling dep.
+    let defined_scopes: BTreeSet<&str> = store
+        .config
+        .scopes
+        .keys()
+        .chain(store.config.scope_crates.keys())
+        .chain(store.config.external_scopes.keys())
+        .map(String::as_str)
+        .collect();
     for path in store.ticket_files()? {
         let file = rel(&store.repo_root, &path);
         let stem = path
@@ -66,6 +78,24 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                             ticket.id
                         ),
                     });
+                }
+                // Only enforce the scope vocabulary once one exists: with no scopes
+                // configured at all the project is not using the scope system, so
+                // there is nothing to typo against (and no false alarms on a fresh repo).
+                if !defined_scopes.is_empty() {
+                    for scope in &ticket.scopes {
+                        if !defined_scopes.contains(scope.as_str()) {
+                            diags.push(Diagnostic {
+                                file: file.clone(),
+                                id: Some(ticket.id.clone()),
+                                code: "unknown-scope",
+                                message: format!(
+                                    "declares scope `{scope}` not defined in {CONFIG_FILE} \
+                                     ([scopes], [scope_crates], or [external_scopes])"
+                                ),
+                            });
+                        }
+                    }
                 }
                 if let Some(prev) = seen.insert(ticket.id.clone(), file.clone()) {
                     diags.push(Diagnostic {

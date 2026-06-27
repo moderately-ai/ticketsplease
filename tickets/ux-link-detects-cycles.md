@@ -1,7 +1,7 @@
 ---
 id: ux-link-detects-cycles
 title: link accepts multi-node cycles (only blows up later)
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]

@@ -260,6 +260,18 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
     out
 }
 
+/// Error with [`Error::Cycle`] if the dependency graph contains a cycle. Lets
+/// `link` reject a cycle-forming edge at write time (exit 5) instead of letting the
+/// corrupt graph surface later in `ready`/`tracks`/`next`. Dangling dependency
+/// targets are ignored here (they are not a cycle and `lint` reports them).
+pub fn ensure_acyclic(tickets: &[Ticket]) -> Result<()> {
+    let by_id: BTreeMap<&str, &Ticket> = tickets.iter().map(|t| (t.id.as_str(), t)).collect();
+    match find_cycle(&by_id) {
+        Some(cycle) => Err(Error::Cycle(cycle.join(" -> "))),
+        None => Ok(()),
+    }
+}
+
 /// Why two tickets can (or cannot) run in parallel, surfaced for explainability
 /// (`tkt why`). Two tickets cannot run in parallel if they share a scope (file
 /// overlap) or one transitively depends on the other (ordering). Note this is
@@ -281,6 +293,13 @@ pub struct Why {
 
 /// Explain the scheduling relationship between two tickets.
 pub fn why(tickets: &[Ticket], a_id: &str, b_id: &str) -> Result<Why> {
+    // A ticket trivially shares every scope with itself; comparing one to itself is
+    // a usage mistake, not a real conflict.
+    if a_id == b_id {
+        return Err(Error::Invalid(format!(
+            "`why` compares two different tickets (got `{a_id}` twice)"
+        )));
+    }
     let by_id: BTreeMap<&str, &Ticket> = tickets.iter().map(|t| (t.id.as_str(), t)).collect();
     let a = by_id
         .get(a_id)
@@ -292,8 +311,8 @@ pub fn why(tickets: &[Ticket], a_id: &str, b_id: &str) -> Result<Why> {
         .ok_or_else(|| Error::NotFound(b_id.to_string()))?;
 
     let shared = shared_scopes(a, b);
-    let dependency_ordered =
-        a_id != b_id && (depends_on(&by_id, a_id, b_id) || depends_on(&by_id, b_id, a_id));
+    // a != b is guaranteed by the early return above.
+    let dependency_ordered = depends_on(&by_id, a_id, b_id) || depends_on(&by_id, b_id, a_id);
 
     let conflict = !shared.is_empty() || dependency_ordered;
     Ok(Why {

@@ -1,7 +1,7 @@
 ---
 id: ux-link-remove-dangling
 title: Cannot remove a dependency once its target is deleted
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, core]

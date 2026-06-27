@@ -1,7 +1,7 @@
 ---
 id: ux-why-self-id-guard
 title: why <id> <id> reports a ticket conflicting with itself
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli, core]

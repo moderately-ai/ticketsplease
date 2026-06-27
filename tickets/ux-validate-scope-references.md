@@ -1,7 +1,7 @@
 ---
 id: ux-validate-scope-references
 title: Undefined/typo'd scopes silently accepted
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core]
