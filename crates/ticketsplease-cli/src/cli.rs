@@ -45,6 +45,8 @@ pub enum Command {
     List(ListArgs),
     /// Report ticket status; with `--all-branches`, scan `tkt/*` branches.
     Status(StatusArgs),
+    /// Cross-check ticket status against `tkt/*` branches and worktrees (drift report).
+    Reconcile(ReconcileArgs),
     /// Block until a ticket reaches a target status.
     Watch(WatchArgs),
     /// Add or list a ticket's comments (append-only, conflict-free).
@@ -433,6 +435,14 @@ pub struct RenameArgs {
     pub new: String,
 }
 
+/// `reconcile` arguments.
+#[derive(Args)]
+pub struct ReconcileArgs {
+    /// Branch namespace that marks per-ticket work branches (id = branch minus this).
+    #[arg(long, default_value = "tkt/")]
+    pub prefix: String,
+}
+
 /// `claims` arguments.
 #[derive(Args)]
 pub struct ClaimsArgs {
@@ -462,6 +472,12 @@ pub struct GuardArgs {
     /// expansion (and the transitive collisions/under-declarations it adds).
     #[arg(long, visible_alias = "no-reverse-deps")]
     pub direct_only: bool,
+    /// Still compute and report transitive collisions (keeping the `cause` triage),
+    /// but exit 0 when every conflict is transitive — only a direct overlap or an
+    /// under-declaration fails the gate. Unlike `--direct-only`, the reverse-dep
+    /// expansion still runs, so the report keeps its transitive collisions for review.
+    #[arg(long)]
+    pub ignore_transitive: bool,
     /// Ref to read the `[scopes]` config from (defaults to the base). Guards against
     /// a stale/empty config on the checked-out feature branch giving a false all-clear.
     #[arg(long)]
@@ -536,6 +552,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Show(a) => commands::show(repo, fmt, a),
         Command::List(a) => commands::list(repo, fmt, a),
         Command::Status(a) => commands::status(repo, fmt, a),
+        Command::Reconcile(a) => commands::reconcile(repo, fmt, a),
         Command::Watch(a) => commands::watch(repo, fmt, a),
         Command::Comment(a) => match &a.command {
             CommentCommand::Add(a) => commands::comment_add(repo, fmt, a),

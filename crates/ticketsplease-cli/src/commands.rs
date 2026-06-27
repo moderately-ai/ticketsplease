@@ -22,8 +22,9 @@ use ticketsplease_core::{
 
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
-    GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReleaseArgs, RenameArgs, SelfUpdateArgs,
-    SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, WatchArgs, WhyArgs,
+    GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReconcileArgs, ReleaseArgs, RenameArgs,
+    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, WatchArgs,
+    WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -1285,18 +1286,32 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
             if let Value::Object(ref mut map) = value {
                 map.insert("schema_version".to_string(), json!(1));
                 map.insert("warnings".to_string(), json!(warnings));
+                map.insert(
+                    "transitive_only".to_string(),
+                    json!(report.transitive_only()),
+                );
             }
             print_json(&value)?;
         }
         Format::Human => {
             print_guard_human(&report);
+            if report.transitive_only() && !args.ignore_transitive {
+                println!("  (every collision is transitive — `--ignore-transitive` would pass)");
+            }
             for w in &warnings {
                 eprintln!("warning: {w}");
             }
         }
     }
 
-    if report.conflict {
+    // `--ignore-transitive` gates on a real conflict only (a direct overlap or an
+    // under-declaration); transitive-only collisions stay in the report but pass.
+    let gated = if args.ignore_transitive {
+        report.has_direct_conflict()
+    } else {
+        report.conflict
+    };
+    if gated {
         Err(Error::Conflict(format!(
             "branch `{}` escapes ticket `{}`'s declared scopes or collides with an open ticket",
             report.branch, report.ticket
@@ -1648,6 +1663,101 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
     }
 }
 
+/// `reconcile` — cross-check the board against git reality. Ticket status lives in
+/// markdown with no link to whether the `<prefix><id>` work branch (or its worktree)
+/// exists, so the board drifts both ways. This reports the drift so an orchestrator
+/// can trust (or repair) the board before dispatching.
+pub fn reconcile(repo: &Path, fmt: Format, args: &ReconcileArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    ensure_git_repo(repo)?;
+    let (tickets, _warnings) = store.load_all_lenient()?;
+    let ticket_ids: BTreeSet<&str> = tickets.iter().map(|t| t.id.as_str()).collect();
+
+    let pattern = format!("refs/heads/{}*", args.prefix);
+    let branch_ids: BTreeSet<String> = git_lines(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", &pattern],
+    )?
+    .iter()
+    .map(|b| b.strip_prefix(&args.prefix).unwrap_or(b).to_string())
+    .collect();
+    let worktrees = worktree_branches(repo)?;
+    let has_worktree = |id: &str| worktrees.contains(&format!("{}{id}", args.prefix));
+
+    let mut findings: Vec<Value> = Vec::new();
+    for t in &tickets {
+        let has_branch = branch_ids.contains(&t.id);
+        match t.status {
+            // Marked busy, but nothing is actually running.
+            Status::InProgress if !has_branch => findings.push(json!({
+                "id": t.id,
+                "issue": "in-progress-no-branch",
+                "status": t.status.as_str(),
+                "branch": false,
+                "worktree": false,
+                "detail": "in-progress but no work branch exists (abandoned or never-started dispatch)",
+            })),
+            // Live branch, but the board says the work hasn't started.
+            Status::Todo | Status::Ready if has_branch => findings.push(json!({
+                "id": t.id,
+                "issue": "branch-without-active-ticket",
+                "status": t.status.as_str(),
+                "branch": true,
+                "worktree": has_worktree(&t.id),
+                "detail": "a work branch exists but the ticket is not in-progress (untracked in-flight work)",
+            })),
+            _ => {}
+        }
+    }
+    for id in &branch_ids {
+        if !ticket_ids.contains(id.as_str()) {
+            findings.push(json!({
+                "id": id,
+                "issue": "orphan-branch",
+                "status": Value::Null,
+                "branch": true,
+                "worktree": has_worktree(id),
+                "detail": "a work branch with no matching ticket",
+            }));
+        }
+    }
+    findings.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let ok = findings.is_empty();
+
+    match fmt {
+        Format::Json => {
+            print_json(&json!({ "schema_version": 1, "ok": ok, "findings": findings }))?;
+        }
+        Format::Human => {
+            if ok {
+                println!("ok: board matches git ({}* branches)", args.prefix);
+            } else {
+                for f in &findings {
+                    let wt = if f["worktree"] == json!(true) {
+                        " [worktree]"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{} {}{wt}: {}",
+                        f["issue"].as_str().unwrap_or(""),
+                        f["id"].as_str().unwrap_or(""),
+                        f["detail"].as_str().unwrap_or(""),
+                    );
+                }
+            }
+        }
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "{} reconcile finding(s) — the board does not match git",
+            findings.len()
+        )))
+    }
+}
+
 /// `delete` — remove a ticket file (and its comments). git history preserves it.
 pub fn delete(repo: &Path, fmt: Format, args: &DeleteArgs) -> Result<()> {
     let store = Store::open(repo)?;
@@ -1910,6 +2020,17 @@ pub fn guide(fmt: Format) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Branch short-names that currently have a git worktree checked out.
+fn worktree_branches(repo: &Path) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for line in git_lines(repo, &["worktree", "list", "--porcelain"])? {
+        if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            out.insert(branch.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// Whether a git ref (or `HEAD`) resolves in `repo`.

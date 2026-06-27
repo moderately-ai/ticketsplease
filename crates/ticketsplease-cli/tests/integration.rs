@@ -551,6 +551,31 @@ fn guard_cargo_reverse_dep_is_tagged_transitive() {
         .args(["guard", "feat", "--ticket", "t", "--no-reverse-deps"])
         .assert()
         .success();
+
+    // --ignore-transitive passes the gate (the only conflict is transitive) but —
+    // unlike --direct-only — keeps the transitive collision in the report for triage.
+    let out = tkt(repo)
+        .args([
+            "guard",
+            "feat",
+            "--ticket",
+            "t",
+            "--ignore-transitive",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "transitive-only must pass with --ignore-transitive"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["transitive_only"], true);
+    assert_eq!(
+        v["collisions"][0]["cause"], "transitive",
+        "the collision is still reported, not dropped"
+    );
 }
 
 const CARGO_PIN: &str = "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n\
@@ -2747,4 +2772,104 @@ fn guide_prints_the_concept_model() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("Scopes") && text.contains("guard"));
+}
+
+/// --ignore-transitive still fails on a real (direct) under-declaration.
+#[test]
+fn guard_ignore_transitive_still_fails_on_direct() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--scope", "core"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(repo.join("core")).unwrap();
+    std::fs::create_dir_all(repo.join("io")).unwrap();
+    std::fs::write(repo.join("core/a.txt"), "a\n").unwrap();
+    std::fs::write(repo.join("io/b.txt"), "b\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git_commit_all(repo, "init");
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(repo.join("io/b.txt"), "changed\n").unwrap();
+    git_commit_all(repo, "edit io");
+    // io is a direct under-declaration, so --ignore-transitive must still fail.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--ignore-transitive"])
+        .assert()
+        .code(6);
+}
+
+/// reconcile flags the two drift directions (in-progress-no-branch, branch-not-started)
+/// and orphan branches, and surfaces a worktree.
+#[test]
+fn reconcile_flags_board_git_drift() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "a", "--status", "in-progress"]) // in-progress, no branch -> stale-busy
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"]) // todo, will get a branch -> stale-idle
+        .assert()
+        .success();
+    git_init_commit(repo);
+    git(repo, &["branch", "tkt/b"]);
+    git(repo, &["branch", "tkt/ghost"]); // orphan branch, no ticket
+    let wt = TempDir::new().unwrap();
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            wt.path().join("b").to_str().unwrap(),
+            "tkt/b",
+        ],
+    );
+
+    let out = tkt(repo)
+        .args(["reconcile", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "drift should fail reconcile");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let findings = v["findings"].as_array().unwrap();
+    let by_id = |id: &str| findings.iter().find(|f| f["id"] == id).cloned();
+    assert_eq!(by_id("a").unwrap()["issue"], "in-progress-no-branch");
+    let b = by_id("b").unwrap();
+    assert_eq!(b["issue"], "branch-without-active-ticket");
+    assert_eq!(b["worktree"], true, "b's worktree should be detected");
+    assert_eq!(by_id("ghost").unwrap()["issue"], "orphan-branch");
+}
+
+/// reconcile is clean (exit 0) when the board matches git.
+#[test]
+fn reconcile_clean_when_consistent() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "x", "--title", "X"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "x", "--status", "in-progress"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "y", "--title", "Y"]) // todo, no branch -> consistent
+        .assert()
+        .success();
+    git_init_commit(repo);
+    git(repo, &["branch", "tkt/x"]); // x in-progress WITH a branch -> consistent
+    tkt(repo).args(["reconcile"]).assert().success();
 }

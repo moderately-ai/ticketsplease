@@ -46,8 +46,11 @@ case exit:
          collisions non-empty -> another open ticket's declared area overlaps your affected set.
              Per collision check `cause`: `direct` = a real overlap, coordinate (merge the other
              first, or split the work); `transitive` = only the reverse-dep graph connects you,
-             usually a false alarm for additive work — confirm with `guard --direct-only` (alias
-             `--no-reverse-deps`). Don't let transitive noise train you to ignore exit 6.
+             usually a false alarm for additive work. To auto-allow transitive-only collisions
+             while still seeing them, gate with `guard --ignore-transitive` (exits 0 unless there's
+             a direct overlap or under-declaration; `transitive_only: true` in the JSON marks the
+             case). `--direct-only` instead drops the reverse-dep walk entirely. Don't let
+             transitive noise train you to ignore a genuine exit 6.
   other -> a setup problem (4 = no ticket resolved, 3 = bad input); fix and retry.
 ```
 
@@ -60,6 +63,7 @@ Workers advance status on their own `tkt/<id>` branches, so an orchestrator on `
 - `ticketsplease events --watch --since <cursor>` — the **multiplexed** wake-on-event across *all* tickets at once: returns the moment any worker changes status, claims, releases, or comments. Events live in `.git` refs, so you see them **without waiting for a commit** (unlike `status`/`show --ref`, which read committed branch state). Loop it, advancing `--since` to the last id you saw, to consume the stream without missing a transition. Prefer this to spawning N single-ticket watchers.
 - `ticketsplease comment add <id> --as <w> --body -` / `comment list <id> --ref tkt/<id>` — leave durable notes on a ticket (blocked-reasons, decisions, questions) and read a worker's notes from `main`. Each `comment add` also rings the event doorbell above.
 - `ticketsplease status --all-branches` — every `tkt/*` branch's ticket status at its committed tip; a simple snapshot when you don't need the live stream.
+- `ticketsplease reconcile` — diff the board against git: in-progress tickets with no branch (a dispatch that never started), live `tkt/*` branches whose ticket still reads todo/ready (work the board doesn't reflect), and orphan branches. The board and git drift independently; run this before each dispatch round (exit 3 on drift) so you can trust `tracks`/`ready` before fanning out.
 - `ticketsplease watch <id> --until review --timeout <secs>` — block until one worker reaches a status (exit 0) or give up (exit 7). It auto-resolves the `tkt/<id>` branch.
 - `ticketsplease show <id> --ref tkt/<id>` — read one ticket (and its comments) as committed on its branch.
 

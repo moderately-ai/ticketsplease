@@ -9,7 +9,7 @@ Exit codes: `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` cyc
 
 ## JSON conventions
 
-- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `status`→`tickets` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 
@@ -73,6 +73,18 @@ list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,pa
 ticketsplease status [--all-branches] [--prefix tkt/]
 ```
 Without flags, the working-tree status of every ticket. `--all-branches` scans `refs/heads/<prefix>*` and reports each ticket's status as committed on its branch tip (a branch whose ticket file is absent on its tip is reported with `status: null`). JSON: `{ "schema_version", "source": "worktree"|"branches", "tickets": [ {branch?, id, status, assignee, lease_expires_at} ] }`.
+
+## reconcile
+
+```
+ticketsplease reconcile [--prefix tkt/]
+```
+Cross-checks each ticket's status against git reality — the `<prefix>*` work branches and `git worktree list` — and reports where the board has drifted (ticket status lives in markdown with no link to whether a branch/worktree actually exists). Findings:
+- `in-progress-no-branch` — a ticket marked in-progress with no work branch (abandoned or never-started dispatch; **stale-busy**).
+- `branch-without-active-ticket` — a `<prefix><id>` branch exists but the ticket is still todo/ready (untracked in-flight work; **stale-idle**).
+- `orphan-branch` — a `<prefix>*` branch with no matching ticket.
+
+Each finding carries `worktree: bool` (a worktree is checked out on that branch). **Exit 3** when any drift is found (so `reconcile && dispatch` gates), `0` when the board matches git. JSON: `{ "schema_version", "ok": bool, "findings": [ {id, issue, status, branch: bool, worktree: bool, detail} ] }`.
 
 ## claims
 
@@ -153,15 +165,19 @@ release JSON: `{ "schema_version", "id", "released": bool }`.
 ## guard
 
 ```
-ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--direct-only] [--config-ref <ref>] [--prefix tkt/]
+ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--direct-only] [--ignore-transitive] [--config-ref <ref>] [--prefix tkt/]
 ```
 Diffs the branch vs `--base` and makes two decoupled judgements. **Exit 6** when the branch under-declares a scope or collides with another open ticket. Requires a git repo (clean error otherwise).
 
 It reads the `[scopes]` contract from `--config-ref` (default: the base), **not** the possibly stale/empty config on the checked-out branch — so an emptied branch config can't give a false all-clear. Sibling tickets' in-flight status is read from `<prefix>*` branch tips, so a collision fires in the branch-per-ticket flow even when the current checkout shows the sibling as `todo`.
 
-**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap) or `transitive` (reverse-dep only — safe for additive work). `--direct-only` (alias `--no-reverse-deps`) drops the expansion; `[language] reverse_dep_expansion = false` makes that the repo default. `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
+**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap) or `transitive` (reverse-dep only — safe for additive work). `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
 
-JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "conflict": bool, "warnings": [...] }`.
+Two ways to handle transitive noise, with different trade-offs:
+- `--ignore-transitive` — **still computes and reports** transitive collisions (keeping `cause` visible for triage), but the *exit code* ignores them: the gate fails only on a direct overlap or an under-declaration. `transitive_only` in the JSON is `true` when a conflict exists but every part of it is transitive (so a gate would otherwise have been a false 6). Use this for additive work where you want the report but not the block.
+- `--direct-only` (alias `--no-reverse-deps`) — **skips the reverse-dep walk entirely**, so transitive collisions never appear in the report at all (faster, but no visibility). `[language] reverse_dep_expansion = false` makes that the repo default.
+
+JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "conflict": bool, "transitive_only": bool, "warnings": [...] }`. (`conflict` stays strict — any conflict; gate on the exit code, or on `transitive_only` to auto-allow transitive-only.)
 
 ## delete / rename
 

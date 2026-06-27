@@ -328,6 +328,28 @@ pub struct GuardReport {
     pub conflict: bool,
 }
 
+impl GuardReport {
+    /// Whether the report contains a *gating* conflict: an under-declaration (always
+    /// file-authoritative) or a collision with a `direct` (real file/crate) overlap.
+    /// Purely-`transitive` collisions are excluded — they are reverse-dependency
+    /// expansion, safe for an additive change.
+    #[must_use]
+    pub fn has_direct_conflict(&self) -> bool {
+        !self.under_declared.is_empty()
+            || self
+                .collisions
+                .iter()
+                .any(|c| c.cause == ScopeCause::Direct)
+    }
+
+    /// Whether the only conflicts are transitive collisions (a conflict exists, but no
+    /// under-declaration and no direct collision). Lets `--ignore-transitive` pass.
+    #[must_use]
+    pub fn transitive_only(&self) -> bool {
+        self.conflict && !self.has_direct_conflict()
+    }
+}
+
 /// The ticket's declared file area: the globs of its declared scopes plus its
 /// explicit `paths`. A changed file matching this set is "covered" — it cannot be
 /// an under-declaration, regardless of which other scope's glob also matches it
