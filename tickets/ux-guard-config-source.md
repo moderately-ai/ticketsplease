@@ -1,7 +1,7 @@
 ---
 id: ux-guard-config-source
 title: guard reads config + open-ticket set from working tree, not --base
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [core, cli]

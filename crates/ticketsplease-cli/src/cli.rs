@@ -372,6 +372,14 @@ pub struct GuardArgs {
     /// expansion (and the transitive collisions/under-declarations it adds).
     #[arg(long, visible_alias = "no-reverse-deps")]
     pub direct_only: bool,
+    /// Ref to read the `[scopes]` config from (defaults to the base). Guards against
+    /// a stale/empty config on the checked-out feature branch giving a false all-clear.
+    #[arg(long)]
+    pub config_ref: Option<String>,
+    /// Branch namespace whose tips supply sibling tickets' in-flight status for
+    /// collision detection (the branch-per-ticket flow).
+    #[arg(long, default_value = "tkt/")]
+    pub prefix: String,
 }
 
 /// `self-update` arguments.

@@ -1,7 +1,7 @@
 ---
 id: ux-guard-nongit-error
 title: guard in a non-git dir dumps full git-diff usage
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [core]

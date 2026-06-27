@@ -1,7 +1,7 @@
 ---
 id: ux-guard-unscoped-paths
 title: guard is blind to files covered by no scope
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [core, cli]

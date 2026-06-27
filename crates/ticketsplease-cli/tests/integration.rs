@@ -1685,3 +1685,259 @@ fn list_filters_empty_state_and_lenient() {
         "the unparseable file should surface as a warning"
     );
 }
+
+/// Stage everything and commit with a fixed identity (test fixtures only).
+fn git_commit_all(repo: &Path, msg: &str) {
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            msg,
+        ],
+    );
+}
+
+/// Write the canonical `[scopes]` config (path-glob backend) into `repo`.
+fn write_scope_config(repo: &Path, scopes: &str) {
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        format!(
+            "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+             [language]\nbackend = \"none\"\n[scopes]\n{scopes}"
+        ),
+    )
+    .unwrap();
+}
+
+/// guard collision detection sees a sibling's status on its own branch tip, not the
+/// stale `todo` in the current checkout (the branch-per-ticket blind spot).
+#[test]
+fn guard_collision_fires_across_branch_tips() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"api\" = [\"src/api/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "api"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "api"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(repo.join("src/api")).unwrap();
+    std::fs::write(repo.join("src/api/mod.rs"), "// base\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git_commit_all(repo, "init");
+
+    // b reaches `review` on its own branch — its open status lives there, not on main.
+    git(repo, &["checkout", "-q", "-b", "tkt/b"]);
+    tkt(repo)
+        .args(["set", "b", "--status", "review"])
+        .assert()
+        .success();
+    git_commit_all(repo, "b review");
+    git(repo, &["checkout", "-q", "main"]);
+
+    // a's branch edits the shared `api` scope.
+    git(repo, &["checkout", "-q", "-b", "tkt/a"]);
+    std::fs::write(repo.join("src/api/a.rs"), "// a\n").unwrap();
+    tkt(repo)
+        .args(["set", "a", "--status", "in-progress"])
+        .assert()
+        .success();
+    git_commit_all(repo, "a work");
+
+    // In this checkout b reads as todo, but its tip says review -> collision must fire.
+    let out = tkt(repo)
+        .args([
+            "guard", "tkt/a", "--ticket", "a", "--base", "main", "--format", "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "cross-branch collision must fire"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["collisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["ticket"] == "b"),
+        "should collide with b on `api`: {v}"
+    );
+}
+
+/// guard reads the `[scopes]` contract from the base ref, so an emptied config on
+/// the feature branch can't produce a false all-clear.
+#[test]
+fn guard_reads_config_from_base_not_branch() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--scope", "core"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(repo.join("core")).unwrap();
+    std::fs::create_dir_all(repo.join("io")).unwrap();
+    std::fs::write(repo.join("core/a.txt"), "a\n").unwrap();
+    std::fs::write(repo.join("io/b.txt"), "b\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git_commit_all(repo, "init");
+
+    // The branch drops the scope map entirely and edits io/ (undeclared by `t`).
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    write_scope_config(repo, "");
+    std::fs::write(repo.join("io/b.txt"), "changed\n").unwrap();
+    git_commit_all(repo, "empty config + edit io");
+
+    // Branch config is empty (would be a no-op all-clear); base config still maps io,
+    // so the under-declaration is caught.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--base", "main"])
+        .assert()
+        .code(6);
+}
+
+/// A changed file under no scope glob is invisible to collision detection — guard
+/// surfaces the gap as a warning rather than staying silent.
+#[test]
+fn guard_warns_about_files_covered_by_no_scope() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--scope", "core"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(repo.join("misc")).unwrap();
+    std::fs::write(repo.join("misc/util.txt"), "x\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git_commit_all(repo, "init");
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(repo.join("misc/util.txt"), "changed\n").unwrap();
+    git_commit_all(repo, "edit unscoped file");
+
+    let out = tkt(repo)
+        .args([
+            "guard", "feat", "--ticket", "t", "--base", "main", "--format", "json",
+        ])
+        .output()
+        .unwrap();
+    // No declared-scope escape (the file maps to no scope), so this is a clean exit
+    // carrying a warning — not a failure.
+    assert!(
+        out.status.success(),
+        "unscoped change is not itself a conflict"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("covered by no scope")),
+        "should warn about the unscoped file: {v}"
+    );
+}
+
+/// guard in a non-git directory fails with a clean message, not git's usage dump.
+#[test]
+fn guard_in_non_git_dir_errors_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["guard", "feat", "--ticket", "t"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("requires a git repository"),
+        "clean message expected, got: {err}"
+    );
+    assert!(
+        !err.contains("usage: git"),
+        "must not leak git usage: {err}"
+    );
+}
+
+/// A bare `release` (no --as, no --force) must not silently drop a live claim.
+#[test]
+fn bare_release_does_not_drop_a_live_claim() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "t", "--as", "alice"])
+        .assert()
+        .success();
+
+    // Bare release is refused while someone holds it.
+    tkt(repo).args(["release", "t"]).assert().code(6);
+    let show = tkt(repo)
+        .args(["show", "t", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(v["assignee"], "alice", "alice's claim must survive");
+
+    // --force still overrides.
+    tkt(repo)
+        .args(["release", "t", "--force"])
+        .assert()
+        .success();
+}
+
+/// set resolves a ticket by filename but writes back to that same file, even when
+/// the frontmatter id has drifted — no orphaned original, no duplicate id.
+#[test]
+fn set_writes_back_to_the_file_read_even_if_id_drifted() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "orig", "--title", "O"])
+        .assert()
+        .success();
+
+    // Hand-edit the frontmatter id so it no longer matches the filename stem.
+    let path = repo.join("tickets/orig.md");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("id: orig", "id: drifted")).unwrap();
+
+    // Operate by the filename id; the write must land back in orig.md.
+    tkt(repo)
+        .args(["set", "orig", "--status", "done"])
+        .assert()
+        .success();
+    assert!(path.exists(), "the original file must be updated in place");
+    assert!(
+        !repo.join("tickets/drifted.md").exists(),
+        "must not spawn a new file at the drifted id"
+    );
+    let updated = std::fs::read_to_string(&path).unwrap();
+    assert!(updated.contains("status: done"));
+}

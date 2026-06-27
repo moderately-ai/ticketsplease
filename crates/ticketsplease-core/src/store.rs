@@ -3,6 +3,7 @@
 //! All writes are atomic (temp file + rename); new tickets are created with
 //! `O_EXCL` so concurrent agents never clobber each other (R15).
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -139,6 +140,65 @@ impl Store {
         }
         let raw = String::from_utf8_lossy(&output.stdout);
         Ticket::parse(&raw).map_err(|e| Error::Invalid(format!("{id} @ {git_ref}: {e}")))
+    }
+
+    /// Load the config as committed on a git ref (e.g. the guard `--base`). Returns
+    /// `Ok(None)` when the ref carries no config file, so a caller can fall back to
+    /// the working-tree config. Lets the guard read the canonical `[scopes]` map from
+    /// a stable ref instead of the possibly stale/empty config on a feature branch.
+    pub fn config_at_ref(&self, git_ref: &str) -> Result<Option<Config>> {
+        let spec = format!("{git_ref}:{CONFIG_FILE}");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["show", &spec])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        Config::parse(&text).map(Some)
+    }
+
+    /// Load the full ticket set with each `<prefix>*` branch tip overlaid onto its
+    /// own ticket. In the branch-per-ticket flow a ticket's true in-flight status
+    /// lives on its branch, so a plain working-tree load sees every sibling as
+    /// whatever the *current* checkout says; this surfaces the real cross-branch
+    /// status (the keystone for guard collision detection). Tickets without a branch
+    /// keep their working-tree status. Returns lenient-load warnings alongside.
+    pub fn load_all_cross_branch(&self, prefix: &str) -> Result<(Vec<Ticket>, Vec<String>)> {
+        let (base, warnings) = self.load_all_lenient()?;
+        let mut by_id: BTreeMap<String, Ticket> =
+            base.into_iter().map(|t| (t.id.clone(), t)).collect();
+        for branch in self.branches_with_prefix(prefix)? {
+            let id = branch.strip_prefix(prefix).unwrap_or(&branch).to_string();
+            // A branch whose ticket file is absent on its tip is simply not overlaid.
+            if let Ok(t) = self.load_at_ref(&id, &branch) {
+                by_id.insert(t.id.clone(), t);
+            }
+        }
+        Ok((by_id.into_values().collect(), warnings))
+    }
+
+    /// Local branch names under `refs/heads/<prefix>*`. Empty (not an error) when
+    /// there is no git repo or no matching branch.
+    fn branches_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let pattern = format!("refs/heads/{prefix}*");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["for-each-ref", "--format=%(refname:short)", &pattern])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Directory holding a ticket's comment files.
@@ -343,9 +403,15 @@ impl Store {
         ))
     }
 
-    /// Atomically overwrite a ticket file.
+    /// Atomically overwrite a ticket file. Writes back to the path the ticket was
+    /// loaded from when known, so an `id` that has drifted from its filename does
+    /// not orphan the original file (or mint a duplicate id); falls back to
+    /// `<id>.md` for tickets built in memory.
     pub fn save(&self, ticket: &Ticket) -> Result<()> {
-        write_atomic(&self.path_for(&ticket.id), &ticket.render())
+        let path = ticket
+            .source_path()
+            .map_or_else(|| self.path_for(&ticket.id), Path::to_path_buf);
+        write_atomic(&path, &ticket.render())
     }
 
     /// Create a ticket with an explicit id (idempotent + atomic). Re-creating

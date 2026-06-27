@@ -3,7 +3,7 @@
 //! Reads use a real YAML parser for correctness; all mutations go through the
 //! round-trip-safe [`Document`] so writes stay line-surgical.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -162,6 +162,12 @@ pub struct Ticket {
     /// Claim lease expiry (epoch seconds), if claimed.
     pub lease_expires_at: Option<u64>,
     doc: Document,
+    /// The file this ticket was loaded from, if any. `save` writes back here so a
+    /// ticket whose frontmatter `id` has drifted from its filename updates in place
+    /// rather than spawning a fresh `<id>.md` (which would orphan the original and
+    /// create a duplicate id). `None` for tickets built in memory or parsed from a
+    /// git ref — those are never the target of a disk write-back.
+    source_path: Option<PathBuf>,
 }
 
 impl Ticket {
@@ -197,14 +203,24 @@ impl Ticket {
             assignee: optional_string(y, "assignee"),
             lease_expires_at: optional_string(y, "lease_expires_at").and_then(|s| s.parse().ok()),
             doc,
+            source_path: None,
         })
     }
 
-    /// Load and parse a ticket from a file.
+    /// Load and parse a ticket from a file, remembering the path for write-back.
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", path.display())))?;
-        Self::parse(&raw)
+        let mut t = Self::parse(&raw)?;
+        t.source_path = Some(path.to_path_buf());
+        Ok(t)
+    }
+
+    /// The file this ticket was loaded from (`None` if built in memory or parsed
+    /// from a string/ref). `Store::save` writes back here to keep edits in place.
+    #[must_use]
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
     }
 
     /// The markdown body.

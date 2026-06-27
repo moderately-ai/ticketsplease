@@ -1,7 +1,7 @@
 ---
 id: ux-release-requires-as
 title: Bare `release` (no --as) drops anyone's live claim
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [core, cli]

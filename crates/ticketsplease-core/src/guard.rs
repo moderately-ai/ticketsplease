@@ -356,6 +356,24 @@ pub fn coverage_globset(config: &Config, ticket: &Ticket) -> Result<GlobSet> {
         .map_err(|e| Error::Invalid(format!("building coverage globset: {e}")))
 }
 
+/// The union of every `[scopes]` glob in the config. A changed file matching none
+/// of these is covered by no scope — invisible to collision detection — so the guard
+/// can warn about scope-map gaps. (External-scope `paths` are intentionally excluded:
+/// they cover only their own fork tree, not the general workspace.)
+pub fn config_globset(config: &Config) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for (scope, globs) in &config.scopes {
+        for g in globs {
+            builder.add(Glob::new(g).map_err(|e| {
+                Error::Invalid(format!("invalid glob `{g}` for scope `{scope}`: {e}"))
+            })?);
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| Error::Invalid(format!("building config globset: {e}")))
+}
+
 /// Evaluate the guard. Two distinct judgements, deliberately decoupled:
 ///
 /// - **Under-declaration** (a scope *escape*) is file-authoritative: a changed

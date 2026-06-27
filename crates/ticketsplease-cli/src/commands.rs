@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::claim as claim_core;
 use ticketsplease_core::comment::Comment;
-use ticketsplease_core::config::Backend;
+use ticketsplease_core::config::{Backend, CONFIG_FILE};
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
@@ -718,6 +718,27 @@ fn emit_watch(
     }
 }
 
+/// Fail with a clean message when `repo` is not inside a git work tree, instead of
+/// letting a downstream `git diff`/`git show` dump its multi-line usage and bury the
+/// real cause. Mirrors the precondition `claim`'s ref-mutex already relies on.
+fn ensure_git_repo(repo: &Path) -> Result<()> {
+    let inside = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if inside {
+        Ok(())
+    } else {
+        Err(Error::Invalid(
+            "this command requires a git repository (run `git init` and make at least one commit)"
+                .to_string(),
+        ))
+    }
+}
+
 /// Whether a local branch exists.
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     Command::new("git")
@@ -917,28 +938,57 @@ pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
 /// `guard` — reconcile a branch's actual diff against its ticket's declared scopes.
 pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let all = store.load_all()?;
+    // A non-git dir would otherwise let the downstream `git diff` dump its full usage.
+    ensure_git_repo(repo)?;
     let base = args
         .base
         .clone()
         .unwrap_or_else(|| store.config.default_base.clone());
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // The [scopes] contract is read from a canonical ref (default: the base), not the
+    // possibly stale/empty config on the checked-out feature branch — otherwise a
+    // branch that dropped the scope map gets a false all-clear. Fall back to the
+    // working-tree config only when the ref carries none (e.g. a fresh, uncommitted init).
+    let config_ref = args.config_ref.clone().unwrap_or_else(|| base.clone());
+    let config = match store.config_at_ref(&config_ref)? {
+        Some(c) => c,
+        None => {
+            warnings.push(format!(
+                "no {CONFIG_FILE} on `{config_ref}`; using the working-tree config"
+            ));
+            store.config.clone()
+        }
+    };
+    if config.scopes.is_empty() {
+        warnings.push(
+            "[scopes] is empty — guard cannot map changed files to scopes; \
+             configure [scopes] in ticketsplease.toml"
+                .to_string(),
+        );
+    }
+
+    // Collision detection needs siblings' real in-flight status, which in the
+    // branch-per-ticket flow lives on each ticket's own branch — overlay the tips.
+    let (all, _) = store.load_all_cross_branch(&args.prefix)?;
     let target_id = resolve_ticket(args, &all)?;
-    let target = all
-        .iter()
-        .find(|t| t.id == target_id)
-        .ok_or_else(|| Error::NotFound(target_id.clone()))?;
+    // The target's declared scopes are the agent's current declaration: read the
+    // working tree (evaluate() self-skips the target in `all`, so a stale copy
+    // there is harmless).
+    let target = store.load(&target_id)?;
 
     let diff = guard::BranchDiff::compute(repo, &base, &args.branch)?;
 
-    let path_mapper = guard::PathGlobMapper::new(&store.config)?;
-    let glob_scopes: BTreeSet<String> = store.config.scopes.keys().cloned().collect();
+    let path_mapper = guard::PathGlobMapper::new(&config)?;
+    let glob_scopes: BTreeSet<String> = config.scopes.keys().cloned().collect();
     // Config can default the reverse-dep walk off (foundational-crate workspaces);
     // --direct-only forces it off per-invocation.
-    let direct_only = args.direct_only || !store.config.language.reverse_dep_expansion;
-    let cargo_mapper = if store.config.language.backend == Backend::Rust {
+    let direct_only = args.direct_only || !config.language.reverse_dep_expansion;
+    let cargo_mapper = if config.language.backend == Backend::Rust {
         Some(CargoMapper::new(
             repo,
-            &store.config.scope_crates,
+            &config.scope_crates,
             &glob_scopes,
             direct_only,
         ))
@@ -947,14 +997,14 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
     };
     // External-scope detection is language-agnostic (it reads manifest diffs) and
     // runs even under --direct-only, since a pin bump is a direct change.
-    let external_mapper = if store.config.external_scopes.is_empty() {
+    let external_mapper = if config.external_scopes.is_empty() {
         None
     } else {
         Some(guard::ExternalScopeMapper::new(
             repo,
             &base,
             &args.branch,
-            &store.config.external_scopes,
+            &config.external_scopes,
         )?)
     };
     // direct = what the branch physically touches (path globs + external pins) —
@@ -969,12 +1019,34 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
         impact.push(cm);
     }
 
-    let coverage = guard::coverage_globset(&store.config, target)?;
+    let coverage = guard::coverage_globset(&config, &target)?;
     let mappers = guard::Mappers {
         direct: &direct,
         impact: &impact,
     };
-    let report = guard::evaluate(target, &all, diff, &mappers, &coverage)?;
+    let report = guard::evaluate(&target, &all, diff, &mappers, &coverage)?;
+
+    // Scope-map gaps: a changed file no [scopes] glob covers is invisible to
+    // collision detection, so two tickets can both edit it and collide undetected.
+    let covered = guard::config_globset(&config)?;
+    let uncovered: Vec<&str> = report
+        .changed_files
+        .iter()
+        .filter(|f| !covered.is_match(f.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !uncovered.is_empty() {
+        let sample = uncovered
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "{} changed file(s) covered by no scope (e.g. {sample})",
+            uncovered.len()
+        ));
+    }
 
     match fmt {
         Format::Json => {
@@ -982,10 +1054,16 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
                 .map_err(|e| Error::Internal(format!("serializing guard report: {e}")))?;
             if let Value::Object(ref mut map) = value {
                 map.insert("schema_version".to_string(), json!(1));
+                map.insert("warnings".to_string(), json!(warnings));
             }
             print_json(&value)?;
         }
-        Format::Human => print_guard_human(&report),
+        Format::Human => {
+            print_guard_human(&report);
+            for w in &warnings {
+                eprintln!("warning: {w}");
+            }
+        }
     }
 
     if report.conflict {

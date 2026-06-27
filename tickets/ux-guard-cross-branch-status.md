@@ -1,7 +1,7 @@
 ---
 id: ux-guard-cross-branch-status
 title: guard collision check is cross-branch-blind
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [core, cli]

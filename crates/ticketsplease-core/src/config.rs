@@ -122,7 +122,12 @@ impl Config {
                 Error::Invalid(format!("cannot read {}: {e}", path.display()))
             }
         })?;
-        toml::from_str(&text).map_err(|e| Error::Invalid(format!("invalid {CONFIG_FILE}: {e}")))
+        Self::parse(&text)
+    }
+
+    /// Parse config from raw TOML text (e.g. the blob committed on a git ref).
+    pub fn parse(text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|e| Error::Invalid(format!("invalid {CONFIG_FILE}: {e}")))
     }
 
     /// Absolute path to the tickets directory.

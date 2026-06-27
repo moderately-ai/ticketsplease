@@ -1,7 +1,7 @@
 ---
 id: ux-set-writes-by-id-not-file
 title: set/claim/release write by frontmatter id, not the file read
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [core, cli]

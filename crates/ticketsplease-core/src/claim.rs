@@ -125,12 +125,22 @@ fn release_locked(store: &Store, id: &str, agent: Option<&str>, force: bool) -> 
         return Ok(false); // nothing to release
     }
     if !force {
-        if let (Some(holder), Some(who)) = (ticket.assignee.as_deref(), agent) {
-            if holder != who {
+        match (ticket.assignee.as_deref(), agent) {
+            // A named release must come from the holder.
+            (Some(holder), Some(who)) if holder != who => {
                 return Err(Error::Conflict(format!(
                     "ticket `{id}` is held by `{holder}`, not `{who}` (use --force to override)"
                 )));
             }
+            // A bare release (no --as) must not silently drop someone else's claim —
+            // confirm the holder or force it.
+            (Some(holder), None) => {
+                return Err(Error::Conflict(format!(
+                    "ticket `{id}` is held by `{holder}`; pass `--as {holder}` to confirm \
+                     (or --force to override)"
+                )));
+            }
+            _ => {}
         }
     }
     ticket.clear_claim()?;
