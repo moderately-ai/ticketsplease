@@ -1,7 +1,7 @@
 //! Command handlers. Each emits human-readable text by default and a stable,
 //! versioned JSON payload under `--format json`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,12 +43,14 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
                 .to_string(),
         )
     };
+    let has_git = git_ref_exists(repo, "HEAD");
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
             "tickets_dir": dir,
             "wrote_config": outcome.wrote_config,
             "skill_installed": skill_path,
+            "git": has_git,
         })),
         Format::Human => {
             println!("Initialized ticketsplease (tickets dir: {dir})");
@@ -57,6 +59,16 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
             }
             if let Some(path) = &skill_path {
                 println!("Installed Claude skill to {path}");
+            }
+            println!("\nNext steps:");
+            println!("  1. Define your [scopes] in {CONFIG_FILE} (scope name -> path globs).");
+            println!("  2. Create a ticket:  tkt create --title \"...\" --scope <scope>");
+            println!("  3. See the model:    tkt guide");
+            if !has_git {
+                println!(
+                    "\nwarning: not a git repository — claim/guard/status/events/watch need \
+                     `git init` and at least one commit."
+                );
             }
             Ok(())
         }
@@ -529,14 +541,7 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
             }
             if !comments.is_empty() {
                 println!("\n## Comments");
-                let now = now_epoch();
-                for c in &comments {
-                    let when =
-                        c.at.map(|a| format!(" · {}", humanize_epoch(a, now)))
-                            .unwrap_or_default();
-                    println!("\n— {}{when}:", c.by.as_deref().unwrap_or("?"));
-                    println!("{}", c.body);
-                }
+                print_comment_thread(&comments, now_epoch());
             }
             Ok(())
         }
@@ -590,16 +595,7 @@ pub fn comment_list(repo: &Path, fmt: Format, args: &CommentListArgs) -> Result<
             "comments": comments.iter().map(comment_value).collect::<Vec<_>>(),
         })),
         Format::Human => {
-            let now = now_epoch();
-            for c in &comments {
-                let when = c.at.map(|a| humanize_epoch(a, now));
-                println!(
-                    "— {}{}:",
-                    c.by.as_deref().unwrap_or("?"),
-                    when.map(|w| format!(" · {w}")).unwrap_or_default()
-                );
-                println!("{}\n", c.body);
-            }
+            print_comment_thread(&comments, now_epoch());
             Ok(())
         }
     }
@@ -620,6 +616,23 @@ fn comment_value(c: &Comment) -> Value {
 /// timeout) — a wake-on-event the orchestrator loops, advancing `--since`.
 pub fn events(repo: &Path, fmt: Format, args: &EventsArgs) -> Result<()> {
     let store = Store::open(repo)?;
+    // Events live in `.git` refs; a non-git dir would otherwise return empty success
+    // forever, so a tailing consumer never learns git is missing.
+    ensure_git_repo(repo)?;
+    // Validate filters so a typo (`--type bogs`, a ghost ticket) fails loudly rather
+    // than silently masking the whole stream as empty.
+    if let Some(kind) = &args.kind {
+        const KNOWN: [&str; 4] = ["comment", "status", "claim", "release"];
+        if !KNOWN.contains(&kind.as_str()) {
+            return Err(Error::Invalid(format!(
+                "unknown event type `{kind}` (expected one of: {})",
+                KNOWN.join(", ")
+            )));
+        }
+    }
+    if let Some(ticket) = &args.ticket {
+        store.load(ticket)?; // NotFound (exit 4) for a ghost ticket
+    }
     if !args.watch {
         let evs = filter_events(store.events()?, args);
         return print_events(fmt, &evs);
@@ -1786,6 +1799,46 @@ pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
     }
 }
 
+/// Render comments as a nested thread: replies indented under their parent. An
+/// orphan reply (its parent absent on this ref) renders at the top level.
+fn print_comment_thread(comments: &[Comment], now: u64) {
+    let ids: BTreeSet<&str> = comments.iter().map(|c| c.id.as_str()).collect();
+    let mut children: BTreeMap<&str, Vec<&Comment>> = BTreeMap::new();
+    let mut roots: Vec<&Comment> = Vec::new();
+    for c in comments {
+        match c.reply_to.as_deref() {
+            Some(parent) if ids.contains(parent) => {
+                children.entry(parent).or_default().push(c);
+            }
+            _ => roots.push(c),
+        }
+    }
+    for r in &roots {
+        print_comment_node(r, 0, &children, now);
+    }
+}
+
+fn print_comment_node(
+    c: &Comment,
+    depth: usize,
+    children: &BTreeMap<&str, Vec<&Comment>>,
+    now: u64,
+) {
+    let indent = "  ".repeat(depth);
+    let when =
+        c.at.map(|a| format!(" · {}", humanize_epoch(a, now)))
+            .unwrap_or_default();
+    println!("{indent}— {}{when}:", c.by.as_deref().unwrap_or("?"));
+    for line in c.body.lines() {
+        println!("{indent}  {line}");
+    }
+    if let Some(kids) = children.get(c.id.as_str()) {
+        for k in kids {
+            print_comment_node(k, depth + 1, children, now);
+        }
+    }
+}
+
 /// Current time in epoch seconds (for relative-time rendering).
 fn now_epoch() -> u64 {
     SystemTime::now()
@@ -1813,6 +1866,49 @@ fn humanize_epoch(at: u64, now: u64) -> String {
         "just now".to_string()
     } else {
         format!("{mag} ago")
+    }
+}
+
+/// The conceptual model, for humans who haven't read the bundled skill.
+const GUIDE: &str = "\
+ticketsplease — conceptual guide
+
+Tickets are markdown files with YAML frontmatter under your tickets dir. Each has an
+id, status (todo/ready/in-progress/blocked/review/done), priority (p0..p3),
+dependencies, and scopes.
+
+Scopes are abstract names you map to path globs in ticketsplease.toml ([scopes]).
+A ticket declares the scopes it will touch. Two tickets that share a scope conflict
+(can't run in parallel); guard uses scopes to catch a branch leaving its lane.
+
+ready    — tickets whose dependencies are all done (the dispatchable queue).
+tracks   — partitions ready tickets into conflict-free parallel batches (no two in a
+           batch share a scope). `--parallel N` caps each batch to N.
+next     — the highest-impact ready pick(s), scored by
+           1000 x priority + 10 x critical-path length + count of tickets it unblocks.
+           `--parallel N` returns N scope-disjoint picks; `--claim --as <w>` claims one.
+why a b  — explains whether two tickets can run in parallel.
+
+guard <branch> — diffs the branch against a base, maps changed files to scopes, and
+           fails (exit 6) if the branch touches scopes its ticket didn't declare
+           (under-declaration) or overlaps another open ticket (collision).
+
+claim/release/claims — a git-ref lock + frontmatter lease let many agents claim
+           tickets race-free. `claims` shows who holds what.
+
+Exit codes: 0 ok · 3 invalid · 4 not-found · 5 cycle · 6 conflict · 7 timeout.
+JSON: every command supports --format json with schema_version: 1.
+
+The bundled Claude skill (installed by `tkt init`) has the full workflow guide.";
+
+/// `guide` — print the conceptual model (scopes, tracks, scoring, guard, claims).
+pub fn guide(fmt: Format) -> Result<()> {
+    match fmt {
+        Format::Json => print_json(&json!({ "schema_version": 1, "guide": GUIDE })),
+        Format::Human => {
+            println!("{GUIDE}");
+            Ok(())
+        }
     }
 }
 

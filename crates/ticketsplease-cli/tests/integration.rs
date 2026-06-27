@@ -2638,3 +2638,113 @@ fn events_human_output_has_relative_time() {
         "events should show a relative time: {text:?}"
     );
 }
+
+/// A reply must target an existing comment; threads render nested in human output.
+#[test]
+fn comment_reply_to_is_validated_and_threaded() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args([
+            "comment",
+            "add",
+            "t",
+            "--body",
+            "root comment",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let parent = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // An unknown reply-to target is rejected.
+    tkt(repo)
+        .args(["comment", "add", "t", "--reply-to", "nope", "--body", "x"])
+        .assert()
+        .code(4);
+    // A valid reply is accepted...
+    tkt(repo)
+        .args([
+            "comment",
+            "add",
+            "t",
+            "--reply-to",
+            &parent,
+            "--body",
+            "a reply",
+        ])
+        .assert()
+        .success();
+    // ...and renders indented beneath its parent.
+    let out = tkt(repo).args(["comment", "list", "t"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("root comment") && text.contains("a reply"));
+    assert!(
+        text.contains("    a reply"),
+        "the reply should be indented under its parent: {text:?}"
+    );
+}
+
+/// events validates its filters and signals a missing git repo (not silent empty).
+#[test]
+fn events_validates_filters_and_requires_git() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    // No git yet -> events fails loudly instead of returning empty success.
+    tkt(repo).args(["events"]).assert().failure();
+    git_init_commit(repo);
+    // Unknown event type is rejected.
+    tkt(repo)
+        .args(["events", "--type", "bogus"])
+        .assert()
+        .code(3);
+    // Unknown ticket is rejected.
+    tkt(repo)
+        .args(["events", "--ticket", "ghost"])
+        .assert()
+        .code(4);
+    // A valid (empty) query now succeeds.
+    tkt(repo)
+        .args(["events", "--ticket", "t"])
+        .assert()
+        .success();
+}
+
+/// init prints next-steps and warns when there's no git repo.
+#[test]
+fn init_prints_next_steps_and_warns_without_git() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let out = tkt(repo).args(["init", "--no-skill"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Next steps"), "got: {text:?}");
+    assert!(
+        text.contains("not a git repository"),
+        "should warn about missing git: {text:?}"
+    );
+}
+
+/// `tkt guide` prints the conceptual model.
+#[test]
+fn guide_prints_the_concept_model() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let out = tkt(repo).args(["guide"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Scopes") && text.contains("guard"));
+}

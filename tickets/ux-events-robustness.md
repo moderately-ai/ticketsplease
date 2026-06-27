@@ -1,7 +1,7 @@
 ---
 id: ux-events-robustness
 title: "events: silent empty on bad filter and in a non-git dir"
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli, core]

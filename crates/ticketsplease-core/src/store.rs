@@ -219,6 +219,14 @@ impl Store {
         if !self.path_for(ticket_id).exists() {
             return Err(Error::NotFound(ticket_id.to_string()));
         }
+        // A reply must target an existing comment, so a typo doesn't orphan it.
+        if let Some(rt) = &reply_to {
+            if !self.comments(ticket_id)?.iter().any(|c| &c.id == rt) {
+                return Err(Error::NotFound(format!(
+                    "comment `{rt}` to reply to on ticket `{ticket_id}`"
+                )));
+            }
+        }
         let dir = self.comments_dir(ticket_id);
         fs::create_dir_all(&dir).map_err(Error::Io)?;
         let comment = Comment::new(by, reply_to, body);

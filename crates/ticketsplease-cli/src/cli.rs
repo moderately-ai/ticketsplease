@@ -13,7 +13,9 @@ use crate::format::Format;
 #[command(
     name = "ticketsplease",
     version,
-    about = "git-native parallel-work ticketing"
+    about = "git-native parallel-work ticketing",
+    after_help = "New here? Run `tkt guide` for the conceptual model (scopes, tracks, \
+                  scoring, guard, claims), or read the bundled skill installed by `tkt init`."
 )]
 pub struct Cli {
     /// Path to the repository root.
@@ -71,6 +73,8 @@ pub enum Command {
     Rename(RenameArgs),
     /// Check repository setup (config, git, scope globs, base ref).
     Doctor,
+    /// Print a short conceptual guide (scopes, tracks, scoring, guard, claims).
+    Guide,
     /// Explain why two tickets can or cannot run in parallel.
     Why(WhyArgs),
     /// Guard a branch against scope under-declaration and collisions.
@@ -102,6 +106,9 @@ pub struct InitArgs {
 /// `create` arguments.
 #[derive(Args)]
 #[command(group = ArgGroup::new("create_input").required(true).multiple(false).args(["title", "from"]))]
+#[command(after_help = "Examples:\n  \
+    tkt create --title \"Add auth\" --scope api --priority p1\n  \
+    tkt create --from backlog.json   # batch from a JSON array; - reads stdin")]
 pub struct CreateArgs {
     /// Ticket title (single create). Mutually exclusive with --from.
     #[arg(long)]
@@ -380,6 +387,9 @@ pub struct WhyArgs {
 
 /// `claim` arguments.
 #[derive(Args)]
+#[command(after_help = "Examples:\n  \
+    tkt claim my-ticket --as worker-1\n  \
+    tkt next --claim --as worker-1   # atomically claim the best ready pick")]
 pub struct ClaimArgs {
     /// Ticket id to claim.
     pub id: String,
@@ -436,6 +446,9 @@ pub struct ClaimsArgs {
 
 /// `guard` arguments.
 #[derive(Args)]
+#[command(after_help = "Examples:\n  \
+    tkt guard tkt/my-feature --base main\n  \
+    tkt guard tkt/my-feature --direct-only   # skip cargo reverse-dep expansion")]
 pub struct GuardArgs {
     /// Branch (or ref) to guard.
     pub branch: String,
@@ -539,6 +552,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Delete(a) => commands::delete(repo, fmt, a),
         Command::Rename(a) => commands::rename(repo, fmt, a),
         Command::Doctor => commands::doctor(repo, fmt),
+        Command::Guide => commands::guide(fmt),
         Command::Why(a) => commands::why(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(_) => commands::migrate(repo, fmt),

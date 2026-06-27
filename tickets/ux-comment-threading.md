@@ -1,7 +1,7 @@
 ---
 id: ux-comment-threading
 title: "--reply-to is stored but never shown or validated"
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli, core]

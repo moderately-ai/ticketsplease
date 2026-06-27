@@ -1,7 +1,7 @@
 ---
 id: ux-concept-guide-for-humans
 title: Conceptual model not learnable from the CLI alone
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, skill]

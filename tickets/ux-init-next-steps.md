@@ -1,7 +1,7 @@
 ---
 id: ux-init-next-steps
 title: init gives no next-steps and no non-git warning
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]
