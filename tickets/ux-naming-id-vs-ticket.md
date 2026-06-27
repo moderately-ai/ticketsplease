@@ -1,7 +1,7 @@
 ---
 id: ux-naming-id-vs-ticket
 title: Inconsistent JSON field naming (id/ticket, depends_on/dependencies, created)
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, core]

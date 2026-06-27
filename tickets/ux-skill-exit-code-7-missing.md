@@ -1,7 +1,7 @@
 ---
 id: ux-skill-exit-code-7-missing
 title: Skill exit-code tables omit exit 7 (timeout)
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [skill]

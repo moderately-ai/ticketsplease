@@ -1,7 +1,7 @@
 ---
 id: ux-cross-clone-propagation-docs
 title: Document that events (refs) and comments don't push by default
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [skill]

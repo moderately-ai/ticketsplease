@@ -1,7 +1,7 @@
 ---
 id: ux-uniform-json-envelope
 title: No uniform JSON result envelope across commands
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli]

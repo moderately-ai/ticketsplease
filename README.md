@@ -14,7 +14,7 @@ tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes it
                                   # ticket's declared scope or collides with another
 ```
 
-`init` / `create` / `set` / `link` / `show` / `ready` / `next` / `lint` are the convenience surface around those two; `status --all-branches`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches.
+`init` / `create` / `set` / `link` / `show` / `list` / `ready` / `next` / `lint` / `delete` / `rename` are the convenience surface around those two; `claim` / `release` / `claims` / `next --claim` provide race-safe pull-based dispatch; `status --all-branches`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches. New to the model? `tkt guide` prints it in one screen, and `tkt doctor` verifies setup.
 
 ## Install
 
@@ -38,6 +38,7 @@ The installer detects your platform, downloads the matching static binary, verif
 
 ```sh
 tkt init                              # scaffold tickets/ + ticketsplease.toml + the Claude skill
+tkt guide                             # the conceptual model in one screen
 # edit ticketsplease.toml to define your scopes (see below)
 tkt create --title "Add vector index" --priority p1 --scope query/planner
 tkt create --id build-index-trait --title "Build the index trait" --scope core

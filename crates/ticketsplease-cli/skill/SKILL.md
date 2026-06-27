@@ -26,7 +26,8 @@ When several agents work a repo in parallel, the failure mode is two of them edi
   | 3 | invalid / dirty (malformed ticket, failed lint) |
   | 4 | ticket not found |
   | 5 | dependency cycle |
-  | 6 | **conflict** — guard found a declared-area overlap (an under-declared scope, or collision with an open ticket). A conservative pre-merge filter, *not* a proof of merge conflict. |
+  | 6 | **conflict** — guard found a declared-area overlap (an under-declared scope, or collision with an open ticket); also a lost claim race, a held-claim release, or a `why` conflict. A conservative signal, *not* a proof of merge conflict. |
+  | 7 | **timeout** — `watch` / `events --watch` gave up after `--timeout` seconds. |
 
 - Output is deterministic (sorted, no timestamps) — safe to diff and cache.
 - Every command accepts `--repo <path>` (default the current directory). Operations are fully offline and atomic.
@@ -37,6 +38,8 @@ Locate the binary (`ticketsplease` or `tkt` on `PATH`; if neither is present, te
 
 ```sh
 ticketsplease init        # scaffolds tickets/ + ticketsplease.toml (+ this skill)
+ticketsplease guide       # the conceptual model in one screen (scopes, tracks, scoring, guard, claims)
+ticketsplease doctor      # verify setup: config, git repo + commit, scope globs, base ref
 ```
 
 Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents (collisions from that expansion are tagged `transitive` so you can triage them; `guard --direct-only`, or `[language] reverse_dep_expansion = false` for a repo default, skips it). Under-declaration is always file-based, so this expansion never causes a false "out of scope" on a shared foundational crate. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
@@ -53,7 +56,7 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ```sh
    ticketsplease claim <id> --as <worker-id> --format json   # exit 6 → already claimed, pick another
    ```
-   The claim is race-safe (a git-ref compare-and-swap: of N workers racing one ticket, exactly one wins and the rest get exit 6) and carries a lease, so a crashed worker's ticket becomes reclaimable instead of stuck forever. It also flips the ticket to in-progress, so `ready`/`tracks`/`next` stop offering it. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside the ticket's declared scope. This is what makes **pull-based** dispatch safe: many workers can each `claim` straight off the same `tracks`/`ready` pool with no central coordinator handing out assignments.
+   The claim is race-safe (a git-ref compare-and-swap: of N workers racing one ticket, exactly one wins and the rest get exit 6) and carries a lease, so a crashed worker's ticket becomes reclaimable instead of stuck forever. It also flips the ticket to in-progress, so `ready`/`tracks`/`next` stop offering it. It refuses a ticket whose dependencies aren't all done (exit 6), matching dispatch. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside the ticket's declared scope. This is what makes **pull-based** dispatch safe: many workers can each `claim` straight off the same `tracks`/`ready` pool with no central coordinator. To collapse the recommend-then-claim race into one call, use `ticketsplease next --claim --as <worker> --format json` — it atomically claims the best free pick (falling through to the next on a lost race). `ticketsplease claims` shows who holds what (assignee, lease, live/expired); `claim --force` steals a live lease.
 
 3. **Before merging, guard the branch:**
    ```sh
@@ -62,7 +65,7 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's declared area; it clears this **pre-merge filter**. (This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
    - Exit `6` → a **declared-area overlap, not a proven conflict.** The JSON says where. `under_declared` is file-authoritative: scopes whose files the branch edited but that fall outside the ticket's declared area (declared-scope globs + `paths`). The crate-graph reverse-dep expansion never lands here — editing a foundational crate that many crates (or sibling sub-scopes) map to is not a scope escape, and a file named in `paths` is always covered. `collisions` lists open tickets whose declared area the affected set overlaps; each (and each scope in `affected_causes`) is tagged `direct` (real overlap) or `transitive` (reverse-dep only — usually safe for an additive change), and `guard --direct-only` drops the transitive ones. Resolve by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), coordinating with the named ticket, or — if you own the merge — building+testing the combined result.
 
-4. **Finish or release.** `claim` already set the ticket in-progress; on completion move it forward with `ticketsplease set <id> --status review|done`. If you abandon the work, `ticketsplease release <id> --as <worker-id>` drops the claim and returns it to the ready pool. Renew a long-running claim by re-running `claim` (it extends your lease).
+4. **Finish or release.** `claim` already set the ticket in-progress; on completion move it forward with `ticketsplease set <id> --status review|done` (setting `done` clears the claim). If you abandon the work, `ticketsplease release <id> --as <worker-id>` drops the claim and restores the pre-claim status (keeping any progress you'd advanced to). Renew a long-running claim by re-running `claim` (it extends your lease; a renewal logs no duplicate event).
 
 5. **Observe and coordinate in flight.** Workers advance status and leave notes on their own `tkt/<id>` branches; from `main` you watch the shared activity log without a checkout:
    ```sh
@@ -90,12 +93,15 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 ```sh
 ticketsplease create --title "Add vector index" --priority p1 \
   --scope query/planner --scope storage --depends-on build-index-trait
-ticketsplease set <id> --status in-progress --add-scope core
-ticketsplease link <id> --depends-on <other-id>
-ticketsplease lint        # validate schema, links, and cycles (exit 3 / 5 on problems)
+ticketsplease create --from backlog.json   # batch (JSON array; - reads stdin); validated all-or-nothing
+ticketsplease set <id> --status in-progress --add-scope core --title "…" --add-path 'src/**' --add-dependency other
+ticketsplease link <id> --depends-on <other-id>   # a cycle is rejected (exit 5); a dangling target is lint's job
+ticketsplease rename <old> <new>            # moves the file, rewrites the id, repoints dependents
+ticketsplease delete <id>                   # remove a ticket (git keeps history)
+ticketsplease lint        # validate schema, scope refs, links, and cycles (exit 3 / 5 on problems)
 ```
 
-Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves everything else — custom frontmatter keys, comments, key order, and the markdown body — byte-for-byte. You can also hand-edit ticket files directly; they are just markdown.
+Add `--dry-run` to `create`/`set` to preview without writing. Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves everything else — custom frontmatter keys, comments, key order, and the markdown body — byte-for-byte. You can also hand-edit ticket files directly; they are just markdown.
 
 Frontmatter schema: `id` (slug, equals the filename), `title`, `status` (todo/ready/in-progress/blocked/review/done), `priority` (p0 highest … p3), `dependencies[]` (ticket ids), `scopes[]` (names from `ticketsplease.toml`), `paths[]` (extra globs), `tags[]`. Claiming additionally manages `assignee` and `lease_expires_at` (epoch seconds) — leave those to `claim`/`release` rather than editing them by hand.
 

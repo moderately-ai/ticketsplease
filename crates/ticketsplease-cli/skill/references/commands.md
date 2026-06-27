@@ -5,43 +5,55 @@ Global flags (accepted by every command):
 - `--repo <path>` — repository root (default `.`).
 - `--format human|json` — `human` is the default; `json` is the stable, versioned contract. Every JSON payload includes `"schema_version": 1` and is deterministically ordered.
 
-Exit codes: `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` cycle · `6` conflict.
+Exit codes: `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` cycle · `6` conflict · `7` timeout (`watch` / `events --watch`).
+
+## JSON conventions
+
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `status`→`tickets` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+- **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
+- **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 
 ## init
 
 ```
 ticketsplease init [--dir tickets] [--force]
 ```
-Scaffolds `<dir>/` and `ticketsplease.toml`, and installs the bundled skill into `.claude/skills/ticketsplease/`. Idempotent: an existing config is left untouched unless `--force`.
+Scaffolds `<dir>/` and `ticketsplease.toml`, and installs the bundled skill into `.claude/skills/ticketsplease/`. Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
 
-JSON: `{ "schema_version", "tickets_dir", "wrote_config" }`.
+JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "git": bool }`.
 
 ## create
 
 ```
 ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3]
-                      [--depends-on a,b] [--scope x,y] [--path 'glob'] [--tag t] [--body <s>]
+                      [--depends-on a,b] [--scope x,y] [--path 'glob'] [--tag t] [--body <s>] [--dry-run]
+ticketsplease create --from <file|-> [--dry-run]
 ```
-Writes a new ticket atomically. Without `--id`, the id is a slug of the title (with `-2`, `-3` … on collision). With `--id`, the create is **idempotent**: re-running with identical content is a no-op; different content with the same id is an error (exit 3).
+Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
-JSON: `{ "schema_version", "id", "created": bool, "path" }`.
+`--from` batch-creates from a JSON array of specs (`-` reads stdin); each element is `{title, id?, status?, priority?, depends_on?, scopes?, paths?, tags?, body?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+
+JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
 ## set
 
 ```
-ticketsplease set <id> [--status <s>] [--priority <p>]
-                       [--add-scope a,b] [--remove-scope c] [--add-tag t]
+ticketsplease set <id> [--title <s>] [--status <s>] [--priority <p>]
+                       [--add-scope a,b] [--remove-scope c] [--add-tag t] [--remove-tag u]
+                       [--add-path 'glob'] [--remove-path 'glob']
+                       [--add-dependency d] [--remove-dependency e]
+                       [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run]
 ```
-Surgically updates fields (round-trip-safe). No-op if nothing changes.
+Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`. Setting status `done` clears the claim (assignee + lease). `--dry-run` previews without writing.
 
-JSON: `{ "schema_version", "id", "changed": bool }`.
+JSON: `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 
 ## link
 
 ```
 ticketsplease link <id> --depends-on <other> [--remove]
 ```
-Adds (or with `--remove`, removes) a dependency edge. The target must exist (else exit 4); self-dependencies are rejected (exit 3).
+Adds (or with `--remove`, removes) a dependency edge. A dangling target is **permitted** (lint reports it) — consistent with `create --depends-on`; only an edge that closes a **cycle** is rejected at write time (exit 5). `--remove` never validates the target, so a dependency on a deleted ticket can be cleaned. Self-dependencies are rejected (exit 3).
 
 JSON: `{ "schema_version", "id", "depends_on", "removed", "changed" }`.
 
@@ -49,23 +61,32 @@ JSON: `{ "schema_version", "id", "depends_on", "removed", "changed" }`.
 
 ```
 ticketsplease show <id> [--ref <branch>]
-ticketsplease list [--status <s>]
+ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--hide-done]
 ```
-`show --format human` prints the raw ticket file. `show --format json` → the ticket's fields. `--ref` reads the ticket as committed on a git ref (e.g. a `tkt/<id>` branch) instead of the working tree — no checkout needed. `list` → `{ "schema_version", "tickets": [ {id,title,status,priority} ] }`.
+`show --format human` prints a rendered field view + body + comments; `--format json` → the ticket's fields. `--ref` reads the ticket as committed on a git ref (no checkout). `list` filters compose (AND); `--hide-done` drops completed tickets. A malformed ticket file degrades to a warning rather than failing the listing.
+
+list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags} ], "warnings": [...] }`.
 
 ## status
 
 ```
 ticketsplease status [--all-branches] [--prefix tkt/]
 ```
-Without flags, the working-tree status of every ticket. `--all-branches` scans `refs/heads/<prefix>*` and reports each ticket's status as committed on its branch tip — so an orchestrator on `main` sees workers' in-flight status before merge (a branch whose ticket file is absent on its tip is reported with `status: null`). JSON: `{ "schema_version", "source": "worktree"|"branches", "tickets": [ {branch?, id, status, assignee, lease_expires_at} ] }`.
+Without flags, the working-tree status of every ticket. `--all-branches` scans `refs/heads/<prefix>*` and reports each ticket's status as committed on its branch tip (a branch whose ticket file is absent on its tip is reported with `status: null`). JSON: `{ "schema_version", "source": "worktree"|"branches", "tickets": [ {branch?, id, status, assignee, lease_expires_at} ] }`.
+
+## claims
+
+```
+ticketsplease claims [--all-branches] [--prefix tkt/]
+```
+Who holds what: every claimed ticket with assignee, `lease_expires_at`, and `live` (lease still valid). `--all-branches` overlays `<prefix>*` branch tips. JSON: `{ "schema_version", "claims": [ {id, assignee, lease_expires_at, live: bool, status} ], "warnings": [...] }`.
 
 ## watch
 
 ```
 ticketsplease watch <id> --until <status> [--ref <branch>] [--prefix tkt/] [--interval 5] [--timeout <secs>]
 ```
-Blocks, polling the ticket until it reaches `--until` (or `done`, which is always terminal), then exits 0. Without `--ref`, polls the `<prefix><id>` branch if it exists, else the working tree. **Exit 7** if `--timeout` seconds elapse first. The JSON payload is printed on both the success and timeout paths: `{ "schema_version", "id", "ref", "status", "reached": bool, "timed_out": bool }`.
+Blocks until the ticket reaches `--until` (or `done`, always terminal), then exits 0. Without `--ref`, polls the `<prefix><id>` branch if it exists, else the working tree. **Exit 7** on `--timeout`. JSON (printed on both paths): `{ "schema_version", "id", "ref", "status", "reached": bool, "timed_out": bool }`.
 
 ## comment add / list
 
@@ -73,16 +94,14 @@ Blocks, polling the ticket until it reaches `--until` (or `done`, which is alway
 ticketsplease comment add <id> [--as <author>] [--reply-to <comment-id>] (--body <text> | --body-file <f|->)
 ticketsplease comment list <id> [--ref <branch>]
 ```
-`comment add` appends a comment as its own file under `<tickets_dir>/<id>.comments/<comment-id>.md` (one file per comment, so concurrent authors never conflict — no lock, no merge driver, in both shared-worktree and single-clone topologies). `--body-file -` reads stdin (shell-safe for rich markdown). The ticket must exist (else exit 4). `comment list` returns comments sorted chronologically; `--ref` reads them as committed on a branch (so an orchestrator on `main` sees a worker's comments). `tkt show <id>` also folds comments in (human: a `## Comments` section; JSON: a `comments` array). JSON: `{ "schema_version", "ticket", "comments": [ {id, by, at, reply_to, body} ] }`.
-
-Adding a comment also emits an **event** (below), so a watcher is notified live.
+`comment add` appends a comment as its own file under `<tickets_dir>/<id>.comments/<comment-id>.md` (one file per comment — concurrent authors never conflict). `--reply-to` must reference an existing comment id (else exit 4). The ticket must exist (else exit 4). `comment list` shows comments chronologically, replies nested under their parent (human) with relative timestamps; `--ref` reads them as committed on a branch. `tkt show <id>` folds comments in. JSON: `{ "schema_version", "ticket", "comments": [ {id, by, at, reply_to, body} ] }`. Adding a comment also emits an **event**.
 
 ## events
 
 ```
 ticketsplease events [--since <event-id>] [--ticket <id>] [--type <kind>] [--watch] [--interval 2] [--timeout <secs>]
 ```
-The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob, living entirely in `.git`. So events are visible across worktrees and a shared clone **immediately — no commit, no push, no merge** — and concurrent emits never collide (per-ref atomic create). `comment add`, `set --status`, `claim`, and `release` all emit events, so this one stream is the full activity feed. The id is time-sortable; pass `--since <last-seen-id>` as a cursor for resumable tailing that never misses a transition. `--ticket` / `--type` filter. `--watch` blocks until at least one matching event appears (the wake-on-event an orchestrator loops, advancing `--since`), exiting **7** on `--timeout`. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`. (Empty when there's no git repo — the event log is the live signal; the comment files are the durable record.)
+The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob in `.git`, visible across worktrees and a shared clone **immediately — no commit, no push** (but see cross-clone note in the parallel-workflow guide). `comment add`, `set --status`, `claim`, and `release` emit events. The id is time-sortable; `--since <last-seen-id>` is a resumable cursor. `--ticket` (must exist) / `--type` (one of `comment`, `status`, `claim`, `release`) are validated — a typo fails loudly rather than masking the stream. Requires a git repo (else a clean error, not silent empty). `--watch` blocks until a matching event appears, exiting **7** on `--timeout`. Human output shows relative timestamps. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`.
 
 ## ready
 
@@ -91,67 +110,85 @@ ticketsplease ready
 ```
 Dispatchable tickets (status todo/ready with every dependency done), ordered by `(priority, id)`. A dependency cycle is a hard error (exit 5).
 
-JSON: `{ "schema_version", "ready": [ {id,title,status,priority,scopes} ] }`.
+JSON: `{ "schema_version", "ready": [ {id,title,status,priority,scopes,paths,dependencies,tags} ] }`.
 
 ## tracks
 
 ```
-ticketsplease tracks
+ticketsplease tracks [--parallel N]
 ```
-Partitions the ready set into conflict-free batches: no two tickets in a batch share a scope. Dependency *ordering* is already handled — only dispatchable tickets (every dependency done) are batched, so none of them depend on each other and a shared scope (file overlap) is the only batch hazard. Dispatch one batch fully in parallel.
+Partitions the ready set into conflict-free batches: no two tickets in a batch share a scope. Dispatch one batch fully in parallel. `--parallel N` caps each batch to N tickets (splitting larger ones), giving an orchestrator worker-sized fronts.
 
-JSON: `{ "schema_version", "batches": [ [ {id,title,status,priority,scopes} ] ] }`.
+JSON: `{ "schema_version", "batches": [ [ {id,title,status,priority,scopes,...} ] ] }`.
 
 ## next
 
 ```
-ticketsplease next [--parallel N] [--allow-overlap]
+ticketsplease next [--parallel N] [--allow-overlap] [--claim --as <worker> [--ttl <secs>]]
 ```
-The single highest-scored dispatchable ticket, or N picks. Score favours priority, downstream critical-path length, and remaining (non-done) downstream unblock count. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N by score even when their scopes overlap, annotating each with `conflicts_with` (which other picks share which scopes) so you can decide whether the shared-crate work is tolerable.
+The highest-scored dispatchable ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks` — higher is more impactful. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N by score even when scopes overlap, annotating each with `conflicts_with`. `--claim --as <worker>` atomically claims the first still-free pick (race-safe dispatch in one call; a lost race falls through to the next pick).
 
-JSON: `{ "schema_version", "picks": [ {id,title,status,priority,scopes,score, "conflicts_with": [ {ticket,scopes} ]} ] }`.
+JSON: `{ "schema_version", "picks": [ {id,...,score, "conflicts_with": [ {ticket,scopes} ]} ] }`, or with `--claim`: a claim payload (see below) or `{ "schema_version", "claimed": null }` when nothing is free.
 
 ## why
 
 ```
 ticketsplease why <a> <b>
 ```
-Explains whether two tickets can run in parallel. They cannot if they share a scope (file overlap) **or** one transitively depends on the other (ordering). This is intentionally broader than what `tracks` gates on: `tracks` only batches dispatchable tickets — among which no dependency relationship can exist — so it gates on scope alone, whereas `why` answers the question for any two tickets. JSON: `{ "schema_version", "a", "b", "conflict": bool, "shared_scopes": [...], "dependency_ordered": bool }`.
+Explains whether two *different* tickets can run in parallel (passing the same id twice is a usage error, exit 3). They cannot if they share a scope **or** one transitively depends on the other. JSON: `{ "schema_version", "a", "b", "conflict": bool, "shared_scopes": [...], "dependency_ordered": bool }`. Exits 6 on conflict (so `why a b && …` gates).
 
 ## claim / release
 
 ```
-ticketsplease claim <id> --as <worker> [--ttl <secs>]      # default ttl 3600
+ticketsplease claim <id> --as <worker> [--ttl <secs>] [--force]   # default ttl 3600
 ticketsplease release <id> [--as <worker>] [--force]
 ```
-`claim` atomically takes a ticket for a worker and marks it in-progress. Atomicity is a git-ref compare-and-swap (`refs/ticketsplease/claim/<id>` created with `git update-ref`'s create-only mode): of N workers racing one ticket, exactly one wins and the rest get **exit 6**. The claim records `assignee` + `lease_expires_at` in the frontmatter; once the lease expires the ticket is reclaimable, so a crashed worker does not strand it (the next claimer takes over with `"stolen": true`). Re-claiming as the same worker extends the lease. Only todo/ready/in-progress tickets are claimable (else exit 3). The lock lives in `.git`, coordinating across worktrees and a single checkout offline.
+`claim` atomically takes a ticket (git-ref compare-and-swap on `refs/ticketsplease/claim/<id>`): of N racing workers, exactly one wins, the rest get **exit 6**. It records `assignee` + `lease_expires_at` (an unquoted integer) and marks the ticket in-progress, remembering the pre-claim status. An expired lease is reclaimable (`stolen: true`); `--force` steals even a *live* lease. Re-claiming as the holder is a `renewed` no-op (no duplicate event). A ticket is unclaimable if its status isn't todo/ready/in-progress (exit 6) **or** its dependencies aren't all done (exit 6).
 
-`release` drops the claim and returns the ticket to `ready`. Without `--force`, only the recorded holder may release (a non-holder gets exit 6); releasing an unclaimed ticket is a no-op success.
+`release` restores the pre-claim status (not always `ready`) — but keeps real progress if the worker advanced to review/blocked/done. Without `--force`, only the recorded holder may release; a **bare** `release` (no `--as`) on a held ticket is refused (pass `--as <holder>` or `--force`).
 
-claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool }`.
+claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool, "renewed": bool }`.
 release JSON: `{ "schema_version", "id", "released": bool }`.
 
 ## guard
 
 ```
-ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--direct-only]
+ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--direct-only] [--config-ref <ref>] [--prefix tkt/]
 ```
-Computes the branch's diff vs `--base` (default `default_base` in config; three-dot merge-base diff) and makes two distinct, deliberately decoupled judgements. The ticket is taken from `--ticket`, else inferred from the branch name. **Exit 6** when the branch under-declares a scope or collides with another open ticket.
+Diffs the branch vs `--base` and makes two decoupled judgements. **Exit 6** when the branch under-declares a scope or collides with another open ticket. Requires a git repo (clean error otherwise).
 
-**Under-declaration is file-authoritative.** A changed file is "out of lane" only if it falls outside the ticket's *declared area* — the path globs of its declared scopes plus its explicit `paths`. The cargo crate-graph reverse-dependency expansion **never** drives under-declaration: editing a file in a foundational crate that many crates depend on (or that several fine-grained sub-crate scopes share) is not a scope escape. A file named in the ticket's `paths` is covered regardless of which other scope's glob also matches it.
+It reads the `[scopes]` contract from `--config-ref` (default: the base), **not** the possibly stale/empty config on the checked-out branch — so an emptied branch config can't give a false all-clear. Sibling tickets' in-flight status is read from `<prefix>*` branch tips, so a collision fires in the branch-per-ticket flow even when the current checkout shows the sibling as `todo`.
 
-**Collisions** use the full affected set — path globs + `[external_scopes]` pins + the cargo reverse-dep expansion (when `backend = "rust"`). Each collision carries a `cause`: `direct` (a real file/crate overlap) or `transitive` (reached only via the reverse-dependency walk — safe for an additive change), and the `affected_causes` map tags every affected scope the same way, so you can auto-triage exit 6 (e.g. ignore purely-`transitive` collisions for additive work). `--direct-only` (alias `--no-reverse-deps`) drops the reverse-dep expansion from the affected set, clearing transitive collisions; `[language] reverse_dep_expansion = false` makes that the repo default (handy when a foundational crate makes transitive collisions noisy). `[external_scopes]` flags a bumped `git = … rev = …` pin (matched by `repo`) or an in-tree fork path.
+**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap) or `transitive` (reverse-dep only — safe for additive work). `--direct-only` (alias `--no-reverse-deps`) drops the expansion; `[language] reverse_dep_expansion = false` makes that the repo default. `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
 
-JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "conflict": bool }`.
+JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "conflict": bool, "warnings": [...] }`.
+
+## delete / rename
+
+```
+ticketsplease delete <id>
+ticketsplease rename <old> <new>
+```
+`delete` removes the ticket file and its comments (git history preserves it). `rename` writes the new file, rewrites the `id`, repoints every dependent, moves the comments, then removes the old file (new-first, so an interruption never loses the ticket).
+
+delete JSON: `{ "schema_version", "id", "deleted": true }`. rename JSON: `{ "schema_version", "old", "new", "repointed": [ids] }`.
+
+## doctor / guide
+
+```
+ticketsplease doctor
+ticketsplease guide
+```
+`doctor` validates setup: config present, git repo with a commit, scope globs compile, base ref resolves (exit non-zero on any failure). JSON: `{ "schema_version", "ok": bool, "checks": [ {check, ok, detail} ] }`. `guide` prints the conceptual model (scopes, tracks, scoring, guard, claims). JSON: `{ "schema_version", "guide": "<text>" }`.
 
 ## lint
 
 ```
 ticketsplease lint
 ```
-Validates schema (enums, id == filename, duplicate ids), links (dangling dependencies), and cycles. Exit 3 on schema/link problems, 5 on a cycle.
+Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists), links (dangling dependencies), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `duplicate-id` | `missing-dep` | `cycle`).
 
-JSON: `{ "schema_version", "ok": bool, "diagnostics": [ {file,id,message} ] }`.
+JSON: `{ "schema_version", "ok": bool, "diagnostics": [ {file, id, code, message} ] }`.
 
 ## skill install / self-update
 
