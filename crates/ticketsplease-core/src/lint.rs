@@ -17,6 +17,9 @@ pub struct Diagnostic {
     pub file: String,
     /// The ticket id, when parseable.
     pub id: Option<String>,
+    /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
+    /// `duplicate-id` | `missing-dep` | `cycle`.
+    pub code: &'static str,
     /// Human-readable message.
     pub message: String,
 }
@@ -38,13 +41,15 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
             Err(e) => diags.push(Diagnostic {
                 file,
                 id: None,
-                message: e.to_string(),
+                code: "parse",
+                message: e.message(),
             }),
             Ok(ticket) => {
                 if ticket.id != stem {
                     diags.push(Diagnostic {
                         file: file.clone(),
                         id: Some(ticket.id.clone()),
+                        code: "id-mismatch",
                         message: format!(
                             "id `{}` does not match filename stem `{stem}`",
                             ticket.id
@@ -55,6 +60,7 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                     diags.push(Diagnostic {
                         file: file.clone(),
                         id: Some(ticket.id.clone()),
+                        code: "bad-id",
                         message: format!(
                             "id `{}` is not a valid slug (lowercase letters, digits, single hyphens)",
                             ticket.id
@@ -65,6 +71,7 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                     diags.push(Diagnostic {
                         file,
                         id: Some(ticket.id.clone()),
+                        code: "duplicate-id",
                         message: format!("duplicate id `{}` (also defined in {prev})", ticket.id),
                     });
                 }

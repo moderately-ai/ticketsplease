@@ -112,8 +112,16 @@ impl Config {
     /// Load and parse `<repo_root>/ticketsplease.toml`.
     pub fn load(repo_root: &Path) -> Result<Self> {
         let path = repo_root.join(CONFIG_FILE);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Invalid(format!(
+                    "not initialized: no {CONFIG_FILE} in {} (run `tkt init`)",
+                    repo_root.display()
+                ))
+            } else {
+                Error::Invalid(format!("cannot read {}: {e}", path.display()))
+            }
+        })?;
         toml::from_str(&text).map_err(|e| Error::Invalid(format!("invalid {CONFIG_FILE}: {e}")))
     }
 

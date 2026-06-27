@@ -1477,3 +1477,86 @@ fn create_rejects_bad_ids_and_normalizes_input() {
     assert_eq!(scopes, vec!["a", "b"]);
     assert_eq!(v["status"], "todo");
 }
+
+/// ux-no-config-error + ux-json-error-contract + ux-claim-done-exit-code.
+#[test]
+fn error_contract_and_exit_codes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+
+    // Before init: a friendly "not initialized" message, not a raw OS error.
+    let out = tkt(repo).args(["list"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not initialized"));
+
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    // Hard-fail under --format json: machine-readable envelope on stderr, clean stdout.
+    let out = tkt(repo)
+        .args(["show", "ghost", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(out.stdout.is_empty(), "stdout stays a clean result channel");
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "not-found");
+
+    // Claiming a done ticket is a state conflict (exit 6), not invalid input (3).
+    tkt(repo)
+        .args(["create", "--id", "d", "--title", "D"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "d", "--status", "done"])
+        .assert()
+        .success();
+    tkt(repo).args(["claim", "d", "--as", "w"]).assert().code(6);
+}
+
+/// ux-lint-cycle-exit-code: lint exits 5 on a cycle, matching ready/tracks.
+#[test]
+fn lint_exits_5_on_cycle() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["link", "a", "--depends-on", "b"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["link", "b", "--depends-on", "a"])
+        .assert()
+        .success();
+    tkt(repo).args(["lint"]).assert().code(5);
+}
+
+/// ux-why-exit-code: why exits 6 on conflict but still prints its report.
+#[test]
+fn why_exits_6_on_conflict() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "core"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["why", "a", "b", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["conflict"], true);
+}

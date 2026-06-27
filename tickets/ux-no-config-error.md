@@ -1,7 +1,7 @@
 ---
 id: ux-no-config-error
 title: Pre-init commands leak a raw OS error
-status: todo
+status: done
 priority: p2
 dependencies: []
 scopes: [cli, core]

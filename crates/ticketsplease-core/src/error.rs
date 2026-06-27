@@ -47,4 +47,33 @@ impl Error {
             Error::Io(_) => 1,
         }
     }
+
+    /// A stable machine-readable kind for the JSON error envelope.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::Invalid(_) => "invalid",
+            Error::NotFound(_) => "not-found",
+            Error::Cycle(_) => "cycle",
+            Error::Conflict(_) => "conflict",
+            Error::Timeout(_) => "timeout",
+            Error::Internal(_) => "internal",
+            Error::Io(_) => "io",
+        }
+    }
+
+    /// The inner message without the `Display` kind prefix — for adding context
+    /// (e.g. a file path) without double-prefixing `invalid input: ... invalid input: ...`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Error::Invalid(s)
+            | Error::NotFound(s)
+            | Error::Cycle(s)
+            | Error::Conflict(s)
+            | Error::Timeout(s)
+            | Error::Internal(s) => s.clone(),
+            Error::Io(e) => e.to_string(),
+        }
+    }
 }

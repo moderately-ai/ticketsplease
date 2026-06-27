@@ -243,6 +243,7 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
                 out.push(Diagnostic {
                     file: format!("{}.md", t.id),
                     id: Some(t.id.clone()),
+                    code: "missing-dep",
                     message: format!("depends on missing ticket `{d}`"),
                 });
             }
@@ -252,6 +253,7 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
         out.push(Diagnostic {
             file: "(dependency graph)".to_string(),
             id: None,
+            code: "cycle",
             message: format!("dependency cycle: {}", cycle.join(" -> ")),
         });
     }

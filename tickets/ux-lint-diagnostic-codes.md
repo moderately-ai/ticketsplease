@@ -1,7 +1,7 @@
 ---
 id: ux-lint-diagnostic-codes
 title: lint/why diagnostics are freeform; exit 3 is a grab-bag
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

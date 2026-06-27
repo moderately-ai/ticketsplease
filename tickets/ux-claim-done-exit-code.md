@@ -1,7 +1,7 @@
 ---
 id: ux-claim-done-exit-code
 title: Claiming a done ticket returns exit 3, not 6
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

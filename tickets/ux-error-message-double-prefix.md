@@ -1,7 +1,7 @@
 ---
 id: ux-error-message-double-prefix
 title: Doubled 'invalid input:' prefix in some errors
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [core]

@@ -1,7 +1,7 @@
 ---
 id: ux-lint-cycle-exit-code
 title: lint exits 3 on a dependency cycle (should be 5)
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [cli]

@@ -1,7 +1,7 @@
 ---
 id: ux-why-exit-code
 title: why returns exit 0 even when conflict:true
-status: todo
+status: done
 priority: p3
 dependencies: []
 scopes: [cli]

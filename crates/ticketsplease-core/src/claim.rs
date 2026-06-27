@@ -64,7 +64,8 @@ pub fn claim(store: &Store, id: &str, agent: &str, ttl_secs: u64) -> Result<Clai
         ticket.status,
         Status::Todo | Status::Ready | Status::InProgress
     ) {
-        return Err(Error::Invalid(format!(
+        // A state conflict (the ticket is done/blocked/review), not bad input.
+        return Err(Error::Conflict(format!(
             "ticket `{id}` is `{}`, not claimable (only todo/ready/in-progress can be claimed)",
             ticket.status
         )));

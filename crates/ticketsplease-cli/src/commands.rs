@@ -741,8 +741,8 @@ pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
             } else {
                 for d in &diagnostics {
                     match &d.id {
-                        Some(id) => println!("{} ({id}): {}", d.file, d.message),
-                        None => println!("{}: {}", d.file, d.message),
+                        Some(id) => println!("{} ({id}) [{}]: {}", d.file, d.code, d.message),
+                        None => println!("{} [{}]: {}", d.file, d.code, d.message),
                     }
                 }
             }
@@ -751,6 +751,11 @@ pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
 
     if problems == 0 {
         Ok(())
+    } else if diagnostics.iter().any(|d| d.code == "cycle") {
+        // A cycle is exit 5, matching `ready`/`tracks` and the contract.
+        Err(Error::Cycle(format!(
+            "{problems} problem(s) found, including a dependency cycle"
+        )))
     } else {
         Err(Error::Invalid(format!("{problems} problem(s) found")))
     }
@@ -1126,7 +1131,7 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
             "conflict": w.conflict,
             "shared_scopes": w.shared_scopes,
             "dependency_ordered": w.dependency_ordered,
-        })),
+        }))?,
         Format::Human => {
             if w.conflict {
                 let mut reasons = Vec::new();
@@ -1148,8 +1153,16 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
                     w.a, w.b
                 );
             }
-            Ok(())
         }
+    }
+    // Exit 6 on conflict so `why a b && ...` gates without parsing (output already printed).
+    if w.conflict {
+        Err(Error::Conflict(format!(
+            "`{}` and `{}` cannot run in parallel",
+            w.a, w.b
+        )))
+    } else {
+        Ok(())
     }
 }
 

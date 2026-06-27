@@ -1,7 +1,7 @@
 ---
 id: ux-json-error-contract
 title: "--format json emits no JSON on error paths"
-status: todo
+status: done
 priority: p1
 dependencies: []
 scopes: [cli, core]
