@@ -3997,3 +3997,92 @@ fn escape_hatches_override_modes_and_emit_matrix() {
         "strict forces exclusive"
     );
 }
+
+#[test]
+fn guard_passes_shared_scope_co_edit() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [language]\nbackend = \"none\"\n[scopes]\n\"core\" = [\"core/**\"]\n",
+    )
+    .unwrap();
+    // Both tickets claim `core` additively (shared); a sibling is in-flight on it.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "t",
+            "--title",
+            "T",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "in-progress"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "u",
+            "--title",
+            "U",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "u", "--status", "in-progress"])
+        .assert()
+        .success();
+
+    // Git fixture: feat edits a core/ file that `t` only appends to.
+    std::fs::create_dir_all(repo.join("core")).unwrap();
+    std::fs::write(repo.join("core/a.txt"), "a\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(repo.join("core/a.txt"), "a\nappended\n").unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qam",
+            "edit",
+        ],
+    );
+
+    // Both append to core, so the collision is reported but does not gate (exit 0).
+    let out = tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "shared co-edit should pass the guard");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["conflict"], false);
+    assert_eq!(v["collisions"][0]["cause"], "shared");
+    assert!(v["under_declared"].as_array().unwrap().is_empty());
+}

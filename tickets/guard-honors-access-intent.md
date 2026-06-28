@@ -1,7 +1,7 @@
 ---
 id: guard-honors-access-intent
 title: Guard honours shared/additive scopes (align dispatch with merge gate)
-status: todo
+status: done
 priority: p2
 dependencies: [access-intent-scopes]
 related: [ux-guard-transitive-exit-gate]

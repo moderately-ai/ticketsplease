@@ -35,6 +35,10 @@ pub enum ScopeCause {
     Direct,
     /// Reached only via reverse-dependency expansion.
     Transitive,
+    /// A collision on a scope both tickets claim in *shared* (additive) mode — reported
+    /// for visibility but non-gating, since both sides intend only to append. Only ever
+    /// a collision cause, never an affected-scope cause.
+    Shared,
 }
 
 impl ScopeCause {
@@ -44,6 +48,7 @@ impl ScopeCause {
         match self {
             ScopeCause::Direct => "direct",
             ScopeCause::Transitive => "transitive",
+            ScopeCause::Shared => "shared",
         }
     }
 
@@ -356,7 +361,9 @@ impl GuardReport {
 /// (so an explicit `paths` entry suppresses an overlapping scope).
 pub fn coverage_globset(config: &Config, ticket: &Ticket) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
-    for scope in &ticket.scopes {
+    // Both exclusive and shared claims are "declared" areas — a shared (additive)
+    // claim still covers its files, so editing them is not an under-declaration.
+    for scope in ticket.scopes.iter().chain(&ticket.shared_scopes) {
         if let Some(globs) = config.scopes.get(scope) {
             for g in globs {
                 builder.add(Glob::new(g).map_err(|e| {
@@ -422,7 +429,14 @@ pub fn evaluate(
         }
     }
 
-    let declared: BTreeSet<String> = target.scopes.iter().cloned().collect();
+    // A ticket's declared area is everything it claims, in either mode.
+    let declared: BTreeSet<String> = target
+        .scopes
+        .iter()
+        .chain(&target.shared_scopes)
+        .cloned()
+        .collect();
+    let target_shared: BTreeSet<&str> = target.shared_scopes.iter().map(String::as_str).collect();
 
     // Under-declaration: only files outside the declared area, mapped to scopes by
     // the file/pin (direct) mappers. Impact scopes are excluded by construction.
@@ -448,16 +462,32 @@ pub fn evaluate(
         if other.id == target.id || !other.status.is_open() {
             continue;
         }
-        let other_declared: BTreeSet<String> = other.scopes.iter().cloned().collect();
+        // The other ticket claims a scope in either mode; both count for overlap.
+        let other_claims: BTreeSet<&str> = other
+            .scopes
+            .iter()
+            .chain(&other.shared_scopes)
+            .map(String::as_str)
+            .collect();
+        let other_shared: BTreeSet<&str> = other.shared_scopes.iter().map(String::as_str).collect();
         let shared: Vec<String> = affected
             .keys()
-            .filter(|s| other_declared.contains(*s))
+            .filter(|s| other_claims.contains(s.as_str()))
             .cloned()
             .collect();
         if !shared.is_empty() {
-            // The collision is direct if any shared scope is a real overlap; only
-            // a purely transitive overlap carries the `transitive` tag.
-            let cause = if shared.iter().any(|s| affected[s] == ScopeCause::Direct) {
+            // A scope both sides claim *shared* (additive) is safe to co-edit; the
+            // collision only bites on scopes where at least one side is exclusive.
+            let hazardous: Vec<&String> = shared
+                .iter()
+                .filter(|s| {
+                    !(target_shared.contains(s.as_str()) && other_shared.contains(s.as_str()))
+                })
+                .collect();
+            let cause = if hazardous.is_empty() {
+                // Both intend only to append: reported for visibility, but non-gating.
+                ScopeCause::Shared
+            } else if hazardous.iter().any(|s| affected[*s] == ScopeCause::Direct) {
                 ScopeCause::Direct
             } else {
                 ScopeCause::Transitive
@@ -470,7 +500,10 @@ pub fn evaluate(
         }
     }
 
-    let conflict = !under_declared.is_empty() || !collisions.is_empty();
+    // A purely-shared (additive) collision does not gate — both sides declared additive
+    // intent, mirroring how `--ignore-transitive` waves through reverse-dep-only ones.
+    let gating_collision = collisions.iter().any(|c| c.cause != ScopeCause::Shared);
+    let conflict = !under_declared.is_empty() || gating_collision;
     Ok(GuardReport {
         ticket: target.id.clone(),
         base: diff.base,
@@ -490,7 +523,12 @@ mod tests {
     use super::*;
 
     fn ticket(id: &str, status: &str, scopes: &[&str]) -> Ticket {
+        ticket_modes(id, status, scopes, &[])
+    }
+
+    fn ticket_modes(id: &str, status: &str, scopes: &[&str], shared: &[&str]) -> Ticket {
         let sc: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+        let sh: Vec<String> = shared.iter().map(|s| (*s).to_string()).collect();
         Ticket::new(
             id,
             id,
@@ -499,7 +537,7 @@ mod tests {
             &[],
             &[],
             &sc,
-            &[],
+            &sh,
             &[],
             &[],
             "",
@@ -583,6 +621,57 @@ mod tests {
         assert!(report.conflict);
         assert_eq!(report.collisions.len(), 1);
         assert_eq!(report.collisions[0].ticket, "u");
+    }
+
+    #[test]
+    fn shared_scope_collision_is_reported_but_non_gating() {
+        let cfg = config_with_scopes(&[("core", "core/**")]);
+        let mapper = PathGlobMapper::new(&cfg).unwrap();
+        // Both claim `core` in shared (additive) mode — safe to co-edit.
+        let target = ticket_modes("t", "in-progress", &[], &["core"]);
+        let other = ticket_modes("u", "in-progress", &[], &["core"]);
+        let all = vec![target.clone(), other];
+        let cov = cover(&cfg, &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[&mapper],
+                impact: &[],
+            },
+            &cov,
+        )
+        .unwrap();
+        // The collision is reported (visibility) but tagged shared and does not gate;
+        // editing a shared-claimed scope is not an under-declaration.
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].cause, ScopeCause::Shared);
+        assert!(report.under_declared.is_empty());
+        assert!(!report.conflict, "shared x shared co-edit is non-gating");
+
+        // But an exclusive rewrite of the same scope still conflicts with the appender.
+        let rewriter = ticket("t", "in-progress", &["core"]);
+        let all2 = vec![
+            rewriter.clone(),
+            ticket_modes("u", "in-progress", &[], &["core"]),
+        ];
+        let cov2 = cover(&cfg, &rewriter);
+        let r2 = evaluate(
+            &rewriter,
+            &all2,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[&mapper],
+                impact: &[],
+            },
+            &cov2,
+        )
+        .unwrap();
+        assert!(
+            r2.conflict,
+            "exclusive rewrite vs shared appender still gates"
+        );
     }
 
     #[test]
