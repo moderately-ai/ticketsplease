@@ -23,9 +23,9 @@ use ticketsplease_core::{
 
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
-    GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReconcileArgs, ReleaseArgs, RenameArgs,
-    RollupArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs,
-    ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
+    GraphArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, PathArgs, ReconcileArgs,
+    ReleaseArgs, RenameArgs, RollupArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs,
+    StatusArgs, TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -1153,6 +1153,132 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 for (t, unmet) in &blocked {
                     println!("    {}  (waiting on: {})", t.id, unmet.join(", "));
                 }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `graph` — export the dependency DAG. Scoring metrics are board-global; the
+/// optional tag/where/view selectors restrict the emitted subgraph (an induced
+/// subgraph: an edge is kept only when both endpoints are selected). `--dot` emits
+/// Graphviz (dependencies solid, related links dashed) for visualization.
+pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let all = store.load_all()?;
+    let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?;
+    let selected: BTreeSet<&str> = all
+        .iter()
+        .filter(|t| args.tag.as_ref().map_or(true, |tag| t.tags.contains(tag)))
+        .filter(|t| predicate.as_ref().map_or(true, |p| p.matches(t)))
+        .map(|t| t.id.as_str())
+        .collect();
+
+    let export = schedule::graph_export(&all)?;
+    let nodes: Vec<&schedule::GraphNode> = export
+        .nodes
+        .iter()
+        .filter(|n| selected.contains(n.id.as_str()))
+        .collect();
+    let dep_edges: Vec<&schedule::GraphEdge> = export
+        .edges
+        .iter()
+        .filter(|e| selected.contains(e.from.as_str()) && selected.contains(e.to.as_str()))
+        .collect();
+    // Related edges are non-blocking, so they live outside the schedule export; induce
+    // them on the selection here.
+    let related_edges: Vec<(&str, &str)> = all
+        .iter()
+        .filter(|t| selected.contains(t.id.as_str()))
+        .flat_map(|t| {
+            t.related
+                .iter()
+                .filter(|r| selected.contains(r.as_str()))
+                .map(move |r| (t.id.as_str(), r.as_str()))
+        })
+        .collect();
+
+    if args.dot {
+        println!("digraph tickets {{");
+        println!("  rankdir=LR;");
+        for n in &nodes {
+            // `{:?}` quotes the id and renders the embedded newline as DOT's `\n`.
+            println!(
+                "  {:?} [label={:?}];",
+                n.id,
+                format!("{}\n{}", n.id, n.status)
+            );
+        }
+        for e in &dep_edges {
+            println!("  {:?} -> {:?};", e.from, e.to);
+        }
+        for (from, to) in &related_edges {
+            println!("  {from:?} -> {to:?} [style=dashed];");
+        }
+        println!("}}");
+        return Ok(());
+    }
+
+    match fmt {
+        Format::Json => {
+            let nodes_json = serde_json::to_value(&nodes)
+                .map_err(|e| Error::Internal(format!("serializing graph nodes: {e}")))?;
+            let edges_json = serde_json::to_value(&dep_edges)
+                .map_err(|e| Error::Internal(format!("serializing graph edges: {e}")))?;
+            print_json(&json!({
+                "schema_version": 1,
+                "nodes": nodes_json,
+                "edges": edges_json,
+                "related_edges": related_edges
+                    .iter()
+                    .map(|(from, to)| json!({ "from": from, "to": to }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        Format::Human => {
+            println!(
+                "{} node(s), {} dependency edge(s), {} related edge(s)",
+                nodes.len(),
+                dep_edges.len(),
+                related_edges.len()
+            );
+            for e in &dep_edges {
+                println!("  {} -> {}", e.from, e.to);
+            }
+            for (from, to) in &related_edges {
+                println!("  {from} ~ {to} (related)");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `path` — the critical prerequisite path to a ticket: the longest chain of
+/// dependencies that must complete before it, root-first with each step's status.
+pub fn path(repo: &Path, fmt: Format, args: &PathArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let all = store.load_all()?;
+    let chain = schedule::longest_prerequisite_path(&all, &args.id)?;
+    let by_id: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "id": args.id,
+            "length": chain.len(),
+            "path": chain.iter().map(|id| {
+                let t = by_id.get(id.as_str());
+                json!({
+                    "id": id,
+                    "status": t.map(|t| t.status.as_str()),
+                    "title": t.map(|t| t.title.clone()),
+                })
+            }).collect::<Vec<_>>(),
+        })),
+        Format::Human => {
+            println!("critical path to `{}` ({} step(s)):", args.id, chain.len());
+            for id in &chain {
+                let st = by_id.get(id.as_str()).map_or("?", |t| t.status.as_str());
+                println!("  {st:<12} {id}");
             }
             Ok(())
         }

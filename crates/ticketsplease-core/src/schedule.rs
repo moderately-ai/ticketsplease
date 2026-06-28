@@ -336,6 +336,118 @@ pub fn why(tickets: &[Ticket], a_id: &str, b_id: &str) -> Result<Why> {
     })
 }
 
+/// A node in the exported dependency graph, carrying the same scoring components
+/// `next` ranks by so a visualizer can size/colour nodes by impact.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphNode {
+    /// Ticket id.
+    pub id: String,
+    /// Ticket title.
+    pub title: String,
+    /// Lifecycle status.
+    pub status: Status,
+    /// Priority.
+    pub priority: Priority,
+    /// `next` score: `1000*priority + 10*critical_path + downstream_count`.
+    pub score: i64,
+    /// Longest remaining downstream chain length (in nodes).
+    pub critical_path: i64,
+    /// Count of not-done tickets this one would unblock.
+    pub downstream_count: i64,
+}
+
+/// A dependency edge: `from` depends on `to`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphEdge {
+    /// The dependent ticket.
+    pub from: String,
+    /// The prerequisite ticket.
+    pub to: String,
+}
+
+/// The dependency DAG with per-node scoring metrics, for `graph` export. Edges are
+/// every declared dependency (regardless of status); metrics use the remaining-work
+/// dependents map (done tickets excluded), matching `next`'s scoring.
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphExport {
+    /// Nodes in input (id-sorted) order.
+    pub nodes: Vec<GraphNode>,
+    /// Dependency edges (`from` depends on `to`).
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Build the dependency-graph export (validates the graph first).
+pub fn graph_export(tickets: &[Ticket]) -> Result<GraphExport> {
+    let graph = Graph::build(tickets)?;
+    let mut memo: BTreeMap<&str, i64> = BTreeMap::new();
+    let nodes = tickets
+        .iter()
+        .map(|t| {
+            let id = t.id.as_str();
+            let critical_path = critical_path(id, &graph.dependents, &mut memo);
+            let downstream_count = downstream_count(id, &graph.dependents);
+            GraphNode {
+                id: t.id.clone(),
+                title: t.title.clone(),
+                status: t.status,
+                priority: t.priority,
+                score: 1000 * priority_value(t.priority) + 10 * critical_path + downstream_count,
+                critical_path,
+                downstream_count,
+            }
+        })
+        .collect();
+    let edges = tickets
+        .iter()
+        .flat_map(|t| {
+            t.dependencies.iter().map(|d| GraphEdge {
+                from: t.id.clone(),
+                to: d.clone(),
+            })
+        })
+        .collect();
+    Ok(GraphExport { nodes, edges })
+}
+
+/// The longest chain of dependencies ending at `id` — its critical prerequisite path
+/// — returned root-first (deepest prerequisite … → `id`). A ticket with no
+/// dependencies yields `[id]`. Validates the graph (acyclic) first.
+pub fn longest_prerequisite_path(tickets: &[Ticket], id: &str) -> Result<Vec<String>> {
+    let graph = Graph::build(tickets)?;
+    if !graph.by_id.contains_key(id) {
+        return Err(Error::NotFound(id.to_string()));
+    }
+    let mut memo: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut chain = longest_dep_chain(id, &graph.by_id, &mut memo);
+    chain.reverse(); // node-first (id → deepest) becomes root-first (deepest → id)
+    Ok(chain.iter().map(|s| (*s).to_string()).collect())
+}
+
+/// Longest chain starting at `node` and descending dependency edges, `node` first.
+/// Memoized; safe because `Graph::build` already proved the graph acyclic.
+fn longest_dep_chain<'a>(
+    node: &'a str,
+    by_id: &BTreeMap<&'a str, &'a Ticket>,
+    memo: &mut BTreeMap<&'a str, Vec<&'a str>>,
+) -> Vec<&'a str> {
+    if let Some(cached) = memo.get(node) {
+        return cached.clone();
+    }
+    let mut best: Vec<&str> = Vec::new();
+    if let Some(t) = by_id.get(node) {
+        for d in &t.dependencies {
+            let sub = longest_dep_chain(d.as_str(), by_id, memo);
+            if sub.len() > best.len() {
+                best = sub;
+            }
+        }
+    }
+    let mut chain = vec![node];
+    chain.extend(best);
+    memo.insert(node, chain.clone());
+    chain
+}
+
 // --- internal graph helpers -------------------------------------------------
 
 fn priority_value(p: Priority) -> i64 {
@@ -572,6 +684,40 @@ mod tests {
         assert!(diags
             .iter()
             .any(|d| d.code == "missing-related" && d.message.contains("ghost")));
+    }
+
+    #[test]
+    fn graph_export_carries_edges_and_scoring_metrics() {
+        let tickets = vec![
+            t("base", "todo", "p0", &[], &[]),
+            t("mid", "todo", "p2", &["base"], &[]),
+            t("leaf", "todo", "p2", &["mid"], &[]),
+        ];
+        let g = graph_export(&tickets).unwrap();
+        assert_eq!(g.nodes.len(), 3);
+        assert_eq!(g.edges.len(), 2);
+        let base = g.nodes.iter().find(|n| n.id == "base").unwrap();
+        assert_eq!(base.downstream_count, 2, "base unblocks mid + leaf");
+        assert_eq!(base.critical_path, 3, "base -> mid -> leaf");
+        assert!(g.edges.iter().any(|e| e.from == "mid" && e.to == "base"));
+    }
+
+    #[test]
+    fn longest_prerequisite_path_is_root_first() {
+        let tickets = vec![
+            t("base", "todo", "p2", &[], &[]),
+            t("mid", "todo", "p2", &["base"], &[]),
+            t("leaf", "todo", "p2", &["mid", "base"], &[]),
+        ];
+        assert_eq!(
+            longest_prerequisite_path(&tickets, "leaf").unwrap(),
+            vec!["base", "mid", "leaf"]
+        );
+        assert_eq!(
+            longest_prerequisite_path(&tickets, "base").unwrap(),
+            vec!["base"]
+        );
+        assert!(longest_prerequisite_path(&tickets, "ghost").is_err());
     }
 
     #[test]

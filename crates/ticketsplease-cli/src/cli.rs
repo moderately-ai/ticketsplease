@@ -51,6 +51,10 @@ pub enum Command {
     /// Roll up an initiative (a tag/filter): status & priority counts, % done, the
     /// ready frontier, and the blocked set.
     Rollup(RollupArgs),
+    /// Export the dependency graph (JSON, or Graphviz DOT with `--dot`).
+    Graph(GraphArgs),
+    /// Print the critical prerequisite path (longest dependency chain) to a ticket.
+    Path(PathArgs),
     /// Report ticket status; with `--all-branches`, scan `tkt/*` branches.
     Status(StatusArgs),
     /// Cross-check ticket status against `tkt/*` branches and worktrees (drift report).
@@ -330,6 +334,31 @@ pub struct RollupArgs {
     /// Restrict with a saved view (ANDs with --tag/--where).
     #[arg(long)]
     pub view: Option<String>,
+}
+
+/// `graph` arguments. Selectors restrict the exported subgraph (metrics stay
+/// board-global). No selector = the whole graph.
+#[derive(Args)]
+pub struct GraphArgs {
+    /// Restrict to tickets carrying this tag.
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Restrict with a `--where` expression (ANDs with --tag/--view).
+    #[arg(long = "where")]
+    pub where_: Option<String>,
+    /// Restrict with a saved view (ANDs with --tag/--where).
+    #[arg(long)]
+    pub view: Option<String>,
+    /// Emit Graphviz DOT (dependencies solid, related dashed) instead of JSON/human.
+    #[arg(long)]
+    pub dot: bool,
+}
+
+/// `path` arguments.
+#[derive(Args)]
+pub struct PathArgs {
+    /// Ticket id to trace the critical prerequisite path to.
+    pub id: String,
 }
 
 /// `view save` arguments.
@@ -656,6 +685,8 @@ pub fn run(cli: Cli) -> Result<()> {
             ViewCommand::Delete(a) => commands::view_delete(repo, fmt, a),
         },
         Command::Rollup(a) => commands::rollup(repo, fmt, a),
+        Command::Graph(a) => commands::graph(repo, fmt, a),
+        Command::Path(a) => commands::path(repo, fmt, a),
         Command::Status(a) => commands::status(repo, fmt, a),
         Command::Reconcile(a) => commands::reconcile(repo, fmt, a),
         Command::Watch(a) => commands::watch(repo, fmt, a),

@@ -3397,3 +3397,100 @@ fn rollup_reports_counts_frontier_and_blocked() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["total"], 5);
 }
+
+#[test]
+fn graph_and_path_export_the_dependency_dag() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // base <- mid <- leaf (deps), plus a non-blocking related edge leaf ~ base.
+    tkt(repo)
+        .args(["create", "--id", "base", "--title", "Base", "--tag", "m1"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "mid",
+            "--title",
+            "Mid",
+            "--tag",
+            "m1",
+            "--depends-on",
+            "base",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "leaf",
+            "--title",
+            "Leaf",
+            "--tag",
+            "m1",
+            "--depends-on",
+            "mid",
+            "--related",
+            "base",
+        ])
+        .assert()
+        .success();
+    // An unrelated, untagged ticket that the tag filter should exclude.
+    tkt(repo)
+        .args(["create", "--id", "other", "--title", "Other"])
+        .assert()
+        .success();
+
+    // JSON graph, restricted to the m1 initiative.
+    let out = tkt(repo)
+        .args(["graph", "--tag", "m1", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["nodes"].as_array().unwrap().len(), 3, "other is excluded");
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 2);
+    assert!(edges
+        .iter()
+        .any(|e| e["from"] == "mid" && e["to"] == "base"));
+    let related = v["related_edges"].as_array().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0]["from"], "leaf");
+    assert_eq!(related[0]["to"], "base");
+    let base = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "base")
+        .unwrap();
+    assert_eq!(base["downstream_count"], 2);
+
+    // DOT output is a digraph with solid dep edges and a dashed related edge.
+    let dot = tkt(repo)
+        .args(["graph", "--tag", "m1", "--dot"])
+        .output()
+        .unwrap();
+    let dot = String::from_utf8_lossy(&dot.stdout);
+    assert!(dot.contains("digraph tickets {"));
+    assert!(dot.contains("\"mid\" -> \"base\";"));
+    assert!(dot.contains("style=dashed"));
+
+    // path: the critical prerequisite chain to leaf, root-first.
+    let out = tkt(repo)
+        .args(["path", "leaf", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["length"], 3);
+    let ids: Vec<&str> = v["path"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["base", "mid", "leaf"]);
+    tkt(repo).args(["path", "ghost"]).assert().code(4);
+}

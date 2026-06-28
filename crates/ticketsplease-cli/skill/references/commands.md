@@ -95,6 +95,19 @@ Aggregates an initiative (a tag and/or filter; selectors AND together — no sel
 
 JSON: `{ "schema_version", "selector": {tag,where,view}, "total", "done", "percent_done", "by_status": {status: n}, "by_priority": {p: n}, "ready": [ {id,title,priority} ], "blocked": [ {id,title,unmet: [ids]} ] }`.
 
+## graph / path
+
+```
+ticketsplease graph [--tag <t>] [--where <expr>] [--view <name>] [--dot]
+ticketsplease path <id>
+```
+`graph` exports the dependency DAG: nodes carry the same scoring metrics `next` ranks by (`score`, `critical_path`, `downstream_count`), edges are dependencies, and `related_edges` are the non-blocking links. Selectors restrict the emitted subgraph (induced — an edge is kept only when both endpoints are selected); metrics stay board-global. `--dot` emits Graphviz (`dot -Tsvg`) with dependency edges solid and related edges dashed.
+
+`path <id>` prints the **critical prerequisite path** — the longest chain of dependencies that must complete before `<id>` — root-first, each step with its status. The longest pole to finishing a ticket.
+
+graph JSON: `{ "schema_version", "nodes": [ {id,title,status,priority,score,critical_path,downstream_count} ], "edges": [ {from,to} ], "related_edges": [ {from,to} ] }`.
+path JSON: `{ "schema_version", "id", "length", "path": [ {id,status,title} ] }` (exit 4 if the id is unknown).
+
 list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags} ], "warnings": [...] }`.
 
 ## status
