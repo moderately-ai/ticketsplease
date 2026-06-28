@@ -3728,3 +3728,54 @@ fn max_overlap_fills_workers_and_reports_cost() {
         .assert()
         .code(3);
 }
+
+#[test]
+fn scope_policy_weight_zero_frees_a_scope() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // `core` is weighted 0 — co-editing it (even exclusively) is free.
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [language]\nbackend = \"none\"\n[scopes]\n\"core\" = [\"core/**\"]\n\
+         [scope_policy]\ncore = { weight = 0 }\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "core"])
+        .assert()
+        .success();
+    // Default budget 0, yet the two exclusive-core tickets co-schedule (cost 0).
+    let out = tkt(repo)
+        .args(["tracks", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(v["overlap_cost"], 0);
+
+    // A [scope_policy] entry for an unknown scope is a lint finding.
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [language]\nbackend = \"none\"\n[scopes]\n\"core\" = [\"core/**\"]\n\
+         [scope_policy]\nghost = { weight = 0 }\n",
+    )
+    .unwrap();
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "unknown-scope-policy"));
+    tkt(repo).args(["lint"]).assert().code(3);
+}

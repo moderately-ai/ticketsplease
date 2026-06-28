@@ -19,8 +19,8 @@ pub struct Diagnostic {
     /// The ticket id, when parseable.
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
-    /// `unknown-scope` | `scope-mode-conflict` | `duplicate-id` | `missing-dep` |
-    /// `missing-related` | `cycle`.
+    /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id`
+    /// | `missing-dep` | `missing-related` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -121,6 +121,19 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                         message: format!("duplicate id `{}` (also defined in {prev})", ticket.id),
                     });
                 }
+            }
+        }
+    }
+    // `[scope_policy]` keys must name real scopes, or a weight typo silently does nothing.
+    if !defined_scopes.is_empty() {
+        for scope in store.config.scope_policy.keys() {
+            if !defined_scopes.contains(scope.as_str()) {
+                diags.push(Diagnostic {
+                    file: CONFIG_FILE.to_string(),
+                    id: None,
+                    code: "unknown-scope-policy",
+                    message: format!("[scope_policy] entry `{scope}` is not a defined scope"),
+                });
             }
         }
     }

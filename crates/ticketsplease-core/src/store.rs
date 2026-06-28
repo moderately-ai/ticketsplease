@@ -589,7 +589,13 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          # The guard flags a branch that bumps the pin (matched by `repo`) or edits an\n\
          # in-tree fork `paths` glob, against tickets declaring the same scope.\n\
          [external_scopes]\n\
-         # \"sqlparser-fork\" = {{ repo = \"tomsanbear/sqlparser\", paths = [] }}\n"
+         # \"sqlparser-fork\" = {{ repo = \"tomsanbear/sqlparser\", paths = [] }}\n\
+         \n\
+         # Tune how costly an exclusive overlap on a scope is for tracks/next\n\
+         # (--max-overlap): weight 0 = free to co-edit (an additive hub), higher =\n\
+         # riskier. Default 1; a shared-by-both claim is always free.\n\
+         [scope_policy]\n\
+         # \"core\" = {{ weight = 0 }}\n"
     )
 }
 

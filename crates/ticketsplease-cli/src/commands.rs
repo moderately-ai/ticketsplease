@@ -1635,7 +1635,8 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
-    let mut batches = schedule::tracks(&tickets, max_overlap)?;
+    let weights = store.config.scope_weights();
+    let mut batches = schedule::tracks(&tickets, max_overlap, &weights)?;
     // --parallel caps each batch to N tickets, splitting larger ones so an orchestrator
     // with N workers gets worker-sized fronts. Chunking preserves the per-pair budget.
     if let Some(n) = args.parallel.filter(|&n| n > 0) {
@@ -1644,7 +1645,7 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
             .flat_map(|b| b.chunks(n).map(<[&Ticket]>::to_vec).collect::<Vec<_>>())
             .collect();
     }
-    let overlap_cost = batch_overlap_cost(&batches);
+    let overlap_cost = batch_overlap_cost(&batches, &weights);
     match fmt {
         Format::Json => {
             let arr: Vec<Value> = batches
@@ -1673,12 +1674,12 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
 
 /// Sum of the residual conflict cost between tickets sharing a batch (0 for strictly
 /// conflict-free batches).
-fn batch_overlap_cost(batches: &[Vec<&Ticket>]) -> i64 {
+fn batch_overlap_cost(batches: &[Vec<&Ticket>], weights: &BTreeMap<String, i64>) -> i64 {
     let mut total = 0;
     for batch in batches {
         for i in 0..batch.len() {
             for j in (i + 1)..batch.len() {
-                total += schedule::conflict_cost(batch[i], batch[j]);
+                total += schedule::conflict_cost(batch[i], batch[j], weights);
             }
         }
     }
@@ -1707,7 +1708,8 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
     } else {
         parse_overlap_budget(&args.max_overlap)?
     };
-    let picks = schedule::next(&tickets, args.parallel, max_overlap)?;
+    let weights = store.config.scope_weights();
+    let picks = schedule::next(&tickets, args.parallel, max_overlap, &weights)?;
 
     // Atomic dispatch: claim the first pick still free. Trying picks in order makes a
     // lost race (another worker grabbed the top pick) fall through to the next instead

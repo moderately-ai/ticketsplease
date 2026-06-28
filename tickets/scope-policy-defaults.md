@@ -1,7 +1,7 @@
 ---
 id: scope-policy-defaults
 title: Per-scope policy defaults in config (set-and-forget intent)
-status: todo
+status: done
 priority: p2
 dependencies: [access-intent-scopes]
 related: []

@@ -44,6 +44,32 @@ pub struct Config {
     /// in-tree fork path) against tickets that declare the same external scope.
     #[serde(default)]
     pub external_scopes: BTreeMap<String, ExternalScope>,
+    /// Scope name -> scheduling policy. Tunes how costly an *exclusive* overlap on
+    /// that scope is for `tracks`/`next` (`--max-overlap`): `weight = 0` makes a scope
+    /// free to co-edit (an always-shareable hub), a higher weight makes overlaps there
+    /// count for more. Default weight is 1; a shared-by-both claim is always free.
+    #[serde(default)]
+    pub scope_policy: BTreeMap<String, ScopePolicy>,
+}
+
+/// Per-scope scheduling policy (see [`Config::scope_policy`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopePolicy {
+    /// Conflict-cost weight for an exclusive overlap on this scope. `0` = free to
+    /// share; higher = riskier. Default 1.
+    #[serde(default = "default_weight")]
+    pub weight: i64,
+}
+
+impl Config {
+    /// The scope -> conflict-cost-weight map (scopes without a policy default to 1).
+    #[must_use]
+    pub fn scope_weights(&self) -> BTreeMap<String, i64> {
+        self.scope_policy
+            .iter()
+            .map(|(k, v)| (k.clone(), v.weight))
+            .collect()
+    }
 }
 
 /// An external/forked dependency that lives outside this repo (pinned via
@@ -104,6 +130,7 @@ impl Default for Config {
             scopes: BTreeMap::new(),
             scope_crates: BTreeMap::new(),
             external_scopes: BTreeMap::new(),
+            scope_policy: BTreeMap::new(),
         }
     }
 }
@@ -145,6 +172,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_weight() -> i64 {
+    1
+}
+
 fn default_tickets_dir() -> String {
     DEFAULT_TICKETS_DIR.to_string()
 }
@@ -156,6 +187,19 @@ fn default_base() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_policy_weights_parse() {
+        let c: Config =
+            toml::from_str("[scope_policy]\ncore = { weight = 0 }\n\"q/p\" = { weight = 3 }\n")
+                .unwrap();
+        let w = c.scope_weights();
+        assert_eq!(w.get("core"), Some(&0));
+        assert_eq!(w.get("q/p"), Some(&3));
+        // An entry that omits `weight` defaults to 1.
+        let c2: Config = toml::from_str("[scope_policy]\ncore = {}\n").unwrap();
+        assert_eq!(c2.scope_weights().get("core"), Some(&1));
+    }
 
     #[test]
     fn reverse_dep_expansion_defaults_on() {
