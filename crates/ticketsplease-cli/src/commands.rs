@@ -24,8 +24,8 @@ use ticketsplease_core::{
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
     GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReconcileArgs, ReleaseArgs, RenameArgs,
-    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs,
-    ViewShowArgs, WatchArgs, WhyArgs,
+    RollupArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs,
+    ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -1034,6 +1034,126 @@ pub fn view_delete(repo: &Path, fmt: Format, args: &ViewShowArgs) -> Result<()> 
         }
         Format::Human => {
             println!("Deleted view `{}`", args.name);
+            Ok(())
+        }
+    }
+}
+
+/// `rollup` — aggregate an initiative (a tag and/or filter): status & priority
+/// counts, percent done, the ready frontier, and the blocked set. Readiness is
+/// computed over the **full** board (so a dependency outside the selection is still
+/// honoured) and then intersected with the selection. No selector = the whole board.
+pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    // Strict load: rollup reports readiness, which needs a valid (acyclic) graph.
+    let all = store.load_all()?;
+    let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?;
+    let selected: Vec<&Ticket> = all
+        .iter()
+        .filter(|t| args.tag.as_ref().map_or(true, |tag| t.tags.contains(tag)))
+        .filter(|t| predicate.as_ref().map_or(true, |p| p.matches(t)))
+        .collect();
+
+    let mut by_status: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_priority: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in &selected {
+        *by_status.entry(t.status.as_str()).or_default() += 1;
+        *by_priority.entry(t.priority.as_str()).or_default() += 1;
+    }
+    let total = selected.len();
+    let done = selected.iter().filter(|t| t.status == Status::Done).count();
+    let percent_done = (done * 100).checked_div(total).unwrap_or(0);
+
+    // Ready frontier: dispatchable over the full board ∩ the selection.
+    let ready_ids: BTreeSet<&str> = schedule::ready(&all)?
+        .iter()
+        .map(|t| t.id.as_str())
+        .collect();
+    let ready: Vec<&&Ticket> = selected
+        .iter()
+        .filter(|t| ready_ids.contains(t.id.as_str()))
+        .collect();
+
+    // Blocked: in the selection, dispatchable-status but with ≥1 dependency not done.
+    let status_by_id: BTreeMap<&str, Status> =
+        all.iter().map(|t| (t.id.as_str(), t.status)).collect();
+    let blocked: Vec<(&Ticket, Vec<&str>)> = selected
+        .iter()
+        .filter_map(|t| {
+            if !t.status.is_dispatchable() {
+                return None;
+            }
+            let unmet: Vec<&str> = t
+                .dependencies
+                .iter()
+                .filter(|d| status_by_id.get(d.as_str()).copied() != Some(Status::Done))
+                .map(String::as_str)
+                .collect();
+            (!unmet.is_empty()).then_some((*t, unmet))
+        })
+        .collect();
+
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "selector": { "tag": args.tag, "where": args.where_, "view": args.view },
+            "total": total,
+            "done": done,
+            "percent_done": percent_done,
+            "by_status": by_status,
+            "by_priority": by_priority,
+            "ready": ready.iter().map(|t| json!({
+                "id": t.id, "title": t.title, "priority": t.priority.as_str(),
+            })).collect::<Vec<_>>(),
+            "blocked": blocked.iter().map(|(t, unmet)| json!({
+                "id": t.id, "title": t.title, "unmet": unmet,
+            })).collect::<Vec<_>>(),
+        })),
+        Format::Human => {
+            let scope = match (&args.tag, &args.where_, &args.view) {
+                (Some(tag), _, _) => format!("tag={tag}"),
+                (None, _, Some(view)) => format!("view={view}"),
+                (None, Some(_), None) => "filter".to_string(),
+                (None, None, None) => "(whole board)".to_string(),
+            };
+            println!("initiative {scope}: {total} ticket(s), {done} done ({percent_done}%)");
+            // Status counts in lifecycle order, skipping absent buckets.
+            let order = [
+                Status::Todo,
+                Status::Ready,
+                Status::InProgress,
+                Status::Blocked,
+                Status::Review,
+                Status::Done,
+            ];
+            let statuses: Vec<String> = order
+                .iter()
+                .filter_map(|s| {
+                    by_status
+                        .get(s.as_str())
+                        .map(|n| format!("{} {n}", s.as_str()))
+                })
+                .collect();
+            println!("  status:   {}", join_or_none(&statuses));
+            let prios: Vec<String> = ["p0", "p1", "p2", "p3"]
+                .iter()
+                .filter_map(|p| by_priority.get(*p).map(|n| format!("{p} {n}")))
+                .collect();
+            println!("  priority: {}", join_or_none(&prios));
+            let ready_ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
+            println!(
+                "  ready ({}): {}",
+                ready_ids.len(),
+                join_or_none(&ready_ids)
+            );
+            if blocked.is_empty() {
+                println!("  blocked (0): (none)");
+            } else {
+                println!("  blocked ({}):", blocked.len());
+                for (t, unmet) in &blocked {
+                    println!("    {}  (waiting on: {})", t.id, unmet.join(", "));
+                }
+            }
             Ok(())
         }
     }

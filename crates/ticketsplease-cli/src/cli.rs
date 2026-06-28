@@ -48,6 +48,9 @@ pub enum Command {
     List(ListArgs),
     /// Manage saved filter views (named `--where` expressions).
     View(ViewArgs),
+    /// Roll up an initiative (a tag/filter): status & priority counts, % done, the
+    /// ready frontier, and the blocked set.
+    Rollup(RollupArgs),
     /// Report ticket status; with `--all-branches`, scan `tkt/*` branches.
     Status(StatusArgs),
     /// Cross-check ticket status against `tkt/*` branches and worktrees (drift report).
@@ -313,6 +316,20 @@ pub enum ViewCommand {
     Show(ViewShowArgs),
     /// Delete a saved view.
     Delete(ViewShowArgs),
+}
+
+/// `rollup` arguments. With no selector, rolls up the whole board.
+#[derive(Args)]
+pub struct RollupArgs {
+    /// Restrict to tickets carrying this tag (the usual initiative key).
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Restrict with a `--where` expression (ANDs with --tag/--view).
+    #[arg(long = "where")]
+    pub where_: Option<String>,
+    /// Restrict with a saved view (ANDs with --tag/--where).
+    #[arg(long)]
+    pub view: Option<String>,
 }
 
 /// `view save` arguments.
@@ -638,6 +655,7 @@ pub fn run(cli: Cli) -> Result<()> {
             ViewCommand::Show(a) => commands::view_show(repo, fmt, a),
             ViewCommand::Delete(a) => commands::view_delete(repo, fmt, a),
         },
+        Command::Rollup(a) => commands::rollup(repo, fmt, a),
         Command::Status(a) => commands::status(repo, fmt, a),
         Command::Reconcile(a) => commands::reconcile(repo, fmt, a),
         Command::Watch(a) => commands::watch(repo, fmt, a),

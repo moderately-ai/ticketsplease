@@ -3299,3 +3299,101 @@ fn create_from_toml_manifest_and_stdin_sniff() {
         .assert()
         .code(3);
 }
+
+#[test]
+fn rollup_reports_counts_frontier_and_blocked() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // An initiative tagged `m1`: base (done), ready (todo, deps satisfied),
+    // blocked (todo, waiting on an unfinished dep), plus an untagged ticket.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "base",
+            "--title",
+            "Base",
+            "--tag",
+            "m1",
+            "--priority",
+            "p0",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "base", "--status", "done"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "frontier",
+            "--title",
+            "Frontier",
+            "--tag",
+            "m1",
+            "--depends-on",
+            "base",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "gate", "--title", "Gate", "--tag", "m1"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "blocked",
+            "--title",
+            "Blocked",
+            "--tag",
+            "m1",
+            "--depends-on",
+            "gate",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "other", "--title", "Other"])
+        .assert()
+        .success();
+
+    let out = tkt(repo)
+        .args(["rollup", "--tag", "m1", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["total"], 4, "the untagged ticket is excluded");
+    assert_eq!(v["done"], 1);
+    assert_eq!(v["percent_done"], 25);
+    assert_eq!(v["by_status"]["done"], 1);
+    assert_eq!(v["by_status"]["todo"], 3);
+
+    // Frontier = dispatchable within the initiative (base done -> frontier & gate ready).
+    let mut ready: Vec<&str> = v["ready"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    ready.sort();
+    assert_eq!(ready, vec!["frontier", "gate"]);
+
+    // `blocked` waits on a not-done dep, and lists the unmet dependency.
+    let blocked = v["blocked"].as_array().unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0]["id"], "blocked");
+    assert_eq!(blocked[0]["unmet"][0], "gate");
+
+    // No selector rolls up the whole board (includes the untagged ticket).
+    let out = tkt(repo)
+        .args(["rollup", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["total"], 5);
+}

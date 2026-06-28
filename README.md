@@ -14,7 +14,7 @@ tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes it
                                   # ticket's declared scope or collides with another
 ```
 
-`init` / `create` / `set` / `link` / `show` / `list` / `ready` / `next` / `lint` / `delete` / `rename` are the convenience surface around those two; `claim` / `release` / `claims` / `next --claim` provide race-safe pull-based dispatch; `status --all-branches`, `reconcile`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches (`reconcile` flags where the board has drifted from the actual branches/worktrees). New to the model? `tkt guide` prints it in one screen, and `tkt doctor` verifies setup.
+`init` / `create` / `set` / `link` / `show` / `list` / `ready` / `next` / `lint` / `delete` / `rename` are the convenience surface around those two; `list --where` filters with boolean expressions and `view` saves them as named views; `rollup` aggregates an initiative (counts, % done, ready frontier, blocked set); `claim` / `release` / `claims` / `next --claim` provide race-safe pull-based dispatch; `status --all-branches`, `reconcile`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches (`reconcile` flags where the board has drifted from the actual branches/worktrees). New to the model? `tkt guide` prints it in one screen, and `tkt doctor` verifies setup.
 
 ## Install
 

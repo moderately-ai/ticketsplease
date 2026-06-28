@@ -86,6 +86,15 @@ Saved views live in `<repo>/.ticketsplease/views.toml` — a tool-owned, **commi
 
 view JSON: `save` → `{ "schema_version", "name", "where", "replaced" }`; `list` → `{ "schema_version", "views": [ {name, where} ] }`; `show` → `{ "schema_version", "name", "where" }`; `delete` → `{ "schema_version", "name", "deleted" }`.
 
+## rollup
+
+```
+ticketsplease rollup [--tag <t>] [--where <expr>] [--view <name>]
+```
+Aggregates an initiative (a tag and/or filter; selectors AND together — no selector = the whole board): status & priority counts, percent done, the **ready frontier**, and the **blocked set**. Readiness is computed over the *full* board (so a prerequisite outside the selection still counts) and then intersected with the selection; `blocked` is the selected dispatchable-status tickets that have an unfinished dependency, each with the unmet ids. Use it to answer "where does this initiative stand and what's next in it" in one call.
+
+JSON: `{ "schema_version", "selector": {tag,where,view}, "total", "done", "percent_done", "by_status": {status: n}, "by_priority": {p: n}, "ready": [ {id,title,priority} ], "blocked": [ {id,title,unmet: [ids]} ] }`.
+
 list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags} ], "warnings": [...] }`.
 
 ## status
