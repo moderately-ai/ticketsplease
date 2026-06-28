@@ -3658,3 +3658,73 @@ fn shared_scopes_co_schedule_and_are_validated() {
         .any(|d| d["code"] == "scope-mode-conflict" && d["id"] == "x"));
     tkt(repo).args(["lint"]).assert().code(3);
 }
+
+#[test]
+fn max_overlap_fills_workers_and_reports_cost() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    // Three tickets that all rewrite `core` (exclusive): disjoint width 1.
+    for id in ["a", "b", "c"] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id, "--scope", "core"])
+            .assert()
+            .success();
+    }
+
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = tkt(repo).args(args).output().unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // Strict (default budget 0): only one of the three fits.
+    let v = run(&["next", "--parallel", "3", "--format", "json"]);
+    assert_eq!(v["picks"].as_array().unwrap().len(), 1);
+
+    // Budget 1: all three fill, every pair costs 1, set overlap_cost = 3.
+    let v = run(&[
+        "next",
+        "--parallel",
+        "3",
+        "--max-overlap",
+        "1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(v["picks"].as_array().unwrap().len(), 3);
+    assert_eq!(v["overlap_cost"], 3);
+    assert!(v["picks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["conflicts_with"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["cost"] == 1)));
+
+    // `--allow-overlap` is the unbounded alias.
+    let v = run(&[
+        "next",
+        "--parallel",
+        "3",
+        "--allow-overlap",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(v["picks"].as_array().unwrap().len(), 3);
+
+    // tracks: strict = 3 batches; budget 1 = one batch with tolerated cost 3.
+    let v = run(&["tracks", "--format", "json"]);
+    assert_eq!(v["batches"].as_array().unwrap().len(), 3);
+    let v = run(&["tracks", "--max-overlap", "1", "--format", "json"]);
+    assert_eq!(v["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(v["overlap_cost"], 3);
+
+    // A malformed budget fails loudly.
+    tkt(repo)
+        .args(["next", "--max-overlap", "lots"])
+        .assert()
+        .code(3);
+}

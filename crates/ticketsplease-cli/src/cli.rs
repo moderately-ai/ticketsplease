@@ -504,9 +504,14 @@ pub struct NextArgs {
     #[arg(long, default_value_t = 1)]
     pub parallel: usize,
     /// Allow picks whose scopes overlap (you resolve the shared-crate work); each
-    /// pick is annotated with the scopes it shares with the others.
+    /// pick is annotated with the scopes it shares with the others. Alias for
+    /// `--max-overlap any`.
     #[arg(long)]
     pub allow_overlap: bool,
+    /// Per-pair overlap budget for filling N picks: `0` (default) = compatible only;
+    /// `K` = also admit the cheapest overlaps costing ≤ K per pair; `any` = unbounded.
+    #[arg(long = "max-overlap", default_value = "0")]
+    pub max_overlap: String,
     /// Atomically claim the first pick that is still free (race-safe dispatch).
     /// Requires `--as`. Tries picks in order so a lost race falls through to the next.
     #[arg(long)]
@@ -653,10 +658,14 @@ empty_args!(ReadyArgs, LintArgs, MigrateArgs,);
 /// `tracks` arguments.
 #[derive(Args)]
 pub struct TracksArgs {
-    /// Cap each conflict-free batch to at most N tickets, splitting larger batches —
-    /// so an orchestrator with N workers gets worker-sized fronts.
+    /// Cap each batch to at most N tickets, splitting larger batches — so an
+    /// orchestrator with N workers gets worker-sized fronts.
     #[arg(long)]
     pub parallel: Option<usize>,
+    /// Per-pair overlap budget: `0` (default) = strictly conflict-free batches; `K` =
+    /// let tickets that conflict by ≤ K per pair share a batch; `any` = unbounded.
+    #[arg(long = "max-overlap", default_value = "0")]
+    pub max_overlap: String,
 }
 
 /// `skill` subcommand group.

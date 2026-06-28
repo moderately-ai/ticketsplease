@@ -1629,27 +1629,31 @@ pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
     }
 }
 
-/// `tracks` — conflict-free parallel batches of ready tickets.
+/// `tracks` — parallel batches of ready tickets (conflict-free by default; `--max-overlap`
+/// lets cheaply-overlapping tickets share a batch).
 pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
-    let mut batches = schedule::tracks(&tickets)?;
-    // --parallel caps each conflict-free batch to N tickets, splitting larger ones so
-    // an orchestrator with N workers gets worker-sized fronts. Tickets within a batch
-    // are already disjoint, so any chunking preserves conflict-freedom.
+    let max_overlap = parse_overlap_budget(&args.max_overlap)?;
+    let mut batches = schedule::tracks(&tickets, max_overlap)?;
+    // --parallel caps each batch to N tickets, splitting larger ones so an orchestrator
+    // with N workers gets worker-sized fronts. Chunking preserves the per-pair budget.
     if let Some(n) = args.parallel.filter(|&n| n > 0) {
         batches = batches
             .into_iter()
             .flat_map(|b| b.chunks(n).map(<[&Ticket]>::to_vec).collect::<Vec<_>>())
             .collect();
     }
+    let overlap_cost = batch_overlap_cost(&batches);
     match fmt {
         Format::Json => {
             let arr: Vec<Value> = batches
                 .iter()
                 .map(|b| Value::Array(b.iter().map(|t| ticket_summary(t)).collect()))
                 .collect();
-            print_json(&json!({ "schema_version": 1, "batches": arr }))
+            print_json(
+                &json!({ "schema_version": 1, "batches": arr, "overlap_cost": overlap_cost }),
+            )
         }
         Format::Human => {
             if batches.is_empty() {
@@ -1659,16 +1663,51 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
                 let ids: Vec<&str> = batch.iter().map(|t| t.id.as_str()).collect();
                 println!("batch {}: {}", i + 1, ids.join(", "));
             }
+            if overlap_cost > 0 {
+                println!("(tolerated overlap cost: {overlap_cost})");
+            }
             Ok(())
         }
     }
+}
+
+/// Sum of the residual conflict cost between tickets sharing a batch (0 for strictly
+/// conflict-free batches).
+fn batch_overlap_cost(batches: &[Vec<&Ticket>]) -> i64 {
+    let mut total = 0;
+    for batch in batches {
+        for i in 0..batch.len() {
+            for j in (i + 1)..batch.len() {
+                total += schedule::conflict_cost(batch[i], batch[j]);
+            }
+        }
+    }
+    total
+}
+
+/// Parse a `--max-overlap` budget: a non-negative integer, or `any` (unbounded).
+fn parse_overlap_budget(s: &str) -> Result<i64> {
+    if s.eq_ignore_ascii_case("any") {
+        return Ok(i64::MAX);
+    }
+    s.parse::<i64>().ok().filter(|n| *n >= 0).ok_or_else(|| {
+        Error::Invalid(format!(
+            "--max-overlap expects a non-negative integer or `any`, got `{s}`"
+        ))
+    })
 }
 
 /// `next` — scored recommendation(s); `--parallel N` returns N disjoint picks.
 pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
-    let picks = schedule::next(&tickets, args.parallel, args.allow_overlap)?;
+    // `--allow-overlap` is the unbounded alias; otherwise parse the per-pair budget.
+    let max_overlap = if args.allow_overlap {
+        i64::MAX
+    } else {
+        parse_overlap_budget(&args.max_overlap)?
+    };
+    let picks = schedule::next(&tickets, args.parallel, max_overlap)?;
 
     // Atomic dispatch: claim the first pick still free. Trying picks in order makes a
     // lost race (another worker grabbed the top pick) fall through to the next instead
@@ -1708,12 +1747,19 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
                     v["conflicts_with"] = json!(p
                         .conflicts_with
                         .iter()
-                        .map(|c| json!({ "ticket": c.ticket, "scopes": c.scopes }))
+                        .map(|c| json!({ "ticket": c.ticket, "scopes": c.scopes, "cost": c.cost }))
                         .collect::<Vec<_>>());
                     v
                 })
                 .collect();
-            print_json(&json!({ "schema_version": 1, "picks": rows }))
+            // Each conflicting pair is counted by both picks, so halve for the set total.
+            let overlap_cost: i64 = picks
+                .iter()
+                .flat_map(|p| &p.conflicts_with)
+                .map(|c| c.cost)
+                .sum::<i64>()
+                / 2;
+            print_json(&json!({ "schema_version": 1, "picks": rows, "overlap_cost": overlap_cost }))
         }
         Format::Human => {
             if picks.is_empty() {

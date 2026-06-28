@@ -1,7 +1,7 @@
 ---
 id: overlap-tolerant-tracks-next
 title: "Overlap-tolerance dial: fill N workers least-cost-first (--max-overlap)"
-status: todo
+status: done
 priority: p1
 dependencies: [access-intent-scopes]
 related: []

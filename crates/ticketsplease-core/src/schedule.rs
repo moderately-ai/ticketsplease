@@ -89,12 +89,14 @@ pub fn ready(tickets: &[Ticket]) -> Result<Vec<&Ticket>> {
     Ok(graph.dispatchable(tickets))
 }
 
-/// Partition the ready set into conflict-free parallel batches (R6): two tickets
-/// that share a scope never share a batch. Dependency *ordering* needs no handling
-/// here — only dispatchable tickets (every dependency already done) are batched, so
-/// by construction none of them depend on each other; the sole parallel hazard left
-/// is file overlap, i.e. a shared scope. Deterministic greedy (Welsh–Powell) colouring.
-pub fn tracks(tickets: &[Ticket]) -> Result<Vec<Vec<&Ticket>>> {
+/// Partition the ready set into parallel batches (R6): no two tickets in a batch
+/// conflict beyond `max_overlap`. With the default `max_overlap = 0` a batch is
+/// strictly conflict-free (two tickets that conflict never share a batch); a higher
+/// per-pair budget lets cheaply-overlapping tickets share a batch. Dependency
+/// *ordering* needs no handling here — only dispatchable tickets (every dependency
+/// already done) are batched, so by construction none depend on each other; the sole
+/// hazard is scope overlap. Deterministic greedy (Welsh–Powell) colouring.
+pub fn tracks(tickets: &[Ticket], max_overlap: i64) -> Result<Vec<Vec<&Ticket>>> {
     let graph = Graph::build(tickets)?;
     let nodes = graph.dispatchable(tickets);
     let n = nodes.len();
@@ -105,7 +107,9 @@ pub fn tracks(tickets: &[Ticket]) -> Result<Vec<Vec<&Ticket>>> {
     let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
     for i in 0..n {
         for j in (i + 1)..n {
-            if conflicts(nodes[i], nodes[j]) {
+            // An edge (must-separate) only when the pair's conflict cost exceeds the
+            // tolerated budget; pairs within budget may share a batch.
+            if conflict_cost(nodes[i], nodes[j]) > max_overlap {
                 adj[i].insert(j);
                 adj[j].insert(i);
             }
@@ -157,22 +161,27 @@ pub struct Pick<'a> {
     pub conflicts_with: Vec<PickConflict>,
 }
 
-/// A scope overlap between two returned picks (surfaced under `allow_overlap`).
+/// A scope overlap between two returned picks (surfaced when an overlap budget let an
+/// overlapping pick through).
 #[derive(Debug, Clone, Serialize)]
 pub struct PickConflict {
     /// The other pick's ticket id.
     pub ticket: String,
-    /// Scopes shared with that pick.
+    /// Conflicting scopes shared with that pick (claimed, not shared-by-both).
     pub scopes: Vec<String>,
+    /// The conflict cost with that pick (currently the number of conflicting scopes).
+    pub cost: i64,
 }
 
 /// Recommend the next ticket(s): score by priority, downstream critical-path
 /// length, and remaining-downstream unblock count. With `parallel > 1`, return that
-/// many picks, highest-scored first (R7). By default the picks are scope-disjoint
-/// (conflict-minimizing); with `allow_overlap` the top-scored picks are returned
-/// even when their scopes overlap, each annotated with the overlap so the caller
-/// can decide whether the shared-crate work is tolerable.
-pub fn next(tickets: &[Ticket], parallel: usize, allow_overlap: bool) -> Result<Vec<Pick<'_>>> {
+/// many picks, highest-scored first (R7). Picks are filled in two passes: first the
+/// highest-scored mutually-compatible (conflict-cost 0) picks, then — when a positive
+/// `max_overlap` budget leaves slots — the lowest-cost overlaps within that per-pair
+/// budget, so the caller fills its N workers least-riskily instead of idling them.
+/// `max_overlap` is a per-pair cost cap (`0` = compatible only, `i64::MAX` = unbounded).
+/// Each overlapping pick is annotated with the conflict so the caller can judge it.
+pub fn next(tickets: &[Ticket], parallel: usize, max_overlap: i64) -> Result<Vec<Pick<'_>>> {
     let graph = Graph::build(tickets)?;
     let mut nodes = graph.dispatchable(tickets);
     if nodes.is_empty() {
@@ -195,20 +204,45 @@ pub fn next(tickets: &[Ticket], parallel: usize, allow_overlap: bool) -> Result<
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    // Highest-scored first. Default: skip a candidate that shares a scope with an
-    // already-chosen pick. allow_overlap: take the top N regardless of overlap.
     let want = parallel.max(1);
     let mut chosen: Vec<&Ticket> = Vec::new();
-    for t in nodes {
+    let mut taken = vec![false; nodes.len()];
+    // Pass 1: highest-scored picks that are compatible (cost 0) with the chosen set.
+    for (i, &t) in nodes.iter().enumerate() {
         if chosen.len() >= want {
             break;
         }
-        if allow_overlap || chosen.iter().all(|&c| !conflicts(c, t)) {
+        if chosen.iter().all(|&c| conflict_cost(c, t) == 0) {
             chosen.push(t);
+            taken[i] = true;
+        }
+    }
+    // Pass 2: fill remaining slots with the lowest per-pair cost overlaps within budget.
+    while chosen.len() < want && max_overlap > 0 {
+        let mut best: Option<(i64, usize)> = None;
+        for (i, &t) in nodes.iter().enumerate() {
+            if taken[i] {
+                continue;
+            }
+            let marginal = chosen
+                .iter()
+                .map(|&c| conflict_cost(c, t))
+                .max()
+                .unwrap_or(0);
+            if marginal <= max_overlap && best.map_or(true, |(bc, _)| marginal < bc) {
+                best = Some((marginal, i));
+            }
+        }
+        match best {
+            Some((_, i)) => {
+                chosen.push(nodes[i]);
+                taken[i] = true;
+            }
+            None => break,
         }
     }
 
-    // Surface, per pick, the scopes it shares with the other picks in the set.
+    // Surface, per pick, the conflicting scopes (and cost) it has with the other picks.
     let picks = chosen
         .iter()
         .map(|&t| {
@@ -219,6 +253,7 @@ pub fn next(tickets: &[Ticket], parallel: usize, allow_overlap: bool) -> Result<
                     let scopes = conflicting_scopes(t, o);
                     (!scopes.is_empty()).then(|| PickConflict {
                         ticket: o.id.clone(),
+                        cost: scopes.len() as i64,
                         scopes,
                     })
                 })
@@ -487,17 +522,12 @@ fn conflicting_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
 }
 
 /// The cost of co-scheduling two tickets: the number of conflicting scopes (each
-/// weight 1 for now). `0` means compatible — safe to run in parallel.
-fn conflict_cost(a: &Ticket, b: &Ticket) -> i64 {
+/// weight 1 for now). `0` means compatible — safe to run in parallel. `tracks` and
+/// `next` gate on this against a per-pair overlap budget; callers can use it to report
+/// the residual overlap cost of a chosen set.
+#[must_use]
+pub fn conflict_cost(a: &Ticket, b: &Ticket) -> i64 {
     conflicting_scopes(a, b).len() as i64
-}
-
-/// Two dispatchable tickets conflict (cannot share a batch) iff they have a
-/// conflicting scope claim — a scope both claim that is not shared-by-both. This is
-/// the only parallel hazard once dependency ordering is satisfied by the dispatchable
-/// filter.
-fn conflicts(a: &Ticket, b: &Ticket) -> bool {
-    conflict_cost(a, b) > 0
 }
 
 /// Whether `from` transitively depends on `to` (directed reachability over dep
@@ -672,17 +702,38 @@ mod tests {
         let b = t_scoped("b", &[], &["core"]); // additive core
         let c = t_scoped("c", &["core"], &[]); // rewrites core
         let d = t_scoped("d", &["core"], &[]); // rewrites core
-        assert_eq!(conflict_cost(&a, &b), 0);
-        assert!(!conflicts(&a, &b), "shared x shared is compatible");
-        assert!(conflicts(&a, &c), "shared x exclusive conflicts");
-        assert!(conflicts(&c, &d), "exclusive x exclusive conflicts");
+        assert_eq!(conflict_cost(&a, &b), 0, "shared x shared is compatible");
+        assert!(conflict_cost(&a, &c) > 0, "shared x exclusive conflicts");
+        assert!(conflict_cost(&c, &d) > 0, "exclusive x exclusive conflicts");
         // The two additive tickets share one tracks batch.
         let additive = [t_scoped("a", &[], &["core"]), t_scoped("b", &[], &["core"])];
-        let batches = tracks(&additive).unwrap();
+        let batches = tracks(&additive, 0).unwrap();
         assert_eq!(batches.len(), 1, "additive co-scheduling: {batches:?}");
         // why agrees: no conflict between two additive claims.
         let pair = vec![t_scoped("a", &[], &["core"]), t_scoped("b", &[], &["core"])];
         assert!(!why(&pair, "a", "b").unwrap().conflict);
+    }
+
+    #[test]
+    fn max_overlap_dial_fills_workers_least_cost_first() {
+        // Three tickets all rewrite `core`: the disjoint width is 1.
+        let tickets = vec![
+            t_scoped("a", &["core"], &[]),
+            t_scoped("b", &["core"], &[]),
+            t_scoped("c", &["core"], &[]),
+        ];
+        // Strict (budget 0): only one fits.
+        assert_eq!(next(&tickets, 3, 0).unwrap().len(), 1);
+        assert_eq!(tracks(&tickets, 0).unwrap().len(), 3);
+        // Budget 1: every pair costs 1, so all three fill / share one batch.
+        let picks = next(&tickets, 3, 1).unwrap();
+        assert_eq!(picks.len(), 3);
+        assert!(picks.iter().any(|p| !p.conflicts_with.is_empty()));
+        assert!(picks
+            .iter()
+            .flat_map(|p| &p.conflicts_with)
+            .all(|c| c.cost == 1));
+        assert_eq!(tracks(&tickets, 1).unwrap().len(), 1);
     }
 
     #[test]
@@ -787,7 +838,7 @@ mod tests {
             t("b", "todo", "p1", &[], &["core"]), // shares scope with a
             t("c", "todo", "p1", &[], &["io"]),   // disjoint
         ];
-        let batches = tracks(&tickets).unwrap();
+        let batches = tracks(&tickets, 0).unwrap();
         // a and b must be in different batches; no batch has both.
         for batch in &batches {
             let ids: BTreeSet<&str> = batch.iter().map(|t| t.id.as_str()).collect();
@@ -804,7 +855,7 @@ mod tests {
             t("a", "todo", "p2", &[], &["x"]),
             t("b", "todo", "p0", &[], &["y"]),
         ];
-        let picks = next(&tickets, 1, false).unwrap();
+        let picks = next(&tickets, 1, 0).unwrap();
         assert_eq!(picks[0].ticket.id, "b");
     }
 
@@ -857,7 +908,7 @@ mod tests {
             t("a", "todo", "p1", &["base"], &["x"]),
             t("b", "todo", "p1", &["base"], &["y"]),
         ];
-        let batches = tracks(&tickets).unwrap();
+        let batches = tracks(&tickets, 0).unwrap();
         assert_eq!(
             batches.len(),
             1,
@@ -874,7 +925,7 @@ mod tests {
             t("b", "todo", "p0", &[], &["core"]), // conflicts with a
             t("c", "todo", "p1", &[], &["io"]),
         ];
-        let picks = next(&tickets, 2, false).unwrap();
+        let picks = next(&tickets, 2, 0).unwrap();
         let ids: BTreeSet<&str> = picks.iter().map(|p| p.ticket.id.as_str()).collect();
         // Cannot pick both a and b together (they share scope `core`).
         assert!(!(ids.contains("a") && ids.contains("b")));
@@ -889,7 +940,7 @@ mod tests {
             t("a", "todo", "p0", &[], &["core"]),
             t("b", "todo", "p0", &[], &["core"]), // shares `core` with a
         ];
-        let picks = next(&tickets, 2, true).unwrap();
+        let picks = next(&tickets, 2, i64::MAX).unwrap();
         let ids: BTreeSet<&str> = picks.iter().map(|p| p.ticket.id.as_str()).collect();
         // With --allow-overlap both top-scored picks come back, despite the overlap.
         assert!(ids.contains("a") && ids.contains("b"));
