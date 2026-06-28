@@ -69,6 +69,9 @@ pub enum Command {
     Ready(ReadyArgs),
     /// Partition ready tickets into conflict-free parallel batches.
     Tracks(TracksArgs),
+    /// Plan worker lanes: ordered per-worker queues that sequence conflicting work
+    /// instead of dropping it, with a merge order.
+    Lanes(LanesArgs),
     /// Recommend the next ticket(s) to work on.
     ///
     /// Picks are ranked by a score that prioritises urgent, unblocking work:
@@ -677,6 +680,17 @@ pub struct TracksArgs {
     pub width: bool,
 }
 
+/// `lanes` arguments.
+#[derive(Args)]
+pub struct LanesArgs {
+    /// Number of worker lanes (default: the safe parallel width).
+    #[arg(long)]
+    pub parallel: Option<usize>,
+    /// Per-pair overlap budget tolerated within a concurrent round (see `tracks`).
+    #[arg(long = "max-overlap", default_value = "0")]
+    pub max_overlap: String,
+}
+
 /// `skill` subcommand group.
 #[derive(Args)]
 pub struct SkillArgs {
@@ -730,6 +744,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Lint(_) => commands::lint(repo, fmt),
         Command::Ready(_) => commands::ready(repo, fmt),
         Command::Tracks(a) => commands::tracks(repo, fmt, a),
+        Command::Lanes(a) => commands::lanes(repo, fmt, a),
         Command::Next(a) => commands::next(repo, fmt, a),
         Command::Claim(a) => commands::claim(repo, fmt, a),
         Command::Release(a) => commands::release(repo, fmt, a),

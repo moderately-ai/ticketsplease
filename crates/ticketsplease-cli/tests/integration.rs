@@ -3870,3 +3870,49 @@ fn next_avoids_inflight_tickets() {
         vec!["c"]
     );
 }
+
+#[test]
+fn lanes_sequence_conflicts_onto_a_worker() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "c", "--title", "C", "--scope", "io"])
+        .assert()
+        .success();
+
+    let out = tkt(repo)
+        .args(["lanes", "--parallel", "2", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let lane_ids: Vec<Vec<&str>> = v["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            l.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    // The conflicting a,b are sequenced onto one lane rather than dropped.
+    assert!(
+        lane_ids
+            .iter()
+            .any(|l| l.contains(&"a") && l.contains(&"b")),
+        "a and b on one lane: {lane_ids:?}"
+    );
+    assert_eq!(v["merge_order"].as_array().unwrap().len(), 3);
+}

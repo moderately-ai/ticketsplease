@@ -153,6 +153,49 @@ pub fn tracks<'a>(
     Ok(batches)
 }
 
+/// A worker-lane plan: ≤ `parallel` lanes, each an ordered queue for one worker, plus
+/// the round-by-round merge order.
+pub struct LanePlan<'a> {
+    /// One ordered queue per worker (non-empty lanes only).
+    pub lanes: Vec<Vec<&'a Ticket>>,
+    /// The recommended merge order: complete an earlier round everywhere before the
+    /// next round's heads start (each later round conflicts with an earlier one).
+    pub merge_order: Vec<&'a Ticket>,
+}
+
+/// Plan up to `parallel` worker lanes for the ready set. Unlike `tracks` — which emits
+/// conflict-free *rounds* that wait for a recompute — this assigns work to fixed
+/// worker queues so conflicting tickets are *sequenced onto one lane* (later rebases
+/// on earlier) instead of dropped. Built by capping each `tracks` round to `parallel`
+/// concurrent tickets and transposing the rounds across lanes; `max_overlap` tolerates
+/// cheap overlaps within a round just like `tracks`.
+pub fn lanes<'a>(
+    tickets: &'a [Ticket],
+    parallel: usize,
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> Result<LanePlan<'a>> {
+    let n = parallel.max(1);
+    let batches = tracks(tickets, max_overlap, weights)?;
+    // Each conflict-free (within budget) batch, capped to n, becomes one or more rounds
+    // of ≤ n concurrently-runnable tickets.
+    let rounds: Vec<Vec<&Ticket>> = batches
+        .iter()
+        .flat_map(|b| b.chunks(n).map(<[&Ticket]>::to_vec))
+        .collect();
+    // Transpose rounds into lanes: lane i gets the i-th ticket of each round, so a
+    // worker's queue runs sequentially while round r stays concurrent across lanes.
+    let mut lanes: Vec<Vec<&Ticket>> = vec![Vec::new(); n];
+    for round in &rounds {
+        for (i, &t) in round.iter().enumerate() {
+            lanes[i].push(t);
+        }
+    }
+    lanes.retain(|l| !l.is_empty());
+    let merge_order: Vec<&Ticket> = rounds.iter().flatten().copied().collect();
+    Ok(LanePlan { lanes, merge_order })
+}
+
 /// A scored next-pick.
 pub struct Pick<'a> {
     /// The recommended ticket.
@@ -851,6 +894,29 @@ mod tests {
             t_scoped("c", &["z"], &[]),
         ];
         assert_eq!(parallel_width(&disjoint, 0, &w).unwrap(), 3, "disjoint");
+    }
+
+    #[test]
+    fn lanes_sequence_conflicts_onto_one_worker() {
+        let w = BTreeMap::new();
+        // a,b conflict on core; c is disjoint (io).
+        let tickets = vec![
+            t_scoped("a", &["core"], &[]),
+            t_scoped("b", &["core"], &[]),
+            t_scoped("c", &["io"], &[]),
+        ];
+        let plan = lanes(&tickets, 2, 0, &w).unwrap();
+        // a and b cannot run together, so they are sequenced onto one lane (not dropped).
+        assert!(
+            plan.lanes.iter().any(|l| {
+                let ids: Vec<&str> = l.iter().map(|t| t.id.as_str()).collect();
+                ids.contains(&"a") && ids.contains(&"b")
+            }),
+            "a and b share a lane"
+        );
+        // c runs concurrently on its own lane; every ready ticket is planned once.
+        assert_eq!(plan.lanes.len(), 2);
+        assert_eq!(plan.merge_order.len(), 3);
     }
 
     #[test]

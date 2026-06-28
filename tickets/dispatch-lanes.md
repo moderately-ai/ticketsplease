@@ -1,7 +1,7 @@
 ---
 id: dispatch-lanes
 title: "Lanes planner: sequence conflicting work, don't drop it"
-status: todo
+status: done
 priority: p2
 dependencies: [overlap-tolerant-tracks-next]
 related: []

@@ -23,9 +23,9 @@ use ticketsplease_core::{
 
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
-    GraphArgs, GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, PathArgs, ReconcileArgs,
-    ReleaseArgs, RenameArgs, RollupArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs,
-    StatusArgs, TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
+    GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, NextArgs, PathArgs,
+    ReconcileArgs, ReleaseArgs, RenameArgs, RollupArgs, SelfUpdateArgs, SetArgs, ShowArgs,
+    SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -1705,6 +1705,49 @@ fn batch_overlap_cost(batches: &[Vec<&Ticket>], weights: &BTreeMap<String, i64>)
         }
     }
     total
+}
+
+/// `lanes` — plan worker queues that sequence conflicting work instead of dropping it.
+pub fn lanes(repo: &Path, fmt: Format, args: &LanesArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let tickets = store.load_all()?;
+    let max_overlap = parse_overlap_budget(&args.max_overlap)?;
+    let weights = store.config.scope_weights();
+    // Default the lane count to the safe parallel width (use as many workers as fit).
+    let n = match args.parallel {
+        Some(n) => n,
+        None => schedule::parallel_width(&tickets, max_overlap, &weights)?.max(1),
+    };
+    let plan = schedule::lanes(&tickets, n, max_overlap, &weights)?;
+    match fmt {
+        Format::Json => {
+            let lanes: Vec<Value> = plan
+                .lanes
+                .iter()
+                .map(|l| Value::Array(l.iter().map(|t| ticket_summary(t)).collect()))
+                .collect();
+            let merge_order: Vec<&str> = plan.merge_order.iter().map(|t| t.id.as_str()).collect();
+            print_json(&json!({
+                "schema_version": 1,
+                "lanes": lanes,
+                "merge_order": merge_order,
+            }))
+        }
+        Format::Human => {
+            if plan.lanes.is_empty() {
+                println!("(no ready tickets)");
+            }
+            for (i, lane) in plan.lanes.iter().enumerate() {
+                let ids: Vec<&str> = lane.iter().map(|t| t.id.as_str()).collect();
+                println!("lane {}: {}", i + 1, ids.join(" -> "));
+            }
+            if !plan.merge_order.is_empty() {
+                let order: Vec<&str> = plan.merge_order.iter().map(|t| t.id.as_str()).collect();
+                println!("merge order: {}", order.join(", "));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Parse a `--max-overlap` budget: a non-negative integer, or `any` (unbounded).
