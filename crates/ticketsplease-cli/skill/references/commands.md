@@ -9,21 +9,22 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 
 ## Contents
 
-`init` · `create` · `set` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `lint` · `skill install` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
+`init` · `create` · `set` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
 
 ## Conventions
 
-- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 - **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
+- **Access intent: `scopes` exclusive, `shared_scopes` additive.** A scope in `scopes` is an *exclusive* (rewrite) claim; one in `shared_scopes` is a *shared* (additive/append) claim. Two tickets that both hold a scope shared are compatible (run in parallel); a shared claim still conflicts with an exclusive one. `[scope_policy]` in `ticketsplease.toml` sets a per-scope conflict-cost `weight` (default 1; `0` = free to co-edit). `tracks`/`next`/`lanes` gate on a per-pair **overlap budget** (`--max-overlap K`, `0`=strict … `any`=unbounded), so you can fill workers least-riskily instead of single-threading. The guard tags a shared-by-both collision `cause: shared` and does not fail on it.
 
 ## init
 
 ```
 ticketsplease init [--dir tickets] [--force]
 ```
-Scaffolds `<dir>/` and `ticketsplease.toml`, installs the bundled skill into `.claude/skills/ticketsplease/`, and seeds example body templates into `.ticketsplease/templates/` (for `create --template`). Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
+Scaffolds `<dir>/` and `ticketsplease.toml`, links the bundled skill into `.claude/skills/ticketsplease` (a gitignored symlink to the canonical copy — see `skill`), and seeds example body templates into `.ticketsplease/templates/` (for `create --template`). Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
 
 JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "templates_installed", "git": bool }`.
 
@@ -31,15 +32,15 @@ JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "te
 
 ```
 ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3]
-                      [--depends-on a,b] [--related c,d] [--scope x,y] [--path 'glob'] [--tag t]
-                      [--body <s>] [--template <name>] [--dry-run]
+                      [--depends-on a,b] [--related c,d] [--scope x,y] [--shared-scope z]
+                      [--path 'glob'] [--tag t] [--body <s>] [--template <name>] [--dry-run]
 ticketsplease create --from <file|-> [--dry-run]
 ```
 Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
 `--template <name>` scaffolds the body from `.ticketsplease/templates/<name>.md` (seeded by `init`; add your own), substituting `{{title}}` and `{{id}}`. An explicit `--body` wins over `--template`; an unknown template is exit 4.
 
-`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
@@ -49,6 +50,7 @@ JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, 
 ticketsplease set (<id> | --where <expr> | --view <name>)
                        [--title <s>] [--status <s>] [--priority <p>]
                        [--add-scope a,b] [--remove-scope c] [--add-tag t] [--remove-tag u]
+                       [--add-shared-scope z] [--remove-shared-scope w]
                        [--add-path 'glob'] [--remove-path 'glob']
                        [--add-dependency d] [--remove-dependency e]
                        [--add-related r] [--remove-related s]
@@ -99,7 +101,7 @@ ticketsplease rollup [--tag <t>] [--where <expr>] [--view <name>]
 ```
 Aggregates an initiative (a tag and/or filter; selectors AND together — no selector = the whole board): status & priority counts, percent done, the **ready frontier**, and the **blocked set**. Readiness is computed over the *full* board (so a prerequisite outside the selection still counts) and then intersected with the selection; `blocked` is the selected dispatchable-status tickets that have an unfinished dependency, each with the unmet ids. Use it to answer "where does this initiative stand and what's next in it" in one call.
 
-JSON: `{ "schema_version", "selector": {tag,where,view}, "total", "done", "percent_done", "by_status": {status: n}, "by_priority": {p: n}, "ready": [ {id,title,priority} ], "blocked": [ {id,title,unmet: [ids]} ] }`.
+JSON: `{ "schema_version", "selector": {tag,where,view}, "total", "done", "percent_done", "width", "by_status": {status: n}, "by_priority": {p: n}, "ready": [ {id,title,priority} ], "blocked": [ {id,title,unmet: [ids]} ] }` (`width` = safe parallel width within the ready frontier).
 
 ## graph / path
 
@@ -176,20 +178,33 @@ JSON: `{ "schema_version", "ready": [ {id,title,status,priority,scopes,paths,dep
 ## tracks
 
 ```
-ticketsplease tracks [--parallel N]
+ticketsplease tracks [--parallel N] [--max-overlap K] [--width] [--overlap-matrix]
+                     [--assume-shared | --strict]
 ```
-Partitions the ready set into conflict-free batches: no two tickets in a batch share a scope. Dispatch one batch fully in parallel. `--parallel N` caps each batch to N tickets (splitting larger ones), giving an orchestrator worker-sized fronts.
+Partitions the ready set into batches; no two tickets in a batch conflict beyond the budget. Dispatch one batch fully in parallel. `--parallel N` caps each batch to N tickets (splitting larger ones), giving worker-sized fronts.
 
-JSON: `{ "schema_version", "batches": [ [ {id,title,status,priority,scopes,...} ] ] }`.
+`--max-overlap K` is the per-pair overlap budget: `0` (default) = strictly conflict-free; `K` = let tickets that conflict by ≤ K per pair share a batch; `any` = unbounded. Each batch's residual `overlap_cost` is reported. `--width` prints only the **safe parallel width** (the largest set runnable at once within the budget) — how many workers to spin up. `--overlap-matrix` instead emits the raw conflict graph (every ready pair with conflicting scopes and cost) for self-service assignment. `--assume-shared` treats every claim as shared (collapse conflicts; reconcile at merge); `--strict` treats every claim as exclusive (ignore `shared_scopes` and weights).
+
+JSON: `{ "schema_version", "batches": [ [ {id,...} ] ], "overlap_cost", "width" }`; with `--width`: `{ "schema_version", "width" }`; with `--overlap-matrix`: `{ "schema_version", "matrix": [ {a, b, scopes, cost} ], "width" }`.
+
+## lanes
+
+```
+ticketsplease lanes [--parallel N] [--max-overlap K] [--assume-shared | --strict]
+```
+Plans **worker lanes**: ordered per-worker queues that *sequence* conflicting work onto one lane (the later rebases on the earlier) instead of dropping it to a future batch and idling a worker. `--parallel N` is the lane count (default: the safe parallel width); `--max-overlap` tolerates cheap overlaps within a concurrent round (same model as `tracks`). The merge order completes an earlier round everywhere before the next round's heads start.
+
+JSON: `{ "schema_version", "lanes": [ [ {id,...} ] ], "merge_order": [ids] }`.
 
 ## next
 
 ```
-ticketsplease next [--parallel N] [--allow-overlap] [--claim --as <worker> [--ttl <secs>]]
+ticketsplease next [--parallel N] [--max-overlap K] [--running ids] [--allow-overlap]
+                   [--assume-shared | --strict] [--claim --as <worker> [--ttl <secs>]]
 ```
-The highest-scored dispatchable ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks` — higher is more impactful. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N by score even when scopes overlap, annotating each with `conflicts_with`. `--claim --as <worker>` atomically claims the first still-free pick (race-safe dispatch in one call; a lost race falls through to the next pick).
+The highest-scored dispatchable ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks` — higher is more impactful. Picks fill in two passes: highest-scored compatible picks first, then — within `--max-overlap` (`0` default … `any`) — the lowest-cost overlaps to fill N, each annotated with `conflicts_with` (scopes + cost). `--allow-overlap` is the `--max-overlap any` alias. `--running <ids>` (alias `--avoid`) drops picks conflicting with those in-flight tickets; omit it to default to every in-progress ticket with a live claim (so a dispatch loop is in-flight-aware with no args). `--claim --as <worker>` atomically claims the first still-free pick (a lost race falls through to the next).
 
-JSON: `{ "schema_version", "picks": [ {id,...,score, "conflicts_with": [ {ticket,scopes} ]} ] }`, or with `--claim`: a claim payload (see below) or `{ "schema_version", "claimed": null }` when nothing is free.
+JSON: `{ "schema_version", "picks": [ {id,...,score, "conflicts_with": [ {ticket,scopes,cost} ]} ], "overlap_cost", "width" }`, or with `--claim`: a claim payload (see below) or `{ "schema_version", "claimed": null }` when nothing is free.
 
 ## why
 
@@ -220,7 +235,7 @@ Diffs the branch vs `--base` and makes two decoupled judgements. **Exit 6** when
 
 It reads the `[scopes]` contract from `--config-ref` (default: the base), **not** the possibly stale/empty config on the checked-out branch — so an emptied branch config can't give a false all-clear. Sibling tickets' in-flight status is read from `<prefix>*` branch tips, so a collision fires in the branch-per-ticket flow even when the current checkout shows the sibling as `todo`.
 
-**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap) or `transitive` (reverse-dep only — safe for additive work). `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
+**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it; a `shared_scopes` claim counts as declared). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap), `transitive` (reverse-dep only — safe for additive work), or `shared` (both tickets claim the scope additively — reported but **non-gating**, like `--ignore-transitive` for transitive). `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
 
 Two ways to handle transitive noise, with different trade-offs:
 - `--ignore-transitive` — **still computes and reports** transitive collisions (keeping `cause` visible for triage), but the *exit code* ignores them: the gate fails only on a direct overlap or an under-declaration. `transitive_only` in the JSON is `true` when a conflict exists but every part of it is transitive (so a gate would otherwise have been a false 6). Use this for additive work where you want the report but not the block.
@@ -244,24 +259,25 @@ delete JSON: `{ "schema_version", "id", "deleted": true }`. rename JSON: `{ "sch
 ticketsplease doctor
 ticketsplease guide
 ```
-`doctor` validates setup: config present, git repo with a commit, scope globs compile, base ref resolves (exit non-zero on any failure). JSON: `{ "schema_version", "ok": bool, "checks": [ {check, ok, detail} ] }`. `guide` prints the conceptual model (scopes, tracks, scoring, guard, claims). JSON: `{ "schema_version", "guide": "<text>" }`.
+`doctor` validates setup: config present, git repo with a commit, scope globs compile, base ref resolves (exit non-zero on any failure). It also reports two **advisory** (non-gating) skill checks — `skill_canonical` (the canonical copy matches this binary; else run `skill sync`) and `skill_link` (the project links to it; else run `migrate`/`skill install`). JSON: `{ "schema_version", "ok": bool, "checks": [ {check, ok, detail} ] }`. `guide` prints the conceptual model (scopes, tracks, scoring, guard, claims). JSON: `{ "schema_version", "guide": "<text>" }`.
 
 ## lint
 
 ```
 ticketsplease lint
 ```
-Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists), links (dangling dependencies and dangling related links), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `duplicate-id` | `missing-dep` | `missing-related` | `cycle`). A dangling `related` is flagged but a `related` cycle is never an error.
+Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists, a scope claimed both exclusive and shared, and `[scope_policy]` keys that name no scope), links (dangling dependencies and dangling related links), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id` | `missing-dep` | `missing-related` | `cycle`). A dangling `related` is flagged but a `related` cycle is never an error.
 
 JSON: `{ "schema_version", "ok": bool, "diagnostics": [ {file, id, code, message} ] }`.
 
-## skill install / self-update
+## skill install / sync / self-update
 
 ```
-ticketsplease skill install [--dir .claude/skills]
+ticketsplease skill install [--dir .claude/skills] [--copy]
+ticketsplease skill sync
 ticketsplease self-update [--version vX.Y.Z]
 ```
-`skill install` writes the bundled skill (the version baked into the running binary). `self-update` replaces the binary in place from GitHub Releases.
+The skill content lives once at a canonical per-user path (`$XDG_DATA_HOME/ticketsplease/skill`, version-stamped); each project's `.claude/skills/ticketsplease` is a **symlink** to it, so refreshing the canonical copy updates every linked project. `skill install` creates that symlink (and gitignores it, since it points at an absolute path); `--copy` writes a committable real copy instead. `skill sync` re-extracts the canonical copy from the running binary — the installer runs it after install/`self-update`, so upgraders get the new skill automatically; `doctor` warns (non-gating) if the canonical copy or a project link has drifted, and `migrate` repairs a stale project link. `self-update` replaces the binary in place from GitHub Releases.
 
 ---
 

@@ -14,7 +14,7 @@ tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes it
                                   # ticket's declared scope or collides with another
 ```
 
-`init` / `create` / `set` / `link` / `show` / `list` / `ready` / `next` / `lint` / `delete` / `rename` are the convenience surface around those two; `list --where` filters with boolean expressions and `view` saves them as named views; `rollup` aggregates an initiative (counts, % done, ready frontier, blocked set) and `graph` / `path` export the dependency DAG (Graphviz DOT, critical path); `claim` / `release` / `claims` / `next --claim` provide race-safe pull-based dispatch; `status --all-branches`, `reconcile`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches (`reconcile` flags where the board has drifted from the actual branches/worktrees). New to the model? `tkt guide` prints it in one screen, and `tkt doctor` verifies setup.
+`init` / `create` / `set` / `link` / `show` / `list` / `ready` / `next` / `lint` / `delete` / `rename` are the convenience surface around those two; `list --where` filters with boolean expressions and `view` saves them as named views; `rollup` aggregates an initiative (counts, % done, ready frontier, blocked set) and `graph` / `path` export the dependency DAG (Graphviz DOT, critical path); `tracks --max-overlap` / `lanes` tune how parallel you go (tolerate benign overlap, or sequence conflicts onto per-worker lanes instead of idling); `claim` / `release` / `claims` / `next --claim` provide race-safe pull-based dispatch; `status --all-branches`, `reconcile`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches (`reconcile` flags where the board has drifted from the actual branches/worktrees). New to the model? `tkt guide` prints it in one screen, and `tkt doctor` verifies setup.
 
 ## Install
 
@@ -66,7 +66,8 @@ status: todo                  # todo | ready | in-progress | blocked | review | 
 priority: p1                  # p0 (highest) .. p3
 dependencies: [build-index-trait]   # hard, scheduling-blocking; cycle-checked
 related: []                   # soft "see also"; ignored by scheduling
-scopes: [query/planner]       # abstract area names defined in ticketsplease.toml
+scopes: [query/planner]       # exclusive (rewrite) area claims
+shared_scopes: []             # additive (append) claims — co-edit freely
 paths: []                     # extra explicit globs
 tags: []
 # any custom keys you add are preserved verbatim
@@ -77,6 +78,8 @@ Free-form markdown body.
 Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves unknown keys, key order, comments, and the body byte-for-byte. Hand-editing is fully supported.
 
 A **scope** is a stable abstract name for an area of the codebase. Tickets reference scopes; `ticketsplease.toml` maps them to file globs (and, for Rust repos, to crates). Two tickets that share a scope never land in the same parallel batch, and the guard fails a branch that touches a scope its ticket didn't declare.
+
+**Access intent.** A scope can be claimed *exclusively* (`scopes` — a rewrite) or *shared/additively* (`shared_scopes` — append/extend). Two shared claims on a scope are compatible and run in parallel; a shared claim still conflicts with an exclusive one. On top of that, `tracks`/`next`/`lanes` take `--max-overlap K`, a per-pair tolerance budget (`0` strict … `any`), so you fill N workers least-riskily instead of single-threading on benign clashes — `tracks --width` tells you how many fit, and `lanes` plans ordered per-worker queues that *sequence* conflicts instead of dropping them. `[scope_policy]` weights a scope's clash cost (`0` = free hub). The guard honours all of this: a shared-by-both collision is reported but non-gating.
 
 ## Configuration — `ticketsplease.toml`
 
@@ -97,6 +100,9 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 
 [external_scopes]              # name a forked dep (pinned via git=…rev=…) as a scope
 "sqlparser-fork" = { repo = "tomsanbear/sqlparser", paths = [] }
+
+[scope_policy]                 # per-scope clash cost for tracks/next --max-overlap
+"core" = { weight = 0 }        # weight 0 = a free-to-co-edit hub; higher = riskier (default 1)
 ```
 
 When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo). Each collision is tagged `cause: "direct"` (a real file/crate overlap) or `"transitive"` (reached only via the reverse-dep walk — safe for an additive change), and a per-scope `affected_causes` map lets a consumer triage which under-declarations and collisions are real rather than hand-diffing. Pass `guard --direct-only` (alias `--no-reverse-deps`) to gate on direct overlap only and skip the expansion entirely.
@@ -115,7 +121,9 @@ Saved views (and bundled body templates) live under `.ticketsplease/` at the rep
 
 ## The Claude skill
 
-`tkt init` (and `tkt skill install`) drop a Claude skill into `.claude/skills/ticketsplease/`. It teaches an agent the orchestration loop — `tracks` to fan out disjoint work, `guard` to gate each branch before merge — and is embedded in the binary, so the installed copy always matches your version.
+`tkt init` (and `tkt skill install`) wire a Claude skill into `.claude/skills/ticketsplease/`. It teaches an agent the orchestration loop — `tracks` to fan out disjoint work, `guard` to gate each branch before merge.
+
+The skill is embedded in the binary, but instead of a frozen per-repo copy it lives once at a canonical per-user path (`~/.local/share/ticketsplease/skill`) and each project's `.claude/skills/ticketsplease` is a **symlink** to it. The installer runs `tkt skill sync` after every install/`self-update`, so the canonical copy — and therefore every linked project — always matches your binary; `tkt doctor` warns if it drifts and `tkt migrate` repairs a stale link. The link is local, so `init` gitignores it; use `tkt skill install --copy` if you'd rather commit a real copy.
 
 ## Dogfooding
 

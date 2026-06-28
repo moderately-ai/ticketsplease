@@ -35,6 +35,19 @@ The loop above is **push-based**: one orchestrator claims each ticket and hands 
 
 A pull worker can collapse recommend-then-claim into a single race-safe call: `ticketsplease next --claim --as <worker> --format json` claims the best free pick, falling through to the next on a lost race. Use `ticketsplease claims --format json` to audit who holds what (assignee, lease, live/expired) and `claim --force` to take over a live lease deliberately.
 
+## Tuning how parallel you go
+
+The default is strict: two tickets never run together if *either* exclusively claims a scope they share (`scopes`). That's safe but over-serializes when the overlap is benign (e.g. both only *append* to a hub crate). The knobs, in the order you'll reach for them:
+
+1. **Declare additive intent.** Put a scope in `shared_scopes` (vs `scopes`) when a ticket only appends/extends it. Two shared claims on a scope run in parallel; an exclusive (rewrite) claim still conflicts. This is the precise lever and it carries through to the guard, which won't fail a shared-by-both collision (`cause: shared`).
+2. **Weight scopes once.** `[scope_policy]` in `ticketsplease.toml` sets a per-scope clash cost (`weight = 0` = a free-to-co-edit hub; higher = riskier) — set-and-forget instead of annotating every ticket.
+3. **Tolerate a budget per dispatch.** `tracks`/`next`/`lanes --max-overlap K` co-schedules pairs whose clash cost is ≤ K (`any` = unbounded), filling N workers least-cost-first; the residual `overlap_cost` is reported so you can judge it. Pair with `guard --ignore-transitive` (and the additive-by-intent pass-through) so the merge gate agrees.
+4. **Size the fleet.** `tracks --width` (also in `next`/`rollup` JSON) is the largest set safely runnable at once under the current budget — how many workers to spin up.
+5. **Sequence instead of dropping.** `ticketsplease lanes --parallel N` plans ordered per-worker queues: conflicting tickets are chained onto one lane (later rebases on earlier) with a merge order, so no worker idles waiting for a recompute.
+6. **Stay compatible mid-loop.** `next --running <ids>` (or, by default, the live-claimed in-progress set) drops picks that would clash with work already in flight — the right call when a single worker frees up.
+
+Escape hatches when you'd rather not annotate: `--assume-shared` (treat everything additive — pack it all, reconcile at merge), `--strict` (ignore `shared_scopes`/weights — the conservative view), and `tracks --overlap-matrix` (the raw weighted conflict graph, so an external orchestrator assigns work itself).
+
 ## Branch naming
 
 Name each branch so the guard can infer the ticket without `--ticket`: include the id, e.g. `tkt/<id>` or `<id>-short-description`. The guard picks the longest ticket id that appears in the branch name. When in doubt, pass `--ticket <id>` explicitly.
@@ -47,7 +60,7 @@ A worker must pass the guard before its branch merges:
 ticketsplease guard tkt/<id> --base main --format json
 case exit:
   0 -> merge
-  6 -> read the JSON (SKILL.md has the field semantics and the --ignore-transitive/--direct-only flags):
+  6 -> read the JSON (commands.md has the full guard schema and the --ignore-transitive/--direct-only flags):
          under_declared -> a genuine scope escape. Narrow the diff back, or if the area truly
              belongs to this ticket `ticketsplease set <id> --add-scope <scope>` (or add the file
              to `paths`) and re-guard. The cargo reverse-dep expansion never lands here, so editing

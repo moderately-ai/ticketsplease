@@ -35,10 +35,12 @@ ticketsplease prevents the parallel-work failure mode — two agents editing the
 Locate the binary (`ticketsplease` or `tkt` on `PATH`; if neither is present, tell the user how they installed it or ask). Confirm the repo is initialized — there is a `ticketsplease.toml` at its root. If not:
 
 ```sh
-ticketsplease init        # scaffolds tickets/ + ticketsplease.toml (+ this skill)
+ticketsplease init        # scaffolds tickets/ + ticketsplease.toml; links the skill into .claude/skills (a gitignored symlink to the canonical per-user copy)
 ticketsplease guide       # the conceptual model in one screen (scopes, tracks, scoring, guard, claims)
-ticketsplease doctor      # verify setup: config, git repo + commit, scope globs, base ref
+ticketsplease doctor      # verify setup: config, git repo + commit, scope globs, base ref, skill freshness
 ```
+
+After upgrading the binary, the installer refreshes the canonical skill; if `doctor` flags it as stale, run `ticketsplease skill sync` (and `ticketsplease migrate` to repair a project link). See `references/commands.md` → `skill`.
 
 Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents (collisions from that expansion are tagged `transitive` so you can triage them; `guard --direct-only`, or `[language] reverse_dep_expansion = false` for a repo default, skips it). Under-declaration is always file-based, so this expansion never causes a false "out of scope" on a shared foundational crate. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
 
@@ -60,8 +62,8 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ```sh
    ticketsplease guard tkt/<id> --format json   # exit 6 → do not merge
    ```
-   - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's declared area; it clears this **pre-merge filter**. (This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
-   - Exit `6` → a **declared-area overlap, not a proven conflict** — the JSON says where: `under_declared` (scopes whose files the branch edited but that fall outside its declared area; file-authoritative) and `collisions` (open tickets whose area the diff overlaps, each tagged `direct` = a real overlap or `transitive` = reverse-dep-only, usually safe for additive work). To gate on the exit code without parsing JSON, run `guard --ignore-transitive` (exits 0 unless there's a direct overlap or under-declaration). See `references/parallel-workflow.md` for the resolution playbook (`set --add-scope`, coordinate with the named ticket, or build+test the merge) and the `--direct-only` flag.
+   - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's *exclusively* claimed area; it clears this **pre-merge filter**. (A shared-by-both collision is still reported in the JSON but does not block — see access intent. This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
+   - Exit `6` → a **declared-area overlap, not a proven conflict** — the JSON says where: `under_declared` (scopes whose files the branch edited but that fall outside its declared area; file-authoritative) and `collisions` (open tickets whose area the diff overlaps, each tagged `direct` = a real overlap, `transitive` = reverse-dep-only, or `shared` = both additive and non-gating). To gate on the exit code without parsing JSON, run `guard --ignore-transitive` (exits 0 unless there's a direct overlap or under-declaration). See `references/parallel-workflow.md` for the resolution playbook (`set --add-scope`, coordinate with the named ticket, or build+test the merge) and the `--direct-only` flag.
 
 4. **Finish or release.** `claim` already set the ticket in-progress; on completion move it forward with `ticketsplease set <id> --status review|done` (setting `done` clears the claim). If you abandon the work, `ticketsplease release <id> --as <worker-id>` drops the claim and restores the pre-claim status (keeping any progress you'd advanced to). Renew a long-running claim by re-running `claim` (it extends your lease; a renewal logs no duplicate event).
 
@@ -81,19 +83,26 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 ## Picking and inspecting work
 
 - `ticketsplease ready` — dependency-satisfied tickets, priority-ordered (a ticket is ready when its status is todo/ready and every dependency is done).
-- `ticketsplease tracks` — conflict-free parallel batches (the headline feature).
+- `ticketsplease tracks [--max-overlap K] [--width]` — conflict-free parallel batches (the headline feature); `--width` shows how many workers are safe to run right now. Overlap tuning: see **Access intent & overlap** below.
+- `ticketsplease lanes [--parallel N]` — ordered per-worker queues that *sequence* conflicting work onto one lane instead of dropping it (with a merge order). Use when you want a full N-worker plan, not just the immediate front.
 - `ticketsplease why <a> <b>` — explain whether two tickets can co-run, and if not, the exact reason (a shared scope, or one transitively depends on the other). Use it when the scheduler's grouping is surprising.
-- `ticketsplease next [--parallel N] [--allow-overlap]` — scored recommendation(s); the score favours priority, critical-path position, and how much remaining downstream work the ticket unblocks. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N even when scopes overlap, annotating each with the shared scopes so you can judge the file overlap yourself.
+- `ticketsplease next [--parallel N] [--max-overlap K] [--running ids]` — scored recommendation(s) favouring priority, critical-path position, and downstream unblock count; `--running` keeps picks compatible with in-flight work, `--claim --as <w>` claims one atomically. (Flag semantics: `references/commands.md`.)
 - `ticketsplease list [--status <s>] [--where '<expr>']` — list/filter tickets. `--where` is a boolean expression: `field:value` joined by `AND`/`OR`/`NOT` with parens (fields: status priority tag scope assignee id dep related), e.g. `--where 'tag:epic AND NOT status:done'`. `ticketsplease view save <name> '<expr>'` stores one as a reusable view (then `list --view <name>`). `ticketsplease show <id>`.
 - `ticketsplease rollup [--tag <t> | --where <e> | --view <v>]` — an initiative's dashboard: status & priority counts, % done, the ready frontier, and the blocked set (each with its unmet deps). The one-call "where does this epic stand and what's next in it".
 - `ticketsplease graph [--tag <t>] [--dot]` and `ticketsplease path <id>` — export the dependency DAG (JSON, or Graphviz with `--dot`) and the critical prerequisite path (longest dependency chain) to a ticket.
 - `ticketsplease reconcile` — cross-check the board against git (tkt/* branches + worktrees): flags in-progress tickets with no branch (stale-busy) and live branches whose ticket is still todo/ready (stale-idle), plus orphan branches. Exit 3 on drift. Run it before a dispatch round so the board can be trusted.
 
+## Access intent & overlap (tuning parallelism)
+
+Claim a scope in one of two modes so you needn't single-thread on benign clashes: `scopes` is an **exclusive** (rewrite) claim, `shared_scopes` is a **shared/additive** (append/extend) one. Two shared claims on a scope co-run; any exclusive claim blocks any other claim on that scope. On top of that, `--max-overlap K` on `tracks`/`next`/`lanes` tolerates clashes up to a per-pair cost budget so you fill N workers least-riskily instead of idling them.
+
+For the full tuning playbook — scope weights (`[scope_policy]`), the escape hatches, sequencing conflicts with `lanes`, and how the guard honours all of it — read `references/parallel-workflow.md`.
+
 ## Creating and editing tickets
 
 ```sh
 ticketsplease create --title "Add vector index" --priority p1 \
-  --scope query/planner --depends-on build-index-trait --related design-doc --template default
+  --scope query/planner --shared-scope changelog --depends-on build-index-trait --related design-doc --template default
 ticketsplease create --from backlog.toml    # batch from a JSON array or TOML [[ticket]] (- reads stdin); all-or-nothing
 ticketsplease set <id> --status in-progress --add-scope core --add-dependency other
 ticketsplease set --where 'tag:epic' --add-tag ready-soon   # bulk-edit every match (field edits only, not title/body)
@@ -110,4 +119,4 @@ For the full frontmatter schema and per-field semantics, see `references/command
 ## Deeper references
 
 - **`references/commands.md`** — read when you need exact flag syntax, JSON key names, or a command's per-exit-code behaviour.
-- **`references/parallel-workflow.md`** — read when setting up a multi-worker fan-out, authoring/organizing an initiative (batch create, tag, `rollup`, `graph`), diagnosing a guard failure, or handling cross-clone propagation.
+- **`references/parallel-workflow.md`** — read when setting up a multi-worker fan-out, tuning how much parallelism to allow (`--max-overlap`, `[scope_policy]`, `lanes`, escape hatches), authoring/organizing an initiative (batch create, tag, `rollup`, `graph`), diagnosing a guard failure, or handling cross-clone propagation.

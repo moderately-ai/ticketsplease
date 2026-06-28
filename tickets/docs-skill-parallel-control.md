@@ -1,7 +1,7 @@
 ---
 id: docs-skill-parallel-control
 title: Document the access-intent model, the dial, lanes, and escape hatches
-status: todo
+status: done
 priority: p2
 dependencies: [access-intent-scopes, overlap-tolerant-tracks-next, dispatch-lanes, next-aware-of-inflight, parallel-width-query, scope-policy-defaults, parallel-escape-hatches, guard-honors-access-intent, skill-global-distribution]
 related: []
