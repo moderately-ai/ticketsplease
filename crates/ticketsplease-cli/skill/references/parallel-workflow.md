@@ -2,6 +2,17 @@
 
 This is the workflow ticketsplease is built for: one orchestrator fanning out disjoint work to several workers, with a hard merge gate.
 
+## Authoring an initiative (before you dispatch)
+
+Turning a spec or audit into a dispatchable, trackable set of tickets:
+
+1. **Emit the batch in one operation.** Write the tickets as a JSON array or a TOML `[[ticket]]` manifest (each with id, `depends_on`, `related`, `scopes`, `tags`, and a `body` or `template`) and `ticketsplease create --from manifest.toml` — validated all-or-nothing, idempotent on re-run. Tag every ticket with the initiative key (e.g. `--tag m1`, or a `tags` field per spec) so the group can be rolled up. Use `--depends-on` only for true ordering; `--related` records a non-blocking cross-reference the scheduler ignores.
+2. **Track where it stands.** `ticketsplease rollup --tag m1` → counts by status/priority, % done, the ready frontier (what to dispatch next within the initiative), and the blocked set with each ticket's unmet deps.
+3. **Plan the shape.** `ticketsplease graph --tag m1 --dot | dot -Tsvg` visualizes the DAG; `ticketsplease path <id>` prints the longest prerequisite chain (critical path) to any ticket.
+4. **Save the view.** `ticketsplease view save open-m1 'tag:m1 AND NOT status:done'`, then `list --view open-m1` / `rollup --view open-m1` is the reusable "epic view" (stored in the committable `.ticketsplease/views.toml`).
+
+Then dispatch the ready frontier with the fan-out loop below.
+
 ## The fan-out loop
 
 ```
@@ -36,21 +47,16 @@ A worker must pass the guard before its branch merges:
 ticketsplease guard tkt/<id> --base main --format json
 case exit:
   0 -> merge
-  6 -> read the JSON:
-         under_declared non-empty -> the branch edited files outside its declared area
-             (declared-scope globs + paths). These are genuine escapes — narrow the diff back, or
-             if the area is truly part of this ticket `ticketsplease set <id> --add-scope <scope>`
-             (or add the file to the ticket's `paths`) and re-guard. The cargo reverse-dep
-             expansion never lands here, so editing a foundational crate within your declared globs
-             will not trip it.
-         collisions non-empty -> another open ticket's declared area overlaps your affected set.
-             Per collision check `cause`: `direct` = a real overlap, coordinate (merge the other
-             first, or split the work); `transitive` = only the reverse-dep graph connects you,
-             usually a false alarm for additive work. To auto-allow transitive-only collisions
-             while still seeing them, gate with `guard --ignore-transitive` (exits 0 unless there's
-             a direct overlap or under-declaration; `transitive_only: true` in the JSON marks the
-             case). `--direct-only` instead drops the reverse-dep walk entirely. Don't let
-             transitive noise train you to ignore a genuine exit 6.
+  6 -> read the JSON (SKILL.md has the field semantics and the --ignore-transitive/--direct-only flags):
+         under_declared -> a genuine scope escape. Narrow the diff back, or if the area truly
+             belongs to this ticket `ticketsplease set <id> --add-scope <scope>` (or add the file
+             to `paths`) and re-guard. The cargo reverse-dep expansion never lands here, so editing
+             a foundational crate within your declared globs will not trip it.
+         collisions -> another open ticket's declared area overlaps yours. `cause: direct` = a real
+             overlap, coordinate (merge the other first, or split the work); `cause: transitive` =
+             reverse-dep-only, usually a false alarm for additive work — `guard --ignore-transitive`
+             auto-allows transitive-only while still reporting it. Don't let transitive noise train
+             you to ignore a genuine exit 6.
   other -> a setup problem (4 = no ticket resolved, 3 = bad input); fix and retry.
 ```
 
@@ -87,3 +93,7 @@ This is invisible in the common single-machine case (one shared working tree or 
 ## One-shot, stateless
 
 Every invocation is independent and offline — no daemon, and the only shared state is git-tracked: the ticket files plus the claim locks (refs under `refs/ticketsplease/claim/`). An agent calls `ticketsplease claim`/`next`, does the work, calls `ticketsplease guard`, sets status or releases, and moves on. This makes the tool safe to drive from a loop and trivial to retry — a retried or crashed run leaves no corrupt state, and an abandoned claim simply expires on its lease so the ticket returns to the pool.
+
+---
+
+For exact flag syntax and JSON key names, see `references/commands.md`.

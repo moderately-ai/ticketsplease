@@ -1,6 +1,6 @@
 ---
 name: ticketsplease
-description: Drive the ticketsplease CLI (`ticketsplease`, alias `tkt`) to manage git-native markdown tickets and dispatch conflict-free parallel work across multiple agents. Use this whenever you are coordinating work in a repo that has a `ticketsplease.toml` and a `tickets/` directory — deciding what to work on next, splitting work across several agents without merge collisions, creating/updating/linking tickets, or checking whether a branch's diff stayed inside its ticket's declared scope before merging. Reach for this skill whenever the user mentions tickets, parallel work, agent coordination, work distribution, "what should I work on", conflict-free batches, dependency-ordered work, or guarding/validating a branch — even if they do not name ticketsplease explicitly.
+description: Manage and distribute development work across a codebase — break work into git-native markdown tickets, dispatch conflict-free parallel batches to multiple agents without merge collisions, query and roll up an initiative's progress, and verify a branch stayed inside its declared scope before merging. Backed by the ticketsplease CLI (`ticketsplease`, alias `tkt`). Use this whenever the user is coordinating work in a repo that has a `ticketsplease.toml` and a `tickets/` directory — deciding what to work on next, splitting work across several agents, creating/updating/linking/filtering tickets, rolling up an epic's status, or checking whether a branch's diff stayed inside its declared scope before merging. Reach for this skill whenever the user mentions tickets, parallel work, agent coordination, work distribution, what to work on next, conflict-free batches, dependency-ordered work, an initiative or epic's status, or guarding/validating a branch — even if they do not name ticketsplease explicitly.
 allowed-tools: Bash, Read, Write, Grep, Glob
 ---
 
@@ -8,11 +8,9 @@ allowed-tools: Bash, Read, Write, Grep, Glob
 
 ticketsplease (CLI `ticketsplease`, short alias `tkt`) manages development work as **git-versioned markdown tickets** and computes **conflict-free parallel work assignment** — so work can be split across multiple agents that never edit the same area of the codebase at once. Tickets are plain markdown + YAML frontmatter under `tickets/`; **scopes** (abstract area names like `core` or `query/planner`) are defined in `ticketsplease.toml` and map to file globs — and, for Rust repos, to crates.
 
-Use this skill to decide **what to work on**, to **split work safely across agents**, and to **guard a branch** before merging.
-
 ## Why this exists
 
-When several agents work a repo in parallel, the failure mode is two of them editing the same files and colliding at merge time. ticketsplease prevents that two ways. `tracks` partitions ready work into batches where no two tickets share a scope, so an entire batch is safe to run in parallel. `guard` checks a branch's *actual* diff against its ticket's *declared* scope — failing if the branch wandered into an area it never claimed, or into one another open ticket owns. For Rust repos the guard maps the diff through the cargo crate graph, so a change to a leaf crate is also checked against everything that depends on it.
+ticketsplease prevents the parallel-work failure mode — two agents editing the same files and colliding at merge — two ways. `tracks` partitions ready work into batches where no two tickets share a scope, so an entire batch is safe to run in parallel. `guard` checks a branch's *actual* diff against its ticket's *declared* scope — failing if the branch wandered into an area it never claimed, or into one another open ticket owns. For Rust repos the guard maps the diff through the cargo crate graph, so a change to a leaf crate is also checked against everything that depends on it.
 
 ## The contract — rely on this, not on prose
 
@@ -56,14 +54,14 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ```sh
    ticketsplease claim <id> --as <worker-id> --format json   # exit 6 → already claimed, pick another
    ```
-   The claim is race-safe (a git-ref compare-and-swap: of N workers racing one ticket, exactly one wins and the rest get exit 6) and carries a lease, so a crashed worker's ticket becomes reclaimable instead of stuck forever. It also flips the ticket to in-progress, so `ready`/`tracks`/`next` stop offering it. It refuses a ticket whose dependencies aren't all done (exit 6), matching dispatch. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside the ticket's declared scope. This is what makes **pull-based** dispatch safe: many workers can each `claim` straight off the same `tracks`/`ready` pool with no central coordinator. To collapse the recommend-then-claim race into one call, use `ticketsplease next --claim --as <worker> --format json` — it atomically claims the best free pick (falling through to the next on a lost race). `ticketsplease claims` shows who holds what (assignee, lease, live/expired); `claim --force` steals a live lease.
+   The claim is race-safe and lease-backed (exactly one of N racers wins; the rest get exit 6; a crashed worker's ticket becomes reclaimable), refuses a ticket whose dependencies aren't all done, and flips it to in-progress so `ready`/`tracks`/`next` stop offering it — this is what makes **pull-based** dispatch safe with no central coordinator. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside its declared scope. `next --claim --as <worker>` collapses recommend-then-claim into one atomic call; `claims` shows who holds what; `claim --force` steals a live lease. See `references/parallel-workflow.md` for the push-vs-pull pattern and lease recovery.
 
 3. **Before merging, guard the branch:**
    ```sh
    ticketsplease guard tkt/<id> --format json   # exit 6 → do not merge
    ```
    - Exit `0` → the diff stays within the declared scope and overlaps no open ticket's declared area; it clears this **pre-merge filter**. (This is a partitioning check, not a substitute for your normal build/test gate — disjoint branches can still conflict semantically.)
-   - Exit `6` → a **declared-area overlap, not a proven conflict.** The JSON says where. `under_declared` is file-authoritative: scopes whose files the branch edited but that fall outside the ticket's declared area (declared-scope globs + `paths`). The crate-graph reverse-dep expansion never lands here — editing a foundational crate that many crates (or sibling sub-scopes) map to is not a scope escape, and a file named in `paths` is always covered. `collisions` lists open tickets whose declared area the affected set overlaps; each (and each scope in `affected_causes`) is tagged `direct` (real overlap) or `transitive` (reverse-dep only — usually safe for an additive change). To gate on the exit code without parsing JSON, run `guard --ignore-transitive`: it still reports transitive collisions (keeping the `cause` triage) but exits 0 when the only conflict is transitive (`transitive_only: true` in the JSON), failing only on a direct overlap or under-declaration. (`guard --direct-only` instead skips the reverse-dep walk entirely, so transitive collisions don't appear at all.) Resolve a real (direct) hit by narrowing the diff, declaring the scope (`ticketsplease set <id> --add-scope <scope>`), coordinating with the named ticket, or — if you own the merge — building+testing the combined result.
+   - Exit `6` → a **declared-area overlap, not a proven conflict** — the JSON says where: `under_declared` (scopes whose files the branch edited but that fall outside its declared area; file-authoritative) and `collisions` (open tickets whose area the diff overlaps, each tagged `direct` = a real overlap or `transitive` = reverse-dep-only, usually safe for additive work). To gate on the exit code without parsing JSON, run `guard --ignore-transitive` (exits 0 unless there's a direct overlap or under-declaration). See `references/parallel-workflow.md` for the resolution playbook (`set --add-scope`, coordinate with the named ticket, or build+test the merge) and the `--direct-only` flag.
 
 4. **Finish or release.** `claim` already set the ticket in-progress; on completion move it forward with `ticketsplease set <id> --status review|done` (setting `done` clears the claim). If you abandon the work, `ticketsplease release <id> --as <worker-id>` drops the claim and restores the pre-claim status (keeping any progress you'd advanced to). Renew a long-running claim by re-running `claim` (it extends your lease; a renewal logs no duplicate event).
 
@@ -86,27 +84,30 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 - `ticketsplease tracks` — conflict-free parallel batches (the headline feature).
 - `ticketsplease why <a> <b>` — explain whether two tickets can co-run, and if not, the exact reason (a shared scope, or one transitively depends on the other). Use it when the scheduler's grouping is surprising.
 - `ticketsplease next [--parallel N] [--allow-overlap]` — scored recommendation(s); the score favours priority, critical-path position, and how much remaining downstream work the ticket unblocks. Picks are scope-disjoint by default; `--allow-overlap` returns the top-N even when scopes overlap, annotating each with the shared scopes so you can judge the file overlap yourself.
-- `ticketsplease list [--status <s>]`, `ticketsplease show <id>`.
+- `ticketsplease list [--status <s>] [--where '<expr>']` — list/filter tickets. `--where` is a boolean expression: `field:value` joined by `AND`/`OR`/`NOT` with parens (fields: status priority tag scope assignee id dep related), e.g. `--where 'tag:epic AND NOT status:done'`. `ticketsplease view save <name> '<expr>'` stores one as a reusable view (then `list --view <name>`). `ticketsplease show <id>`.
+- `ticketsplease rollup [--tag <t> | --where <e> | --view <v>]` — an initiative's dashboard: status & priority counts, % done, the ready frontier, and the blocked set (each with its unmet deps). The one-call "where does this epic stand and what's next in it".
+- `ticketsplease graph [--tag <t>] [--dot]` and `ticketsplease path <id>` — export the dependency DAG (JSON, or Graphviz with `--dot`) and the critical prerequisite path (longest dependency chain) to a ticket.
 - `ticketsplease reconcile` — cross-check the board against git (tkt/* branches + worktrees): flags in-progress tickets with no branch (stale-busy) and live branches whose ticket is still todo/ready (stale-idle), plus orphan branches. Exit 3 on drift. Run it before a dispatch round so the board can be trusted.
 
 ## Creating and editing tickets
 
 ```sh
 ticketsplease create --title "Add vector index" --priority p1 \
-  --scope query/planner --scope storage --depends-on build-index-trait
-ticketsplease create --from backlog.json   # batch (JSON array; - reads stdin); validated all-or-nothing
-ticketsplease set <id> --status in-progress --add-scope core --title "…" --add-path 'src/**' --add-dependency other
-ticketsplease link <id> --depends-on <other-id>   # a cycle is rejected (exit 5); a dangling target is lint's job
+  --scope query/planner --depends-on build-index-trait --related design-doc --template default
+ticketsplease create --from backlog.toml    # batch from a JSON array or TOML [[ticket]] (- reads stdin); all-or-nothing
+ticketsplease set <id> --status in-progress --add-scope core --add-dependency other
+ticketsplease set --where 'tag:epic' --add-tag ready-soon   # bulk-edit every match (field edits only, not title/body)
+ticketsplease link <id> (--depends-on <o> | --related <o>)  # depends-on cycle → exit 5; related is non-blocking, never cycle-checked
 ticketsplease rename <old> <new>            # moves the file, rewrites the id, repoints dependents
 ticketsplease delete <id>                   # remove a ticket (git keeps history)
 ticketsplease lint        # validate schema, scope refs, links, and cycles (exit 3 / 5 on problems)
 ```
 
-Add `--dry-run` to `create`/`set` to preview without writing. Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves everything else — custom frontmatter keys, comments, key order, and the markdown body — byte-for-byte. You can also hand-edit ticket files directly; they are just markdown.
+`dependencies` block scheduling; `related` is a soft, non-blocking "see also" (queryable via `--where related:x`, ignored by `ready`/`tracks`). `--template <name>` scaffolds the body from `.ticketsplease/templates/<name>.md` (seeded by `init`). Add `--dry-run` to `create`/`set` to preview without writing. Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves everything else — custom frontmatter keys, comments, key order, and the markdown body — byte-for-byte. You can also hand-edit ticket files directly; they are just markdown.
 
-Frontmatter schema: `id` (slug, equals the filename), `title`, `status` (todo/ready/in-progress/blocked/review/done), `priority` (p0 highest … p3), `dependencies[]` (ticket ids), `scopes[]` (names from `ticketsplease.toml`), `paths[]` (extra globs), `tags[]`. Claiming additionally manages `assignee` and `lease_expires_at` (epoch seconds) — leave those to `claim`/`release` rather than editing them by hand.
+For the full frontmatter schema and per-field semantics, see `references/commands.md`. One safety rule: claiming manages `assignee` and `lease_expires_at` (epoch seconds) — leave those to `claim`/`release` rather than hand-editing them.
 
 ## Deeper references
 
-- Full command/flag/JSON-shape reference: read `references/commands.md`.
-- Multi-agent orchestration patterns (fan-out, branch naming, merge gating, recovering from a guard failure): read `references/parallel-workflow.md`.
+- **`references/commands.md`** — read when you need exact flag syntax, JSON key names, or a command's per-exit-code behaviour.
+- **`references/parallel-workflow.md`** — read when setting up a multi-worker fan-out, authoring/organizing an initiative (batch create, tag, `rollup`, `graph`), diagnosing a guard failure, or handling cross-clone propagation.

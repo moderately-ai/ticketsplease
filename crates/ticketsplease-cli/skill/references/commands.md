@@ -5,11 +5,15 @@ Global flags (accepted by every command):
 - `--repo <path>` — repository root (default `.`).
 - `--format human|json` — `human` is the default; `json` is the stable, versioned contract. Every JSON payload includes `"schema_version": 1` and is deterministically ordered.
 
-Exit codes: `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` cycle · `6` conflict · `7` timeout (`watch` / `events --watch`).
+Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage · `3` invalid · `4` not found · `5` cycle · `6` conflict · `7` timeout).
 
-## JSON conventions
+## Contents
 
-- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+`init` · `create` · `set` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `lint` · `skill install` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
+
+## Conventions
+
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 - **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
@@ -258,3 +262,7 @@ ticketsplease skill install [--dir .claude/skills]
 ticketsplease self-update [--version vX.Y.Z]
 ```
 `skill install` writes the bundled skill (the version baked into the running binary). `self-update` replaces the binary in place from GitHub Releases.
+
+---
+
+For orchestration patterns and merge-gate recovery (not flag syntax), see `references/parallel-workflow.md`.
