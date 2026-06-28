@@ -1,7 +1,7 @@
 ---
 id: parallel-width-query
 title: "Parallel-width query: how wide can I safely go right now"
-status: todo
+status: done
 priority: p3
 dependencies: [access-intent-scopes]
 related: [overlap-tolerant-tracks-next]

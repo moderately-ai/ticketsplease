@@ -497,6 +497,80 @@ fn longest_dep_chain<'a>(
     chain
 }
 
+/// The safe parallel width: the largest set of *dispatchable* tickets that can run at
+/// once with no pair exceeding `max_overlap` (an orchestrator's "how many workers can
+/// I usefully spin up right now"). Validates the graph first.
+pub fn parallel_width(
+    tickets: &[Ticket],
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> Result<usize> {
+    let graph = Graph::build(tickets)?;
+    let nodes = graph.dispatchable(tickets);
+    Ok(max_compatible_among(&nodes, max_overlap, weights))
+}
+
+/// The largest mutually-compatible subset of `tickets` (every pair's conflict cost
+/// ≤ `max_overlap`) — a maximum independent set in the conflict graph. Exact for a
+/// frontier of ≤ 22 tickets (the normal case); beyond that it falls back to a greedy
+/// lower bound to stay fast.
+#[must_use]
+pub fn max_compatible_among(
+    tickets: &[&Ticket],
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> usize {
+    let n = tickets.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if conflict_cost(tickets[i], tickets[j], weights) > max_overlap {
+                adj[i].insert(j);
+                adj[j].insert(i);
+            }
+        }
+    }
+    if n > 22 {
+        return greedy_independent_set(&adj);
+    }
+    let all: Vec<usize> = (0..n).collect();
+    max_independent_set(&adj, &all)
+}
+
+/// Exact maximum independent set over `remaining` (include/exclude branch-and-bound;
+/// including a vertex drops its neighbours). Fine for the small frontiers it gates.
+fn max_independent_set(adj: &[BTreeSet<usize>], remaining: &[usize]) -> usize {
+    match remaining.split_first() {
+        None => 0,
+        Some((&v, rest)) => {
+            let exclude = max_independent_set(adj, rest);
+            let kept: Vec<usize> = rest
+                .iter()
+                .copied()
+                .filter(|u| !adj[v].contains(u))
+                .collect();
+            let include = 1 + max_independent_set(adj, &kept);
+            include.max(exclude)
+        }
+    }
+}
+
+/// Greedy independent-set lower bound (smallest-degree-first), for large frontiers.
+fn greedy_independent_set(adj: &[BTreeSet<usize>]) -> usize {
+    let mut order: Vec<usize> = (0..adj.len()).collect();
+    order.sort_by_key(|&i| adj[i].len());
+    let mut chosen: Vec<usize> = Vec::new();
+    for v in order {
+        if chosen.iter().all(|&c| !adj[v].contains(&c)) {
+            chosen.push(v);
+        }
+    }
+    chosen.len()
+}
+
 // --- internal graph helpers -------------------------------------------------
 
 fn priority_value(p: Priority) -> i64 {
@@ -739,6 +813,32 @@ mod tests {
         // why agrees: no conflict between two additive claims.
         let pair = vec![t_scoped("a", &[], &["core"]), t_scoped("b", &[], &["core"])];
         assert!(!why(&pair, "a", "b").unwrap().conflict);
+    }
+
+    #[test]
+    fn parallel_width_is_the_max_compatible_set() {
+        let w = BTreeMap::new();
+        let exclusive = vec![
+            t_scoped("a", &["core"], &[]),
+            t_scoped("b", &["core"], &[]),
+            t_scoped("c", &["core"], &[]),
+        ];
+        assert_eq!(
+            parallel_width(&exclusive, 0, &w).unwrap(),
+            1,
+            "all conflict"
+        );
+        assert_eq!(
+            parallel_width(&exclusive, 1, &w).unwrap(),
+            3,
+            "budget frees them"
+        );
+        let disjoint = vec![
+            t_scoped("a", &["x"], &[]),
+            t_scoped("b", &["y"], &[]),
+            t_scoped("c", &["z"], &[]),
+        ];
+        assert_eq!(parallel_width(&disjoint, 0, &w).unwrap(), 3, "disjoint");
     }
 
     #[test]

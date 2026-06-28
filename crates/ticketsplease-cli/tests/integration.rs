@@ -3779,3 +3779,32 @@ fn scope_policy_weight_zero_frees_a_scope() {
         .any(|d| d["code"] == "unknown-scope-policy"));
     tkt(repo).args(["lint"]).assert().code(3);
 }
+
+#[test]
+fn tracks_reports_safe_parallel_width() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    for id in ["a", "b", "c"] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id, "--scope", "core"])
+            .assert()
+            .success();
+    }
+    // All three rewrite core: at most one can run at once.
+    let out = tkt(repo).args(["tracks", "--width"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+    let out = tkt(repo)
+        .args(["tracks", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["width"], 1);
+    // Tolerating overlap widens the safe front to all three.
+    let out = tkt(repo)
+        .args(["tracks", "--width", "--max-overlap", "any"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+}

@@ -666,6 +666,10 @@ pub struct TracksArgs {
     /// let tickets that conflict by ≤ K per pair share a batch; `any` = unbounded.
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// Print only the safe parallel width (largest set runnable at once within the
+    /// budget) — how many workers you can usefully spin up right now.
+    #[arg(long)]
+    pub width: bool,
 }
 
 /// `skill` subcommand group.

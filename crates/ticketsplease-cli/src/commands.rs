@@ -1126,6 +1126,10 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
         .iter()
         .filter(|t| ready_ids.contains(t.id.as_str()))
         .collect();
+    // Safe parallel width within the initiative's ready frontier (default budget).
+    let weights = store.config.scope_weights();
+    let ready_refs: Vec<&Ticket> = ready.iter().map(|t| **t).collect();
+    let width = schedule::max_compatible_among(&ready_refs, 0, &weights);
 
     // Blocked: in the selection, dispatchable-status but with ≥1 dependency not done.
     let status_by_id: BTreeMap<&str, Status> =
@@ -1153,6 +1157,7 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
             "total": total,
             "done": done,
             "percent_done": percent_done,
+            "width": width,
             "by_status": by_status,
             "by_priority": by_priority,
             "ready": ready.iter().map(|t| json!({
@@ -1199,6 +1204,7 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 ready_ids.len(),
                 join_or_none(&ready_ids)
             );
+            println!("  safe parallel width: {width}");
             if blocked.is_empty() {
                 println!("  blocked (0): (none)");
             } else {
@@ -1636,6 +1642,18 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
     let tickets = store.load_all()?;
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
+    // Safe parallel width: the largest set runnable at once within the budget.
+    let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
+    // `--width` is a terse one-number answer for "how many workers can I spin up".
+    if args.width {
+        return match fmt {
+            Format::Json => print_json(&json!({ "schema_version": 1, "width": width })),
+            Format::Human => {
+                println!("{width}");
+                Ok(())
+            }
+        };
+    }
     let mut batches = schedule::tracks(&tickets, max_overlap, &weights)?;
     // --parallel caps each batch to N tickets, splitting larger ones so an orchestrator
     // with N workers gets worker-sized fronts. Chunking preserves the per-pair budget.
@@ -1652,9 +1670,12 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
                 .iter()
                 .map(|b| Value::Array(b.iter().map(|t| ticket_summary(t)).collect()))
                 .collect();
-            print_json(
-                &json!({ "schema_version": 1, "batches": arr, "overlap_cost": overlap_cost }),
-            )
+            print_json(&json!({
+                "schema_version": 1,
+                "batches": arr,
+                "overlap_cost": overlap_cost,
+                "width": width,
+            }))
         }
         Format::Human => {
             if batches.is_empty() {
@@ -1761,7 +1782,13 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
                 .map(|c| c.cost)
                 .sum::<i64>()
                 / 2;
-            print_json(&json!({ "schema_version": 1, "picks": rows, "overlap_cost": overlap_cost }))
+            let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
+            print_json(&json!({
+                "schema_version": 1,
+                "picks": rows,
+                "overlap_cost": overlap_cost,
+                "width": width,
+            }))
         }
         Format::Human => {
             if picks.is_empty() {
