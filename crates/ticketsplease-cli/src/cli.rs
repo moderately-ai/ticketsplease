@@ -29,6 +29,9 @@ pub struct Cli {
 }
 
 /// Top-level subcommands.
+// The variants wrap clap arg structs of uneven size; the enum is parsed once per
+// process, so the size spread is irrelevant and boxing would only fight the derive.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Command {
     /// Initialize ticketsplease in a repository.
@@ -117,8 +120,10 @@ pub struct CreateArgs {
     /// Ticket title (single create). Mutually exclusive with --from.
     #[arg(long)]
     pub title: Option<String>,
-    /// Batch-create from a JSON array of ticket specs; `-` reads stdin. Each element:
-    /// `{title, id?, status?, priority?, depends_on?, scopes?, paths?, tags?, body?}`.
+    /// Batch-create from a JSON array of ticket specs, or a TOML `[[ticket]]`
+    /// document (chosen by `.json`/`.toml` extension; `-` reads stdin as JSON). Each
+    /// spec: `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?,
+    /// tags?, body?}`.
     #[arg(long)]
     pub from: Option<String>,
     /// Explicit id (slug); defaults to a slug of the title.
@@ -156,9 +161,20 @@ pub struct CreateArgs {
 /// `set` arguments.
 #[derive(Args)]
 #[command(group = ArgGroup::new("body_op").multiple(false).args(["body", "body_file", "append_body", "append_body_file"]))]
+#[command(
+    after_help = "Single: pass an id. Bulk: pass --where/--view to edit every matching\n\
+    ticket at once (--title and body edits are single-target only and rejected in bulk)."
+)]
 pub struct SetArgs {
-    /// Ticket id.
-    pub id: String,
+    /// Ticket id (single-ticket edit). Omit when using --where/--view for a bulk edit.
+    pub id: Option<String>,
+    /// Bulk edit: apply the mutations to every ticket matching this `--where`
+    /// expression (see `tkt list` for the grammar).
+    #[arg(long = "where")]
+    pub where_: Option<String>,
+    /// Bulk edit: apply to every ticket matching a saved view (ANDs with --where).
+    #[arg(long)]
+    pub view: Option<String>,
     /// New title.
     #[arg(long)]
     pub title: Option<String>,

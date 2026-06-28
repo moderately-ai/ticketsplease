@@ -241,6 +241,39 @@ struct TicketSpec {
     body: String,
 }
 
+/// The TOML manifest shape: `[[ticket]]` array-of-tables (also accepts `[[tickets]]`).
+/// JSON `--from` is a bare array, so it does not use this wrapper.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    #[serde(default, alias = "tickets")]
+    ticket: Vec<TicketSpec>,
+}
+
+/// Parse a `--from` manifest into ticket specs, accepting a JSON array or a TOML
+/// `[[ticket]]` document. Format is chosen by file extension (`.toml`/`.json`); for
+/// stdin or an extensionless path it sniffs — content starting with `[[` is TOML,
+/// otherwise JSON (the established stdin default).
+fn parse_manifest(from: &str, raw: &str) -> Result<Vec<TicketSpec>> {
+    let is_toml =
+        from.ends_with(".toml") || (!from.ends_with(".json") && raw.trim_start().starts_with("[["));
+    if is_toml {
+        toml::from_str::<Manifest>(raw)
+            .map(|m| m.ticket)
+            .map_err(|e| {
+                Error::Invalid(format!(
+                    "invalid --from TOML (expected [[ticket]] tables): {e}"
+                ))
+            })
+    } else {
+        serde_json::from_str(raw).map_err(|e| {
+            Error::Invalid(format!(
+                "invalid --from JSON (expected an array of ticket specs): {e}"
+            ))
+        })
+    }
+}
+
 /// A batch spec with its fields parsed once (shared by the validate and write passes).
 struct ParsedSpec {
     id: Option<String>,
@@ -280,11 +313,7 @@ impl ParsedSpec {
 /// and the result reports created vs unchanged per element.
 fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result<()> {
     let raw = read_text(from)?;
-    let raw_specs: Vec<TicketSpec> = serde_json::from_str(&raw).map_err(|e| {
-        Error::Invalid(format!(
-            "invalid --from JSON (expected an array of ticket specs): {e}"
-        ))
-    })?;
+    let raw_specs = parse_manifest(from, &raw)?;
 
     // Parse every element up front so a bad status/priority aborts before any write.
     let specs: Vec<ParsedSpec> = raw_specs
@@ -362,13 +391,27 @@ fn parse_field<T: std::str::FromStr<Err = Error>>(value: &str, index: usize) -> 
         .map_err(|e: Error| Error::Invalid(format!("element {index}: {}", e.message())))
 }
 
-/// `set` — surgically update a ticket's fields.
+/// `set` — surgically update a ticket's fields. With an `id`, edits one ticket;
+/// with `--where`/`--view`, edits every matching ticket in one operation.
 pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let mut ticket = store.load(&args.id)?;
-    let before = ticket.render();
-    let status_before = ticket.status;
+    let bulk = args.where_.is_some() || args.view.is_some();
+    match (&args.id, bulk) {
+        (Some(_), true) => Err(Error::Invalid(
+            "pass either an id or --where/--view, not both".into(),
+        )),
+        (None, false) => Err(Error::Invalid(
+            "provide a ticket id, or --where/--view for a bulk edit".into(),
+        )),
+        (Some(_), false) => set_single(&store, fmt, args),
+        (None, true) => set_bulk(repo, &store, fmt, args),
+    }
+}
 
+/// Apply the field mutations shared by single and bulk `set`, returning whether any
+/// dependency was added (so the caller runs one cycle check). `--title` and body
+/// edits are single-target only and are handled by [`set_single`], not here.
+fn apply_set_field_mutations(ticket: &mut Ticket, args: &SetArgs) -> Result<bool> {
     if let Some(title) = &args.title {
         ticket.set_title(title)?;
     }
@@ -415,6 +458,17 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     for rel in norm_list(&args.remove_related) {
         ticket.remove_related(&rel)?;
     }
+    Ok(deps_added)
+}
+
+/// Single-ticket `set` (an explicit id). Body edits and title apply here.
+fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
+    let id = args.id.as_deref().expect("single set has an id");
+    let mut ticket = store.load(id)?;
+    let before = ticket.render();
+    let status_before = ticket.status;
+
+    let deps_added = apply_set_field_mutations(&mut ticket, args)?;
     // Reject a dependency edit that would close a cycle, exactly like `link`. Related
     // links carry no ordering, so they need no cycle check.
     if deps_added {
@@ -467,6 +521,90 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
                 (false, _) => "No change to",
             };
             println!("{verb} `{}`", ticket.id);
+            Ok(())
+        }
+    }
+}
+
+/// Bulk `set` (`--where`/`--view`): apply field mutations to every matching ticket.
+/// Field edits only — `--title` and body edits are single-target and rejected here.
+/// A single cycle check runs over the whole updated set after all edits.
+fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
+    if args.title.is_some() {
+        return Err(Error::Invalid(
+            "--title is single-ticket only (it would set the same title on every match)".into(),
+        ));
+    }
+    if args.body.is_some()
+        || args.body_file.is_some()
+        || args.append_body.is_some()
+        || args.append_body_file.is_some()
+    {
+        return Err(Error::Invalid(
+            "body edits are single-ticket only; not allowed with --where/--view".into(),
+        ));
+    }
+    let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?
+        .ok_or_else(|| Error::Invalid("bulk set requires --where or --view".into()))?;
+
+    let mut all = store.load_all()?;
+    let mut any_deps_added = false;
+    let mut to_save: Vec<usize> = Vec::new();
+    let mut events: Vec<(String, Status, Status)> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
+    for (i, ticket) in all.iter_mut().enumerate() {
+        if !predicate.matches(ticket) {
+            continue;
+        }
+        let before = ticket.render();
+        let status_before = ticket.status;
+        any_deps_added |= apply_set_field_mutations(ticket, args)?;
+        if ticket.status == Status::Done {
+            ticket.clear_lease();
+        }
+        let changed = ticket.render() != before;
+        results.push(json!({ "id": ticket.id, "changed": changed }));
+        if changed {
+            to_save.push(i);
+            if ticket.status != status_before {
+                events.push((ticket.id.clone(), status_before, ticket.status));
+            }
+        }
+    }
+    // One cycle check over the whole edited set, mirroring single `set`/`link`.
+    if any_deps_added {
+        schedule::ensure_acyclic(&all)?;
+    }
+    if !args.dry_run {
+        for &i in &to_save {
+            store.save(&all[i])?;
+        }
+        for (id, from, to) in &events {
+            let _ = store.emit_event(
+                "status",
+                id,
+                None,
+                json!({ "status": to.as_str(), "from": from.as_str() }),
+            );
+        }
+    }
+
+    let matched = results.len();
+    let changed_count = to_save.len();
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "matched": matched,
+            "results": results,
+            "dry_run": args.dry_run,
+        })),
+        Format::Human => {
+            let verb = if args.dry_run {
+                "would update"
+            } else {
+                "updated"
+            };
+            println!("{matched} matched, {changed_count} {verb}");
             Ok(())
         }
     }

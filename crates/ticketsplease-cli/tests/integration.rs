@@ -3174,3 +3174,128 @@ fn saved_views_round_trip_and_resolve_in_list() {
         .assert()
         .code(4);
 }
+
+#[test]
+fn bulk_set_where_edits_every_match() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    for id in ["a", "b", "c"] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id, "--tag", "epic"])
+            .assert()
+            .success();
+    }
+    // `c` is not in the epic; only a and b should be touched.
+    tkt(repo)
+        .args(["set", "c", "--remove-tag", "epic"])
+        .assert()
+        .success();
+
+    // Dry-run reports matches but writes nothing.
+    let out = tkt(repo)
+        .args([
+            "set",
+            "--where",
+            "tag:epic",
+            "--add-tag",
+            "ready-soon",
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matched"], 2);
+    assert_eq!(v["dry_run"], true);
+    let listed = list_ids_where(repo, "tag:ready-soon");
+    assert!(listed.is_empty(), "dry-run wrote nothing: {listed:?}");
+
+    // Real bulk edit: status + tag on every epic ticket.
+    let out = tkt(repo)
+        .args([
+            "set",
+            "--where",
+            "tag:epic",
+            "--status",
+            "review",
+            "--add-tag",
+            "swept",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matched"], 2);
+    let changed = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["changed"] == true)
+        .count();
+    assert_eq!(changed, 2);
+    let mut swept = list_ids_where(repo, "tag:swept AND status:review");
+    swept.sort();
+    assert_eq!(swept, vec!["a", "b"]);
+
+    // Bulk rejects single-target-only edits.
+    tkt(repo)
+        .args(["set", "--where", "tag:epic", "--title", "nope"])
+        .assert()
+        .code(3);
+    tkt(repo)
+        .args(["set", "--where", "tag:epic", "--body", "nope"])
+        .assert()
+        .code(3);
+    // id and --where are mutually exclusive; neither is an error too.
+    tkt(repo)
+        .args(["set", "a", "--where", "tag:epic", "--add-tag", "x"])
+        .assert()
+        .code(3);
+    tkt(repo).args(["set", "--add-tag", "x"]).assert().code(3);
+}
+
+#[test]
+fn create_from_toml_manifest_and_stdin_sniff() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    // A TOML manifest with [[ticket]] tables, including related + a dependency.
+    let manifest = repo.join("backlog.toml");
+    std::fs::write(
+        &manifest,
+        "[[ticket]]\nid = \"base\"\ntitle = \"Base\"\n\n\
+         [[ticket]]\nid = \"feat\"\ntitle = \"Feature\"\ndepends_on = [\"base\"]\nrelated = [\"base\"]\ntags = [\"epic\"]\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["create", "--from", manifest.to_str().unwrap()])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["show", "feat", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dependencies"][0], "base");
+    assert_eq!(v["related"][0], "base");
+
+    // stdin starting with `[[` is sniffed as TOML even without an extension.
+    tkt(repo)
+        .args(["create", "--from", "-"])
+        .write_stdin("[[ticket]]\nid = \"from-stdin\"\ntitle = \"Stdin TOML\"\n")
+        .assert()
+        .success();
+    tkt(repo).args(["show", "from-stdin"]).assert().success();
+
+    // A bad TOML manifest fails loudly (exit 3).
+    let bad = repo.join("bad.toml");
+    std::fs::write(&bad, "[[ticket]]\nid = \"x\"\n").unwrap(); // missing required title
+    tkt(repo)
+        .args(["create", "--from", bad.to_str().unwrap()])
+        .assert()
+        .code(3);
+}

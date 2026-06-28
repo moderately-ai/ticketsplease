@@ -716,6 +716,7 @@ dependencies = [
  "tempfile",
  "ticketsplease-cargo",
  "ticketsplease-core",
+ "toml",
 ]
 
 [[package]]

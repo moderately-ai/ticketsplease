@@ -33,14 +33,15 @@ ticketsplease create --from <file|-> [--dry-run]
 ```
 Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
-`--from` batch-creates from a JSON array of specs (`-` reads stdin); each element is `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?, tags?, body?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?, tags?, body?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
 ## set
 
 ```
-ticketsplease set <id> [--title <s>] [--status <s>] [--priority <p>]
+ticketsplease set (<id> | --where <expr> | --view <name>)
+                       [--title <s>] [--status <s>] [--priority <p>]
                        [--add-scope a,b] [--remove-scope c] [--add-tag t] [--remove-tag u]
                        [--add-path 'glob'] [--remove-path 'glob']
                        [--add-dependency d] [--remove-dependency e]
@@ -49,7 +50,10 @@ ticketsplease set <id> [--title <s>] [--status <s>] [--priority <p>]
 ```
 Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. Setting status `done` clears the claim (assignee + lease). `--dry-run` previews without writing.
 
-JSON: `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
+**Single vs bulk:** pass an `id` to edit one ticket, or `--where`/`--view` to edit **every matching ticket** in one operation (exactly one of the two; passing both, or neither, is exit 3). Bulk applies field edits only — `--title` and the body edits are single-target and rejected with `--where`/`--view`. A single cycle check runs over the whole edited set after all dependency edits.
+
+Single JSON: `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
+Bulk JSON: `{ "schema_version", "matched": N, "results": [ {id, changed: bool} ], "dry_run": bool }`.
 
 ## link
 
