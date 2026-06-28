@@ -497,6 +497,7 @@ mod tests {
             status.parse().unwrap(),
             "p2".parse().unwrap(),
             &[],
+            &[],
             &sc,
             &[],
             &[],

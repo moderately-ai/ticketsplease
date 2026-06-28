@@ -151,6 +151,10 @@ pub struct Ticket {
     pub priority: Priority,
     /// IDs of tickets this one depends on.
     pub dependencies: Vec<String>,
+    /// IDs of thematically-related tickets. A soft, non-blocking cross-reference:
+    /// recorded structurally (queryable, graphable) but ignored by readiness,
+    /// `tracks`, and cycle detection — unlike `dependencies`, which gate scheduling.
+    pub related: Vec<String>,
     /// Abstract scope names this ticket declares.
     pub scopes: Vec<String>,
     /// Explicit path globs (augment `scopes`).
@@ -200,6 +204,7 @@ impl Ticket {
             status,
             priority,
             dependencies: string_list(y, "dependencies"),
+            related: string_list(y, "related"),
             scopes: string_list(y, "scopes"),
             paths: string_list(y, "paths"),
             tags: string_list(y, "tags"),
@@ -300,6 +305,26 @@ impl Ticket {
         let changed = self.doc.remove_list_item("dependencies", id)?;
         if changed {
             self.dependencies.retain(|d| d != id);
+        }
+        Ok(changed)
+    }
+
+    /// Add a non-blocking related link (idempotent). Returns whether anything
+    /// changed. Unlike a dependency, this is never cycle-checked — related links
+    /// carry no ordering, so a cycle among them is harmless.
+    pub fn add_related(&mut self, id: &str) -> Result<bool> {
+        let changed = self.doc.add_list_item("related", id)?;
+        if changed {
+            self.related.push(id.to_string());
+        }
+        Ok(changed)
+    }
+
+    /// Remove a related link (idempotent). Returns whether anything changed.
+    pub fn remove_related(&mut self, id: &str) -> Result<bool> {
+        let changed = self.doc.remove_list_item("related", id)?;
+        if changed {
+            self.related.retain(|r| r != id);
         }
         Ok(changed)
     }
@@ -407,6 +432,7 @@ impl Ticket {
         status: Status,
         priority: Priority,
         dependencies: &[String],
+        related: &[String],
         scopes: &[String],
         paths: &[String],
         tags: &[String],
@@ -423,6 +449,7 @@ impl Ticket {
             "dependencies: {}\n",
             render_inline_list(dependencies)
         ));
+        s.push_str(&format!("related: {}\n", render_inline_list(related)));
         s.push_str(&format!("scopes: {}\n", render_inline_list(scopes)));
         s.push_str(&format!("paths: {}\n", render_inline_list(paths)));
         s.push_str(&format!("tags: {}\n", render_inline_list(tags)));
@@ -505,6 +532,41 @@ mod tests {
         let again = Ticket::parse(&out).unwrap();
         assert_eq!(again.status, Status::Done);
         assert_eq!(again.dependencies, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn related_is_a_separate_list_from_dependencies() {
+        let raw = "---\nid: foo\ntitle: T\ndependencies: [a]\nrelated: [b, c]\n---\n";
+        let t = Ticket::parse(raw).unwrap();
+        assert_eq!(t.dependencies, vec!["a"]);
+        assert_eq!(t.related, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn new_renders_related_inline_and_round_trips() {
+        let t = Ticket::new(
+            "foo",
+            "T",
+            Status::Todo,
+            Priority::P2,
+            &["a".into()],
+            &["b".into()],
+            &[],
+            &[],
+            &[],
+            "",
+        )
+        .unwrap();
+        let out = t.render();
+        assert!(out.contains("dependencies: [a]\n"));
+        assert!(out.contains("related: [b]\n"));
+        // Mutators stay inline because the key already exists from `new`.
+        let mut t = Ticket::parse(&out).unwrap();
+        assert!(t.add_related("c").unwrap());
+        assert!(!t.add_related("c").unwrap(), "idempotent");
+        assert!(t.render().contains("related: [b, c]\n"));
+        assert!(t.remove_related("b").unwrap());
+        assert_eq!(Ticket::parse(&t.render()).unwrap().related, vec!["c"]);
     }
 
     #[test]

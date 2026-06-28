@@ -248,6 +248,18 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
                 });
             }
         }
+        // Related links are non-blocking (no ordering), so a dangling one is a typo
+        // to surface but never a cycle — only existence is checked.
+        for r in &t.related {
+            if !by_id.contains_key(r.as_str()) {
+                out.push(Diagnostic {
+                    file: format!("{}.md", t.id),
+                    id: Some(t.id.clone()),
+                    code: "missing-related",
+                    message: format!("related to missing ticket `{r}`"),
+                });
+            }
+        }
     }
     if let Some(cycle) = find_cycle(&by_id) {
         out.push(Diagnostic {
@@ -473,7 +485,27 @@ mod tests {
             status.parse().unwrap(),
             priority.parse().unwrap(),
             &d,
+            &[],
             &sc,
+            &[],
+            &[],
+            "",
+        )
+        .unwrap()
+    }
+
+    /// Build a ticket with explicit related links (for the non-blocking tests).
+    fn t_rel(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Ticket {
+        let d: Vec<String> = deps.iter().map(|s| (*s).to_string()).collect();
+        let r: Vec<String> = related.iter().map(|s| (*s).to_string()).collect();
+        Ticket::new(
+            id,
+            id,
+            status.parse().unwrap(),
+            "p2".parse().unwrap(),
+            &d,
+            &r,
+            &[],
             &[],
             &[],
             "",
@@ -507,6 +539,39 @@ mod tests {
     fn dangling_dependency_is_an_error() {
         let tickets = vec![t("a", "todo", "p2", &["ghost"], &[])];
         assert!(ready(&tickets).is_err());
+    }
+
+    #[test]
+    fn related_links_do_not_block_or_cycle() {
+        // `a` relates to `b` (not done) and they relate to each other (a cycle in the
+        // related graph). Neither blocks readiness, and no cycle is reported.
+        let tickets = vec![
+            t_rel("a", "todo", &[], &["b"]),
+            t_rel("b", "in-progress", &[], &["a"]),
+        ];
+        let ids: Vec<&str> = ready(&tickets)
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["a"],
+            "a is ready despite relating to a non-done ticket"
+        );
+        assert!(
+            !link_diagnostics(&tickets).iter().any(|d| d.code == "cycle"),
+            "a related cycle is not a dependency cycle"
+        );
+    }
+
+    #[test]
+    fn link_diagnostics_flags_missing_related() {
+        let tickets = vec![t_rel("a", "todo", &[], &["ghost"])];
+        let diags = link_diagnostics(&tickets);
+        assert!(diags
+            .iter()
+            .any(|d| d.code == "missing-related" && d.message.contains("ghost")));
     }
 
     #[test]

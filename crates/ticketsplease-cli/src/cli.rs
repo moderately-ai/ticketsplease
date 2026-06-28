@@ -131,6 +131,9 @@ pub struct CreateArgs {
     /// Dependency ticket ids (repeatable or comma-separated).
     #[arg(long = "depends-on", value_delimiter = ',')]
     pub depends_on: Vec<String>,
+    /// Non-blocking related ticket ids (repeatable or comma-separated).
+    #[arg(long = "related", value_delimiter = ',')]
+    pub related: Vec<String>,
     /// Declared scope names (repeatable or comma-separated).
     #[arg(long = "scope", value_delimiter = ',')]
     pub scopes: Vec<String>,
@@ -188,6 +191,12 @@ pub struct SetArgs {
     /// Dependencies to remove (repeatable or comma-separated).
     #[arg(long = "remove-dependency", value_delimiter = ',')]
     pub remove_dependency: Vec<String>,
+    /// Non-blocking related links to add (repeatable or comma-separated).
+    #[arg(long = "add-related", value_delimiter = ',')]
+    pub add_related: Vec<String>,
+    /// Non-blocking related links to remove (repeatable or comma-separated).
+    #[arg(long = "remove-related", value_delimiter = ',')]
+    pub remove_related: Vec<String>,
     /// Replace the body with this text (markdown bullets are fine).
     #[arg(long, allow_hyphen_values = true)]
     pub body: Option<String>,
@@ -208,12 +217,17 @@ pub struct SetArgs {
 
 /// `link` arguments.
 #[derive(Args)]
+#[command(group = ArgGroup::new("link_target").required(true).multiple(false).args(["depends_on", "related"]))]
 pub struct LinkArgs {
-    /// Ticket that gains (or loses) a dependency.
+    /// Ticket that gains (or loses) a link.
     pub id: String,
-    /// The dependency target id.
+    /// Add/remove a hard dependency (blocks scheduling; cycle-checked).
     #[arg(long = "depends-on")]
-    pub depends_on: String,
+    pub depends_on: Option<String>,
+    /// Add/remove a soft, non-blocking related link (ignored by scheduling; never
+    /// cycle-checked).
+    #[arg(long)]
+    pub related: Option<String>,
     /// Remove the link instead of adding it.
     #[arg(long)]
     pub remove: bool,

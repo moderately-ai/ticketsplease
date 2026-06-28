@@ -2873,3 +2873,105 @@ fn reconcile_clean_when_consistent() {
     git(repo, &["branch", "tkt/x"]); // x in-progress WITH a branch -> consistent
     tkt(repo).args(["reconcile"]).assert().success();
 }
+
+#[test]
+fn related_links_are_non_blocking_and_queryable() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // `a` is created relating to `b`; `b` is created later and depends on a never-done
+    // ticket, so it is NOT ready — but that must not hold `a` back.
+    tkt(repo)
+        .args(["create", "--id", "blocker", "--title", "Blocker"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--related", "b"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "b",
+            "--title",
+            "B",
+            "--depends-on",
+            "blocker",
+        ])
+        .assert()
+        .success();
+    // `a` relates to `b` (not done) yet is still dispatchable.
+    assert!(ready_ids(repo).contains(&"a".to_string()));
+
+    // `link --related` and `set --add-related` both record without cycle-checking,
+    // even when it forms a related cycle (b -> a while a -> b).
+    tkt(repo)
+        .args(["link", "b", "--related", "a"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "a", "--add-related", "blocker"])
+        .assert()
+        .success();
+
+    // The field surfaces in JSON and is queryable; a related cycle lints clean.
+    let out = tkt(repo)
+        .args(["show", "a", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let related: Vec<&str> = v["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(related.contains(&"b") && related.contains(&"blocker"));
+    tkt(repo).args(["lint"]).assert().success();
+
+    // A self-relation is rejected, and a dangling related target is a lint finding
+    // (exit 3) — but not a cycle.
+    tkt(repo)
+        .args(["set", "a", "--add-related", "a"])
+        .assert()
+        .code(3);
+    tkt(repo)
+        .args(["link", "a", "--related", "ghost"])
+        .assert()
+        .success();
+    tkt(repo).args(["lint"]).assert().code(3);
+}
+
+#[test]
+fn related_tickets_share_a_track_when_scopes_disjoint() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--scope",
+            "core",
+            "--related",
+            "b",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "io"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["tracks", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // related (unlike a dependency) imposes no ordering: disjoint scopes -> one batch.
+    assert_eq!(v["batches"].as_array().unwrap().len(), 1);
+}

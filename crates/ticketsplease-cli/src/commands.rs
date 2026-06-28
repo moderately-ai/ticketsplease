@@ -114,6 +114,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let status: Status = args.status.parse()?;
     let priority: Priority = args.priority.parse()?;
     let depends_on = norm_list(&args.depends_on);
+    let related = norm_list(&args.related);
     let scopes = norm_list(&args.scopes);
     let paths = norm_list(&args.paths);
     let tags = norm_list(&args.tags);
@@ -125,6 +126,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
             status,
             priority,
             &depends_on,
+            &related,
             &scopes,
             &paths,
             &tags,
@@ -227,6 +229,8 @@ struct TicketSpec {
     #[serde(default, alias = "dependencies")]
     depends_on: Vec<String>,
     #[serde(default)]
+    related: Vec<String>,
+    #[serde(default)]
     scopes: Vec<String>,
     #[serde(default)]
     paths: Vec<String>,
@@ -243,6 +247,7 @@ struct ParsedSpec {
     status: Status,
     priority: Priority,
     depends_on: Vec<String>,
+    related: Vec<String>,
     scopes: Vec<String>,
     paths: Vec<String>,
     tags: Vec<String>,
@@ -258,6 +263,7 @@ impl ParsedSpec {
             self.status,
             self.priority,
             &self.depends_on,
+            &self.related,
             &self.scopes,
             &self.paths,
             &self.tags,
@@ -290,6 +296,7 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
                 id: s.id,
                 title: s.title,
                 depends_on: norm_list(&s.depends_on),
+                related: norm_list(&s.related),
                 scopes: norm_list(&s.scopes),
                 paths: norm_list(&s.paths),
                 tags: norm_list(&s.tags),
@@ -398,7 +405,17 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     for dep in norm_list(&args.remove_dependency) {
         ticket.remove_dependency(&dep)?;
     }
-    // Reject a dependency edit that would close a cycle, exactly like `link`.
+    for rel in norm_list(&args.add_related) {
+        if rel == ticket.id {
+            return Err(Error::Invalid("a ticket cannot relate to itself".into()));
+        }
+        ticket.add_related(&rel)?;
+    }
+    for rel in norm_list(&args.remove_related) {
+        ticket.remove_related(&rel)?;
+    }
+    // Reject a dependency edit that would close a cycle, exactly like `link`. Related
+    // links carry no ordering, so they need no cycle check.
     if deps_added {
         let mut all = store.load_all()?;
         if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
@@ -454,27 +471,41 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
     }
 }
 
-/// `link` — add or remove a dependency edge.
+/// `link` — add or remove a link between tickets. `--depends-on` is a hard,
+/// cycle-checked dependency; `--related` is a soft, non-blocking cross-reference
+/// that scheduling ignores (and so is never cycle-checked). The CLI arg-group
+/// guarantees exactly one target is set.
 pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
-    if args.id == args.depends_on {
-        return Err(Error::Invalid("a ticket cannot depend on itself".into()));
+    let related = args.related.is_some();
+    let target = args
+        .depends_on
+        .as_deref()
+        .or(args.related.as_deref())
+        .ok_or_else(|| Error::Invalid("provide --depends-on or --related".into()))?;
+    let kind = if related { "related" } else { "dependency" };
+    if args.id == target {
+        return Err(Error::Invalid(format!(
+            "a ticket cannot {kind}-link to itself"
+        )));
     }
     let store = Store::open(repo)?;
     let mut ticket = store.load(&args.id)?;
 
-    let changed = if args.remove {
-        // Removal never validates the target: a dangling reference (its ticket was
-        // deleted) must be cleanable without hand-editing the file.
-        ticket.remove_dependency(&args.depends_on)?
-    } else {
-        ticket.add_dependency(&args.depends_on)?
+    // Removal never validates the target: a dangling reference (its ticket was
+    // deleted) must be cleanable without hand-editing the file.
+    let changed = match (related, args.remove) {
+        (false, false) => ticket.add_dependency(target)?,
+        (false, true) => ticket.remove_dependency(target)?,
+        (true, false) => ticket.add_related(target)?,
+        (true, true) => ticket.remove_related(target)?,
     };
 
-    // Adding an edge that closes a dependency cycle is rejected here (exit 5) rather
+    // Adding a dependency edge that closes a cycle is rejected here (exit 5) rather
     // than left to corrupt the graph until `ready`/`tracks`/`next` trips over it. A
     // dangling target is permitted, mirroring `create --depends-on` — `lint` reports
-    // both dangling deps and cycles on the parseable set.
-    if changed && !args.remove {
+    // both dangling deps and cycles on the parseable set. Related links carry no
+    // ordering, so they are never cycle-checked.
+    if changed && !related && !args.remove {
         let mut all = store.load_all()?;
         if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
             *slot = ticket.clone();
@@ -487,17 +518,27 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
     }
 
     match fmt {
-        Format::Json => print_json(&json!({
-            "schema_version": 1,
-            "id": ticket.id,
-            "depends_on": args.depends_on,
-            "removed": args.remove,
-            "changed": changed,
-        })),
+        // Keep the established `depends_on` key for the dependency path; the related
+        // path reports a `related` key instead (additive — no key is repurposed).
+        Format::Json => {
+            let key = if related { "related" } else { "depends_on" };
+            print_json(&json!({
+                "schema_version": 1,
+                "id": ticket.id,
+                key: target,
+                "removed": args.remove,
+                "changed": changed,
+            }))
+        }
         Format::Human => {
-            let verb = if args.remove { "Unlinked" } else { "Linked" };
+            let verb = match (args.remove, related) {
+                (false, false) => "Linked",
+                (true, false) => "Unlinked",
+                (false, true) => "Related",
+                (true, true) => "Unrelated",
+            };
             let note = if changed { "" } else { " (no change)" };
-            println!("{verb} `{}` -> `{}`{note}", ticket.id, args.depends_on);
+            println!("{verb} `{}` -> `{target}`{note}", ticket.id);
             Ok(())
         }
     }
@@ -530,6 +571,7 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
                 }
             };
             line("deps:    ", &ticket.dependencies);
+            line("related: ", &ticket.related);
             line("scopes:  ", &ticket.scopes);
             line("paths:   ", &ticket.paths);
             line("tags:    ", &ticket.tags);
@@ -2053,6 +2095,7 @@ fn ticket_summary(ticket: &Ticket) -> Value {
         "scopes": ticket.scopes,
         "paths": ticket.paths,
         "dependencies": ticket.dependencies,
+        "related": ticket.related,
         "tags": ticket.tags,
     })
 }
@@ -2065,6 +2108,7 @@ fn ticket_json(ticket: &Ticket) -> Value {
         "status": ticket.status.as_str(),
         "priority": ticket.priority.as_str(),
         "dependencies": ticket.dependencies,
+        "related": ticket.related,
         "scopes": ticket.scopes,
         "paths": ticket.paths,
         "tags": ticket.tags,

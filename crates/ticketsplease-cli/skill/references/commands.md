@@ -12,6 +12,7 @@ Exit codes: `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` cyc
 - **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
+- **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
 
 ## init
 
@@ -26,12 +27,13 @@ JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "gi
 
 ```
 ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3]
-                      [--depends-on a,b] [--scope x,y] [--path 'glob'] [--tag t] [--body <s>] [--dry-run]
+                      [--depends-on a,b] [--related c,d] [--scope x,y] [--path 'glob'] [--tag t]
+                      [--body <s>] [--dry-run]
 ticketsplease create --from <file|-> [--dry-run]
 ```
 Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
-`--from` batch-creates from a JSON array of specs (`-` reads stdin); each element is `{title, id?, status?, priority?, depends_on?, scopes?, paths?, tags?, body?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+`--from` batch-creates from a JSON array of specs (`-` reads stdin); each element is `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?, tags?, body?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
@@ -42,20 +44,21 @@ ticketsplease set <id> [--title <s>] [--status <s>] [--priority <p>]
                        [--add-scope a,b] [--remove-scope c] [--add-tag t] [--remove-tag u]
                        [--add-path 'glob'] [--remove-path 'glob']
                        [--add-dependency d] [--remove-dependency e]
+                       [--add-related r] [--remove-related s]
                        [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run]
 ```
-Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`. Setting status `done` clears the claim (assignee + lease). `--dry-run` previews without writing.
+Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. Setting status `done` clears the claim (assignee + lease). `--dry-run` previews without writing.
 
 JSON: `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 
 ## link
 
 ```
-ticketsplease link <id> --depends-on <other> [--remove]
+ticketsplease link <id> (--depends-on <other> | --related <other>) [--remove]
 ```
-Adds (or with `--remove`, removes) a dependency edge. A dangling target is **permitted** (lint reports it) — consistent with `create --depends-on`; only an edge that closes a **cycle** is rejected at write time (exit 5). `--remove` never validates the target, so a dependency on a deleted ticket can be cleaned. Self-dependencies are rejected (exit 3).
+Adds (or with `--remove`, removes) a link. `--depends-on` is a hard, cycle-checked **dependency** edge; `--related` is a soft, non-blocking cross-reference that scheduling ignores (and so is never cycle-checked). Exactly one of the two is required. A dangling target is **permitted** (lint reports it as `missing-dep`/`missing-related`) — consistent with `create`; only a dependency edge that closes a **cycle** is rejected at write time (exit 5). `--remove` never validates the target, so a link to a deleted ticket can be cleaned. A self-link is rejected (exit 3).
 
-JSON: `{ "schema_version", "id", "depends_on", "removed", "changed" }`.
+JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`.
 
 ## show / list
 
@@ -202,7 +205,7 @@ ticketsplease guide
 ```
 ticketsplease lint
 ```
-Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists), links (dangling dependencies), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `duplicate-id` | `missing-dep` | `cycle`).
+Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists), links (dangling dependencies and dangling related links), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `duplicate-id` | `missing-dep` | `missing-related` | `cycle`). A dangling `related` is flagged but a `related` cycle is never an error.
 
 JSON: `{ "schema_version", "ok": bool, "diagnostics": [ {file, id, code, message} ] }`.
 

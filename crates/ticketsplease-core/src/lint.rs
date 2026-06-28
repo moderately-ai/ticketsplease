@@ -19,7 +19,7 @@ pub struct Diagnostic {
     /// The ticket id, when parseable.
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
-    /// `unknown-scope` | `duplicate-id` | `missing-dep` | `cycle`.
+    /// `unknown-scope` | `duplicate-id` | `missing-dep` | `missing-related` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,

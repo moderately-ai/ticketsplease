@@ -62,7 +62,8 @@ id: add-vector-index          # slug; equals the filename
 title: Add vector index
 status: todo                  # todo | ready | in-progress | blocked | review | done
 priority: p1                  # p0 (highest) .. p3
-dependencies: [build-index-trait]
+dependencies: [build-index-trait]   # hard, scheduling-blocking; cycle-checked
+related: []                   # soft "see also"; ignored by scheduling
 scopes: [query/planner]       # abstract area names defined in ticketsplease.toml
 paths: []                     # extra explicit globs
 tags: []
