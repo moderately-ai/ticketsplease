@@ -725,8 +725,12 @@ pub struct SkillArgs {
 /// Subcommands under `skill`.
 #[derive(Subcommand)]
 pub enum SkillCommand {
-    /// Write the bundled skill into `.claude/skills/ticketsplease/`.
+    /// Link this project's `.claude/skills/ticketsplease` to the canonical skill copy
+    /// (or, with `--copy`, write a committable real copy).
     Install(SkillInstallArgs),
+    /// Refresh the canonical skill copy from this binary (run by the installer; no repo
+    /// needed). Every linked project then sees the update.
+    Sync,
 }
 
 /// `skill install` arguments.
@@ -735,6 +739,9 @@ pub struct SkillInstallArgs {
     /// Base directory to install the skill under (default `.claude/skills`).
     #[arg(long, default_value = ".claude/skills")]
     pub dir: String,
+    /// Write a committable real copy instead of a symlink to the canonical copy.
+    #[arg(long)]
+    pub copy: bool,
 }
 
 /// Dispatch a parsed CLI invocation.
@@ -782,6 +789,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Migrate(_) => commands::migrate(repo, fmt),
         Command::Skill(a) => match &a.command {
             SkillCommand::Install(a) => commands::skill_install(repo, fmt, a),
+            SkillCommand::Sync => commands::skill_sync(fmt),
         },
         Command::SelfUpdate(a) => commands::self_update(fmt, a),
     }

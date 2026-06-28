@@ -37,14 +37,14 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
     let config_body = build_config(repo, &args.dir);
     let outcome = store::init_repo(repo, &args.dir, &config_body, args.force)?;
     let dir = outcome.tickets_dir.display().to_string();
+    // Link the project to the canonical skill copy (a self-update refreshes it for
+    // every linked project). The symlink is local, so gitignore it rather than commit.
     let skill_path = if args.no_skill {
         None
     } else {
-        Some(
-            skill::install(repo, ".claude/skills")?
-                .display()
-                .to_string(),
-        )
+        let link = skill::link_into(repo, ".claude/skills")?;
+        ensure_gitignored(repo, ".claude/skills/ticketsplease")?;
+        Some(link.display().to_string())
     };
     // Seed the example body templates so `create --template` has something to use and
     // the house convention is discoverable.
@@ -65,7 +65,7 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
                 println!("(config already present; left unchanged)");
             }
             if let Some(path) = &skill_path {
-                println!("Installed Claude skill to {path}");
+                println!("Linked Claude skill at {path} (-> canonical copy)");
             }
             println!("Seeded body templates to {templates_path}");
             println!("\nNext steps:");
@@ -83,17 +83,69 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
     }
 }
 
-/// `skill install` — write the bundled Claude skill into the repo.
+/// `skill install` — link this project to the canonical skill (default) or, with
+/// `--copy`, write a committable real copy.
 pub fn skill_install(repo: &Path, fmt: Format, args: &SkillInstallArgs) -> Result<()> {
-    let target = skill::install(repo, &args.dir)?;
+    let (target, linked) = if args.copy {
+        (skill::copy_into(repo, &args.dir)?, false)
+    } else {
+        let link = skill::link_into(repo, &args.dir)?;
+        ensure_gitignored(repo, &format!("{}/ticketsplease", args.dir))?;
+        (link, true)
+    };
     let path = target.display().to_string();
     match fmt {
-        Format::Json => print_json(&json!({ "schema_version": 1, "installed": path })),
+        Format::Json => {
+            print_json(&json!({ "schema_version": 1, "installed": path, "linked": linked }))
+        }
         Format::Human => {
-            println!("Installed skill to {path}");
+            if linked {
+                println!("Linked skill at {path} (-> canonical copy)");
+            } else {
+                println!("Copied skill to {path}");
+            }
             Ok(())
         }
     }
+}
+
+/// `skill sync` — refresh the canonical skill copy from this binary (run by the
+/// installer after a self-update, so every linked project sees the new version).
+pub fn skill_sync(fmt: Format) -> Result<()> {
+    let dir = skill::sync()?;
+    let path = dir.display().to_string();
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "canonical": path,
+            "version": skill::embedded_version(),
+        })),
+        Format::Human => {
+            println!(
+                "Synced canonical skill ({}) to {path}",
+                skill::embedded_version()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Append `entry` to the repo's `.gitignore` if not already present (one line). Used
+/// for the local skill symlink, which points at an absolute path and must not be
+/// committed.
+fn ensure_gitignored(repo: &Path, entry: &str) -> Result<()> {
+    let path = repo.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == entry) {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(entry);
+    out.push('\n');
+    std::fs::write(&path, out).map_err(Error::Io)
 }
 
 /// `self-update` — replace the binary in place from GitHub Releases.
@@ -1934,15 +1986,29 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
     }
 }
 
-/// `migrate` — bring ticket frontmatter up to the current schema (round-trip-safe).
+/// `migrate` — bring ticket frontmatter up to the current schema (round-trip-safe) and
+/// repair a stale project skill (an old real-dir copy or broken link) into a symlink to
+/// the refreshed canonical copy.
 pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
     let store = Store::open(repo)?;
     let report = migrate_core::migrate(&store)?;
+    // Repair the project skill link if it exists but is stale, and refresh canonical.
+    let link_path = skill::project_path(repo, ".claude/skills");
+    let skill_relinked = if std::fs::symlink_metadata(&link_path).is_ok()
+        && !skill::link_ok(repo, ".claude/skills")
+    {
+        skill::link_into(repo, ".claude/skills")?;
+        ensure_gitignored(repo, ".claude/skills/ticketsplease")?;
+        true
+    } else {
+        false
+    };
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
             "migrated": report.migrated,
             "unchanged": report.unchanged,
+            "skill_relinked": skill_relinked,
         })),
         Format::Human => {
             if report.migrated.is_empty() {
@@ -1953,6 +2019,9 @@ pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
                     report.migrated.len(),
                     report.migrated.join(", ")
                 );
+            }
+            if skill_relinked {
+                println!("Repaired the project skill link to the canonical copy");
             }
             Ok(())
         }
@@ -2680,7 +2749,44 @@ pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
         },
     );
 
-    let ok = checks.iter().all(|(_, c, _)| *c);
+    // Skill: the canonical copy should match this binary, and the project should link
+    // to it (a real-dir/old copy or wrong link is stale — repair with `migrate`).
+    let skill_current = skill::is_current();
+    check(
+        "skill_canonical",
+        skill_current,
+        if skill_current {
+            format!("canonical skill is current ({})", skill::embedded_version())
+        } else {
+            format!(
+                "canonical skill is {} (binary is {}); run `tkt skill sync`",
+                skill::installed_version().unwrap_or_else(|| "absent".into()),
+                skill::embedded_version()
+            )
+        },
+    );
+    let link_path = skill::project_path(repo, ".claude/skills");
+    if link_path.exists() || std::fs::symlink_metadata(&link_path).is_ok() {
+        let link_ok = skill::link_ok(repo, ".claude/skills");
+        check(
+            "skill_link",
+            link_ok,
+            if link_ok {
+                "project skill links to the canonical copy".to_string()
+            } else {
+                "project skill is a stale copy / broken link; run `tkt migrate` or \
+                 `tkt skill install`"
+                    .to_string()
+            },
+        );
+    }
+
+    // The skill checks are advisory — a stale/absent global skill copy is a warning to
+    // surface, not a reason to fail a repo's setup gate (it has no per-repo fix).
+    let ok = checks
+        .iter()
+        .filter(|(name, _, _)| !name.starts_with("skill_"))
+        .all(|(_, c, _)| *c);
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = checks

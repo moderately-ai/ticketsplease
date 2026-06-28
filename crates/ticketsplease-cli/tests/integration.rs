@@ -4086,3 +4086,76 @@ fn guard_passes_shared_scope_co_edit() {
     assert_eq!(v["collisions"][0]["cause"], "shared");
     assert!(v["under_declared"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn skill_links_to_canonical_and_sync_refreshes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let xdg = TempDir::new().unwrap(); // sandbox the canonical skill dir
+    let tkt_x = |args: &[&str]| -> std::process::Output {
+        tkt(repo)
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // init (with the skill) links the project to the canonical copy + gitignores it.
+    assert!(tkt_x(&["init"]).status.success());
+    let canonical = xdg
+        .path()
+        .join("ticketsplease")
+        .join("skill")
+        .join("SKILL.md");
+    assert!(
+        canonical.exists(),
+        "canonical skill synced under XDG_DATA_HOME"
+    );
+    let link = repo.join(".claude/skills/ticketsplease");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "project skill is a symlink"
+    );
+    assert!(
+        link.join("SKILL.md").exists(),
+        "the link resolves to the skill"
+    );
+    assert!(std::fs::read_to_string(repo.join(".gitignore"))
+        .unwrap()
+        .contains(".claude/skills/ticketsplease"));
+
+    let skill_check = |name: &str| -> bool {
+        let out = tkt_x(&["doctor", "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == name)
+            .map(|c| c["ok"] == true)
+            .unwrap_or(false)
+    };
+    assert!(
+        skill_check("skill_canonical"),
+        "canonical current after init"
+    );
+    assert!(
+        skill_check("skill_link"),
+        "project link resolves to canonical"
+    );
+
+    // Simulate drift (a self-update without a sync): doctor flags it, sync fixes it.
+    std::fs::write(
+        xdg.path()
+            .join("ticketsplease")
+            .join("skill")
+            .join(".skill-version"),
+        "0.0.1",
+    )
+    .unwrap();
+    assert!(!skill_check("skill_canonical"), "stale sentinel is flagged");
+    assert!(tkt_x(&["skill", "sync"]).status.success());
+    assert!(skill_check("skill_canonical"), "sync clears the drift");
+}

@@ -93,6 +93,12 @@ main() {
   fi
   err "Installed ${BIN_NAME}${ALIAS:+ and ${ALIAS}} to ${BIN_DIR}"
 
+  # Refresh the canonical skill copy from the just-installed binary so every linked
+  # project picks up this version (best-effort; never fail the install on it).
+  if "${BIN_DIR}/${BIN_NAME}" skill sync >/dev/null 2>&1; then
+    err "Refreshed the canonical Claude skill"
+  fi
+
   case ":${PATH}:" in
     *":${BIN_DIR}:"*) ;;
     *) err "Note: add ${BIN_DIR} to your PATH:  export PATH=\"${BIN_DIR}:\$PATH\"" ;;

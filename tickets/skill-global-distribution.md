@@ -1,7 +1,7 @@
 ---
 id: skill-global-distribution
 title: Per-project skill symlink to a canonical, installer-refreshed copy
-status: todo
+status: done
 priority: p1
 dependencies: []
 related: []
