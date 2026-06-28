@@ -216,7 +216,7 @@ pub fn next(tickets: &[Ticket], parallel: usize, allow_overlap: bool) -> Result<
                 .iter()
                 .filter(|&&o| o.id != t.id)
                 .filter_map(|&o| {
-                    let scopes = shared_scopes(t, o);
+                    let scopes = conflicting_scopes(t, o);
                     (!scopes.is_empty()).then(|| PickConflict {
                         ticket: o.id.clone(),
                         scopes,
@@ -295,7 +295,9 @@ pub struct Why {
     pub a: String,
     /// Second ticket id.
     pub b: String,
-    /// Scopes both tickets declare (a shared-scope conflict).
+    /// Scopes both tickets claim where at least one is exclusive — the scopes that
+    /// block them from running in parallel (a shared-by-both claim is compatible and
+    /// excluded). Field name kept for back-compat.
     pub shared_scopes: Vec<String>,
     /// Whether one transitively depends on the other (a hard ordering constraint).
     pub dependency_ordered: bool,
@@ -322,15 +324,15 @@ pub fn why(tickets: &[Ticket], a_id: &str, b_id: &str) -> Result<Why> {
         .copied()
         .ok_or_else(|| Error::NotFound(b_id.to_string()))?;
 
-    let shared = shared_scopes(a, b);
+    let conflicting = conflicting_scopes(a, b);
     // a != b is guaranteed by the early return above.
     let dependency_ordered = depends_on(&by_id, a_id, b_id) || depends_on(&by_id, b_id, a_id);
 
-    let conflict = !shared.is_empty() || dependency_ordered;
+    let conflict = !conflicting.is_empty() || dependency_ordered;
     Ok(Why {
         a: a_id.to_string(),
         b: b_id.to_string(),
-        shared_scopes: shared,
+        shared_scopes: conflicting,
         dependency_ordered,
         conflict,
     })
@@ -459,26 +461,43 @@ fn priority_value(p: Priority) -> i64 {
     }
 }
 
-fn shares_scope(a: &Ticket, b: &Ticket) -> bool {
-    let set: BTreeSet<&str> = a.scopes.iter().map(String::as_str).collect();
-    b.scopes.iter().any(|s| set.contains(s.as_str()))
-}
-
-/// The scopes both tickets declare (sorted, deduped).
-fn shared_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
-    let a_set: BTreeSet<&str> = a.scopes.iter().map(String::as_str).collect();
-    let b_set: BTreeSet<&str> = b.scopes.iter().map(String::as_str).collect();
-    a_set
-        .intersection(&b_set)
-        .map(|s| (*s).to_string())
+/// Every scope a ticket claims, in either mode (exclusive `scopes` ∪ `shared_scopes`).
+fn claimed_scopes(t: &Ticket) -> BTreeSet<&str> {
+    t.scopes
+        .iter()
+        .chain(t.shared_scopes.iter())
+        .map(String::as_str)
         .collect()
 }
 
-/// Two dispatchable tickets conflict (cannot share a batch) iff they share a scope
-/// — the only parallel hazard once dependency ordering is satisfied by the
-/// dispatchable filter.
+/// Scopes both tickets claim where at least one claims it *exclusively* — the scopes
+/// that prevent them running in parallel. Two *shared* (additive) claims on the same
+/// scope are compatible and excluded. Sorted, deduped.
+fn conflicting_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
+    let a_claims = claimed_scopes(a);
+    let b_claims = claimed_scopes(b);
+    let a_shared: BTreeSet<&str> = a.shared_scopes.iter().map(String::as_str).collect();
+    let b_shared: BTreeSet<&str> = b.shared_scopes.iter().map(String::as_str).collect();
+    a_claims
+        .intersection(&b_claims)
+        .copied()
+        .filter(|s| !(a_shared.contains(*s) && b_shared.contains(*s)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The cost of co-scheduling two tickets: the number of conflicting scopes (each
+/// weight 1 for now). `0` means compatible — safe to run in parallel.
+fn conflict_cost(a: &Ticket, b: &Ticket) -> i64 {
+    conflicting_scopes(a, b).len() as i64
+}
+
+/// Two dispatchable tickets conflict (cannot share a batch) iff they have a
+/// conflicting scope claim — a scope both claim that is not shared-by-both. This is
+/// the only parallel hazard once dependency ordering is satisfied by the dispatchable
+/// filter.
 fn conflicts(a: &Ticket, b: &Ticket) -> bool {
-    shares_scope(a, b)
+    conflict_cost(a, b) > 0
 }
 
 /// Whether `from` transitively depends on `to` (directed reachability over dep
@@ -601,6 +620,7 @@ mod tests {
             &sc,
             &[],
             &[],
+            &[],
             "",
         )
         .unwrap()
@@ -620,9 +640,49 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             "",
         )
         .unwrap()
+    }
+
+    /// Build a ticket with explicit exclusive + shared scope claims.
+    fn t_scoped(id: &str, exclusive: &[&str], shared: &[&str]) -> Ticket {
+        let e: Vec<String> = exclusive.iter().map(|s| (*s).to_string()).collect();
+        let sh: Vec<String> = shared.iter().map(|s| (*s).to_string()).collect();
+        Ticket::new(
+            id,
+            id,
+            "todo".parse().unwrap(),
+            "p2".parse().unwrap(),
+            &[],
+            &[],
+            &e,
+            &sh,
+            &[],
+            &[],
+            "",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn shared_scope_claims_are_compatible() {
+        let a = t_scoped("a", &[], &["core"]); // additive core
+        let b = t_scoped("b", &[], &["core"]); // additive core
+        let c = t_scoped("c", &["core"], &[]); // rewrites core
+        let d = t_scoped("d", &["core"], &[]); // rewrites core
+        assert_eq!(conflict_cost(&a, &b), 0);
+        assert!(!conflicts(&a, &b), "shared x shared is compatible");
+        assert!(conflicts(&a, &c), "shared x exclusive conflicts");
+        assert!(conflicts(&c, &d), "exclusive x exclusive conflicts");
+        // The two additive tickets share one tracks batch.
+        let additive = [t_scoped("a", &[], &["core"]), t_scoped("b", &[], &["core"])];
+        let batches = tracks(&additive).unwrap();
+        assert_eq!(batches.len(), 1, "additive co-scheduling: {batches:?}");
+        // why agrees: no conflict between two additive claims.
+        let pair = vec![t_scoped("a", &[], &["core"]), t_scoped("b", &[], &["core"])];
+        assert!(!why(&pair, "a", "b").unwrap().conflict);
     }
 
     #[test]

@@ -3566,3 +3566,95 @@ fn create_template_scaffolds_the_body() {
     let body = body_of(repo, "batched");
     assert!(body.contains("# Batched") && body.contains("## Goal"));
 }
+
+#[test]
+fn shared_scopes_co_schedule_and_are_validated() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+
+    // Two tickets that both claim `core` additively are compatible -> one track.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "b",
+            "--title",
+            "B",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["tracks", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["batches"].as_array().unwrap().len(),
+        1,
+        "additive core co-schedules"
+    );
+    // `why` agrees they don't conflict (exit 0).
+    tkt(repo).args(["why", "a", "b"]).assert().success();
+
+    // A ticket that rewrites `core` (exclusive) conflicts with the additive ones.
+    tkt(repo)
+        .args(["create", "--id", "c", "--title", "C", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo).args(["why", "a", "c"]).assert().code(6);
+
+    // The field surfaces in JSON, and set --add-shared-scope edits it.
+    let out = tkt(repo)
+        .args(["show", "a", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["shared_scopes"][0], "core");
+    tkt(repo)
+        .args(["set", "b", "--add-shared-scope", "io"])
+        .assert()
+        .success();
+
+    // A scope claimed both exclusive and shared on one ticket is a lint finding.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "x",
+            "--title",
+            "X",
+            "--scope",
+            "core",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "scope-mode-conflict" && d["id"] == "x"));
+    tkt(repo).args(["lint"]).assert().code(3);
+}

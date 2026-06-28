@@ -155,8 +155,13 @@ pub struct Ticket {
     /// recorded structurally (queryable, graphable) but ignored by readiness,
     /// `tracks`, and cycle detection — unlike `dependencies`, which gate scheduling.
     pub related: Vec<String>,
-    /// Abstract scope names this ticket declares.
+    /// Abstract scope names this ticket claims *exclusively* (a rewrite): two tickets
+    /// that both claim a scope here cannot run in parallel.
     pub scopes: Vec<String>,
+    /// Scope names this ticket claims in *shared* (additive) mode — it only appends to
+    /// or extends that area. Two tickets that both hold a scope shared are compatible
+    /// (may run in parallel); a shared claim still conflicts with an exclusive one.
+    pub shared_scopes: Vec<String>,
     /// Explicit path globs (augment `scopes`).
     pub paths: Vec<String>,
     /// Free-form tags.
@@ -206,6 +211,7 @@ impl Ticket {
             dependencies: string_list(y, "dependencies"),
             related: string_list(y, "related"),
             scopes: string_list(y, "scopes"),
+            shared_scopes: string_list(y, "shared_scopes"),
             paths: string_list(y, "paths"),
             tags: string_list(y, "tags"),
             assignee: optional_string(y, "assignee"),
@@ -347,6 +353,24 @@ impl Ticket {
         Ok(changed)
     }
 
+    /// Add a shared (additive) scope claim (idempotent). Returns whether changed.
+    pub fn add_shared_scope(&mut self, scope: &str) -> Result<bool> {
+        let changed = self.doc.add_list_item("shared_scopes", scope)?;
+        if changed {
+            self.shared_scopes.push(scope.to_string());
+        }
+        Ok(changed)
+    }
+
+    /// Remove a shared scope claim (idempotent). Returns whether changed.
+    pub fn remove_shared_scope(&mut self, scope: &str) -> Result<bool> {
+        let changed = self.doc.remove_list_item("shared_scopes", scope)?;
+        if changed {
+            self.shared_scopes.retain(|s| s != scope);
+        }
+        Ok(changed)
+    }
+
     /// Add a tag (idempotent). Returns whether anything changed.
     pub fn add_tag(&mut self, tag: &str) -> Result<bool> {
         let changed = self.doc.add_list_item("tags", tag)?;
@@ -434,6 +458,7 @@ impl Ticket {
         dependencies: &[String],
         related: &[String],
         scopes: &[String],
+        shared_scopes: &[String],
         paths: &[String],
         tags: &[String],
         body: &str,
@@ -451,6 +476,10 @@ impl Ticket {
         ));
         s.push_str(&format!("related: {}\n", render_inline_list(related)));
         s.push_str(&format!("scopes: {}\n", render_inline_list(scopes)));
+        s.push_str(&format!(
+            "shared_scopes: {}\n",
+            render_inline_list(shared_scopes)
+        ));
         s.push_str(&format!("paths: {}\n", render_inline_list(paths)));
         s.push_str(&format!("tags: {}\n", render_inline_list(tags)));
         s.push_str("---\n");
@@ -552,6 +581,7 @@ mod tests {
             &["a".into()],
             &["b".into()],
             &[],
+            &["sh".into()],
             &[],
             &[],
             "",
@@ -560,6 +590,7 @@ mod tests {
         let out = t.render();
         assert!(out.contains("dependencies: [a]\n"));
         assert!(out.contains("related: [b]\n"));
+        assert!(out.contains("shared_scopes: [sh]\n"));
         // Mutators stay inline because the key already exists from `new`.
         let mut t = Ticket::parse(&out).unwrap();
         assert!(t.add_related("c").unwrap());

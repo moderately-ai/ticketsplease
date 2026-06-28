@@ -19,7 +19,8 @@ pub struct Diagnostic {
     /// The ticket id, when parseable.
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
-    /// `unknown-scope` | `duplicate-id` | `missing-dep` | `missing-related` | `cycle`.
+    /// `unknown-scope` | `scope-mode-conflict` | `duplicate-id` | `missing-dep` |
+    /// `missing-related` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -83,7 +84,7 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                 // configured at all the project is not using the scope system, so
                 // there is nothing to typo against (and no false alarms on a fresh repo).
                 if !defined_scopes.is_empty() {
-                    for scope in &ticket.scopes {
+                    for scope in ticket.scopes.iter().chain(&ticket.shared_scopes) {
                         if !defined_scopes.contains(scope.as_str()) {
                             diags.push(Diagnostic {
                                 file: file.clone(),
@@ -95,6 +96,21 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                                 ),
                             });
                         }
+                    }
+                }
+                // A scope can be claimed exclusively or shared, not both — the mode
+                // would be ambiguous for conflict detection.
+                for scope in &ticket.scopes {
+                    if ticket.shared_scopes.contains(scope) {
+                        diags.push(Diagnostic {
+                            file: file.clone(),
+                            id: Some(ticket.id.clone()),
+                            code: "scope-mode-conflict",
+                            message: format!(
+                                "scope `{scope}` is declared both exclusive (`scopes`) and \
+                                 shared (`shared_scopes`)"
+                            ),
+                        });
                     }
                 }
                 if let Some(prev) = seen.insert(ticket.id.clone(), file.clone()) {

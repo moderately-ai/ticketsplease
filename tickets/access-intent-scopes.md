@@ -1,7 +1,7 @@
 ---
 id: access-intent-scopes
 title: "Access-intent scopes: shared (additive) vs exclusive locks"
-status: todo
+status: done
 priority: p1
 dependencies: []
 related: []

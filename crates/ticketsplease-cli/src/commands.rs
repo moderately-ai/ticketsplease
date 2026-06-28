@@ -123,6 +123,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let depends_on = norm_list(&args.depends_on);
     let related = norm_list(&args.related);
     let scopes = norm_list(&args.scopes);
+    let shared_scopes = norm_list(&args.shared_scopes);
     let paths = norm_list(&args.paths);
     let tags = norm_list(&args.tags);
 
@@ -136,6 +137,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
             &depends_on,
             &related,
             &scopes,
+            &shared_scopes,
             &paths,
             &tags,
             &body,
@@ -261,6 +263,8 @@ struct TicketSpec {
     #[serde(default)]
     scopes: Vec<String>,
     #[serde(default)]
+    shared_scopes: Vec<String>,
+    #[serde(default)]
     paths: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
@@ -312,6 +316,7 @@ struct ParsedSpec {
     depends_on: Vec<String>,
     related: Vec<String>,
     scopes: Vec<String>,
+    shared_scopes: Vec<String>,
     paths: Vec<String>,
     tags: Vec<String>,
     body: String,
@@ -332,6 +337,7 @@ impl ParsedSpec {
             &self.depends_on,
             &self.related,
             &self.scopes,
+            &self.shared_scopes,
             &self.paths,
             &self.tags,
             &body,
@@ -361,6 +367,7 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
                 depends_on: norm_list(&s.depends_on),
                 related: norm_list(&s.related),
                 scopes: norm_list(&s.scopes),
+                shared_scopes: norm_list(&s.shared_scopes),
                 paths: norm_list(&s.paths),
                 tags: norm_list(&s.tags),
                 body: s.body,
@@ -465,6 +472,12 @@ fn apply_set_field_mutations(ticket: &mut Ticket, args: &SetArgs) -> Result<bool
     }
     for scope in norm_list(&args.remove_scope) {
         ticket.remove_scope(&scope)?;
+    }
+    for scope in norm_list(&args.add_shared_scope) {
+        ticket.add_shared_scope(&scope)?;
+    }
+    for scope in norm_list(&args.remove_shared_scope) {
+        ticket.remove_shared_scope(&scope)?;
     }
     for tag in norm_list(&args.add_tag) {
         ticket.add_tag(&tag)?;
@@ -751,6 +764,7 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
             line("deps:    ", &ticket.dependencies);
             line("related: ", &ticket.related);
             line("scopes:  ", &ticket.scopes);
+            line("shared:  ", &ticket.shared_scopes);
             line("paths:   ", &ticket.paths);
             line("tags:    ", &ticket.tags);
             if let Some(a) = &ticket.assignee {
@@ -2626,6 +2640,7 @@ fn ticket_summary(ticket: &Ticket) -> Value {
         "status": ticket.status.as_str(),
         "priority": ticket.priority.as_str(),
         "scopes": ticket.scopes,
+        "shared_scopes": ticket.shared_scopes,
         "paths": ticket.paths,
         "dependencies": ticket.dependencies,
         "related": ticket.related,
@@ -2643,6 +2658,7 @@ fn ticket_json(ticket: &Ticket) -> Value {
         "dependencies": ticket.dependencies,
         "related": ticket.related,
         "scopes": ticket.scopes,
+        "shared_scopes": ticket.shared_scopes,
         "paths": ticket.paths,
         "tags": ticket.tags,
         "assignee": ticket.assignee,

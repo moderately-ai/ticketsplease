@@ -148,9 +148,13 @@ pub struct CreateArgs {
     /// Non-blocking related ticket ids (repeatable or comma-separated).
     #[arg(long = "related", value_delimiter = ',')]
     pub related: Vec<String>,
-    /// Declared scope names (repeatable or comma-separated).
+    /// Exclusively-claimed scope names (repeatable or comma-separated).
     #[arg(long = "scope", value_delimiter = ',')]
     pub scopes: Vec<String>,
+    /// Shared (additive) scope claims — areas this ticket only appends to, safe to
+    /// co-edit with other shared claimants (repeatable or comma-separated).
+    #[arg(long = "shared-scope", value_delimiter = ',')]
+    pub shared_scopes: Vec<String>,
     /// Explicit path globs (repeatable or comma-separated).
     #[arg(long = "path", value_delimiter = ',')]
     pub paths: Vec<String>,
@@ -201,6 +205,12 @@ pub struct SetArgs {
     /// Scopes to remove (repeatable or comma-separated).
     #[arg(long = "remove-scope", value_delimiter = ',')]
     pub remove_scope: Vec<String>,
+    /// Shared (additive) scope claims to add (repeatable or comma-separated).
+    #[arg(long = "add-shared-scope", value_delimiter = ',')]
+    pub add_shared_scope: Vec<String>,
+    /// Shared scope claims to remove (repeatable or comma-separated).
+    #[arg(long = "remove-shared-scope", value_delimiter = ',')]
+    pub remove_shared_scope: Vec<String>,
     /// Tags to add (repeatable or comma-separated).
     #[arg(long = "add-tag", value_delimiter = ',')]
     pub add_tag: Vec<String>,
