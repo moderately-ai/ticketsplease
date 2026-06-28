@@ -1,7 +1,7 @@
 ---
 id: next-aware-of-inflight
 title: "In-flight-aware next: best pick compatible with what's running"
-status: todo
+status: done
 priority: p2
 dependencies: [overlap-tolerant-tracks-next]
 related: []

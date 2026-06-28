@@ -3808,3 +3808,65 @@ fn tracks_reports_safe_parallel_width() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
 }
+
+#[test]
+fn next_avoids_inflight_tickets() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "c", "--title", "C", "--scope", "io"])
+        .assert()
+        .success();
+
+    let pick_ids = |args: &[&str]| -> Vec<String> {
+        let out = tkt(repo).args(args).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["picks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Baseline: nothing running -> a (top) + the disjoint c; b drops (conflicts a).
+    assert_eq!(
+        pick_ids(&["next", "--parallel", "3", "--format", "json"]).len(),
+        2
+    );
+
+    // Explicit --running a: a and the core-conflicting b are both dropped; only c.
+    assert_eq!(
+        pick_ids(&[
+            "next",
+            "--running",
+            "a",
+            "--parallel",
+            "3",
+            "--format",
+            "json"
+        ]),
+        vec!["c"]
+    );
+
+    // Auto in-flight: a live claim on `a` makes plain `next` avoid the conflicting b.
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "a", "--as", "w"])
+        .assert()
+        .success();
+    assert_eq!(
+        pick_ids(&["next", "--parallel", "3", "--format", "json"]),
+        vec!["c"]
+    );
+}

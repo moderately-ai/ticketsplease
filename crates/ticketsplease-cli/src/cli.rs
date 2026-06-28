@@ -512,6 +512,11 @@ pub struct NextArgs {
     /// `K` = also admit the cheapest overlaps costing ≤ K per pair; `any` = unbounded.
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// In-flight ticket ids to stay compatible with — picks conflicting with these
+    /// (beyond the budget) are dropped. Omit to default to every in-progress ticket
+    /// with a live claim, so a dispatch loop needs no args.
+    #[arg(long = "running", visible_alias = "avoid", value_delimiter = ',')]
+    pub running: Vec<String>,
     /// Atomically claim the first pick that is still free (race-safe dispatch).
     /// Requires `--as`. Tries picks in order so a lost race falls through to the next.
     #[arg(long)]

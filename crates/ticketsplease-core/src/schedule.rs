@@ -185,14 +185,26 @@ pub struct PickConflict {
 /// budget, so the caller fills its N workers least-riskily instead of idling them.
 /// `max_overlap` is a per-pair cost cap (`0` = compatible only, `i64::MAX` = unbounded).
 /// Each overlapping pick is annotated with the conflict so the caller can judge it.
+/// `running` is the in-flight set: candidates that conflict with any of them beyond the
+/// budget are dropped, so a freed worker only gets work compatible with what is live.
 pub fn next<'a>(
     tickets: &'a [Ticket],
     parallel: usize,
     max_overlap: i64,
     weights: &BTreeMap<String, i64>,
+    running: &[&Ticket],
 ) -> Result<Vec<Pick<'a>>> {
     let graph = Graph::build(tickets)?;
     let mut nodes = graph.dispatchable(tickets);
+    // Drop candidates that conflict (beyond the budget) with an already-in-flight
+    // ticket, so a freed worker is offered work compatible with what's still running.
+    if !running.is_empty() {
+        nodes.retain(|t| {
+            running
+                .iter()
+                .all(|r| conflict_cost(t, r, weights) <= max_overlap)
+        });
+    }
     if nodes.is_empty() {
         return Ok(Vec::new());
     }
@@ -851,10 +863,10 @@ mod tests {
         ];
         let w = BTreeMap::new();
         // Strict (budget 0): only one fits.
-        assert_eq!(next(&tickets, 3, 0, &w).unwrap().len(), 1);
+        assert_eq!(next(&tickets, 3, 0, &w, &[]).unwrap().len(), 1);
         assert_eq!(tracks(&tickets, 0, &w).unwrap().len(), 3);
         // Budget 1: every pair costs 1, so all three fill / share one batch.
-        let picks = next(&tickets, 3, 1, &w).unwrap();
+        let picks = next(&tickets, 3, 1, &w, &[]).unwrap();
         assert_eq!(picks.len(), 3);
         assert!(picks.iter().any(|p| !p.conflicts_with.is_empty()));
         assert!(picks
@@ -983,7 +995,7 @@ mod tests {
             t("a", "todo", "p2", &[], &["x"]),
             t("b", "todo", "p0", &[], &["y"]),
         ];
-        let picks = next(&tickets, 1, 0, &BTreeMap::new()).unwrap();
+        let picks = next(&tickets, 1, 0, &BTreeMap::new(), &[]).unwrap();
         assert_eq!(picks[0].ticket.id, "b");
     }
 
@@ -1053,7 +1065,7 @@ mod tests {
             t("b", "todo", "p0", &[], &["core"]), // conflicts with a
             t("c", "todo", "p1", &[], &["io"]),
         ];
-        let picks = next(&tickets, 2, 0, &BTreeMap::new()).unwrap();
+        let picks = next(&tickets, 2, 0, &BTreeMap::new(), &[]).unwrap();
         let ids: BTreeSet<&str> = picks.iter().map(|p| p.ticket.id.as_str()).collect();
         // Cannot pick both a and b together (they share scope `core`).
         assert!(!(ids.contains("a") && ids.contains("b")));
@@ -1068,7 +1080,7 @@ mod tests {
             t("a", "todo", "p0", &[], &["core"]),
             t("b", "todo", "p0", &[], &["core"]), // shares `core` with a
         ];
-        let picks = next(&tickets, 2, i64::MAX, &BTreeMap::new()).unwrap();
+        let picks = next(&tickets, 2, i64::MAX, &BTreeMap::new(), &[]).unwrap();
         let ids: BTreeSet<&str> = picks.iter().map(|p| p.ticket.id.as_str()).collect();
         // With --allow-overlap both top-scored picks come back, despite the overlap.
         assert!(ids.contains("a") && ids.contains("b"));

@@ -1730,7 +1730,19 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
         parse_overlap_budget(&args.max_overlap)?
     };
     let weights = store.config.scope_weights();
-    let picks = schedule::next(&tickets, args.parallel, max_overlap, &weights)?;
+    // The in-flight set to avoid: explicit `--running` ids, else every in-progress
+    // ticket with a live claim (so a dispatch loop is in-flight-aware with no args).
+    let running: Vec<&Ticket> = if args.running.is_empty() {
+        let now = now_epoch();
+        tickets
+            .iter()
+            .filter(|t| t.status == Status::InProgress && t.lease_live(now))
+            .collect()
+    } else {
+        let ids = norm_list(&args.running);
+        tickets.iter().filter(|t| ids.contains(&t.id)).collect()
+    };
+    let picks = schedule::next(&tickets, args.parallel, max_overlap, &weights, &running)?;
 
     // Atomic dispatch: claim the first pick still free. Trying picks in order makes a
     // lost race (another worker grabbed the top pick) fall through to the next instead
