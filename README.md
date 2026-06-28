@@ -44,6 +44,7 @@ tkt create --title "Add vector index" --priority p1 --scope query/planner
 tkt create --id build-index-trait --title "Build the index trait" --scope core
 tkt link add-vector-index --depends-on build-index-trait
 tkt ready                             # what's dispatchable now
+tkt list --where 'priority:p0 AND NOT status:done'   # boolean filter (AND/OR/NOT, parens)
 tkt tracks                            # conflict-free parallel batches
 tkt next --parallel 4                 # four disjoint picks for four agents
 tkt guard my-branch                   # gate a branch before merge (exit 6 = conflict)

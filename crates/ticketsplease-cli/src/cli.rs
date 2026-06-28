@@ -246,6 +246,11 @@ pub struct ShowArgs {
 
 /// `list` arguments.
 #[derive(Args)]
+#[command(after_help = "Filter expression (--where) grammar:\n  \
+    field:value combined with AND / OR / NOT and parentheses.\n  \
+    fields: status priority tag scope assignee id dep related\n  \
+    e.g. --where 'tag:dialect AND NOT status:done'\n  \
+         --where '(priority:p0 OR priority:p1) AND scope:core'")]
 pub struct ListArgs {
     /// Filter by status.
     #[arg(long)]
@@ -259,6 +264,11 @@ pub struct ListArgs {
     /// Filter by priority (p0..p3).
     #[arg(long)]
     pub priority: Option<String>,
+    /// Boolean filter expression: `field:value` joined by AND/OR/NOT and parens
+    /// (fields: status priority tag scope assignee id dep related). Composes (AND)
+    /// with the single-axis flags above.
+    #[arg(long = "where")]
+    pub where_: Option<String>,
     /// Hide completed (done) tickets.
     #[arg(long)]
     pub hide_done: bool,

@@ -17,7 +17,7 @@ use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::{
-    lint as lint_core, schedule, Error, Priority, Result, Status, Store, Ticket,
+    lint as lint_core, query, schedule, Error, Priority, Result, Status, Store, Ticket,
 };
 
 use crate::cli::{
@@ -748,6 +748,9 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
         .as_deref()
         .map(str::parse::<Priority>)
         .transpose()?;
+    // `--where` is a full boolean expression; it composes (AND) with the single-axis
+    // flags, so existing scripts keep working and `--where` adds power on top.
+    let predicate = args.where_.as_deref().map(query::parse).transpose()?;
     let (all, warnings) = store.load_all_lenient()?;
     let tickets: Vec<Ticket> = all
         .into_iter()
@@ -756,6 +759,7 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
         .filter(|t| args.scope.as_ref().map_or(true, |s| t.scopes.contains(s)))
         .filter(|t| args.tag.as_ref().map_or(true, |tg| t.tags.contains(tg)))
         .filter(|t| !args.hide_done || t.status != Status::Done)
+        .filter(|t| predicate.as_ref().map_or(true, |p| p.matches(t)))
         .collect();
 
     match fmt {

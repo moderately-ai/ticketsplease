@@ -64,9 +64,11 @@ JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`
 
 ```
 ticketsplease show <id> [--ref <branch>]
-ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--hide-done]
+ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--where <expr>] [--hide-done]
 ```
 `show --format human` prints a rendered field view + body + comments; `--format json` → the ticket's fields. `--ref` reads the ticket as committed on a git ref (no checkout). `list` filters compose (AND); `--hide-done` drops completed tickets. A malformed ticket file degrades to a warning rather than failing the listing.
+
+`--where` is a boolean filter expression: `field:value` terms joined by `AND` / `OR` / `NOT` (case-insensitive) with parentheses; it composes (AND) with the single-axis flags. Fields: `status`, `priority`, `tag`, `scope`, `assignee`, `id`, `dep`, `related`. Values are barewords (`p0`, `query/planner`, slug ids) or quoted (`"needs review"`). `status:`/`priority:` values are validated, so a typo exits 3. Examples: `--where 'tag:dialect AND NOT status:done'`, `--where '(priority:p0 OR priority:p1) AND scope:core'`.
 
 list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags} ], "warnings": [...] }`.
 

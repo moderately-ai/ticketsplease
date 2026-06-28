@@ -2975,3 +2975,113 @@ fn related_tickets_share_a_track_when_scopes_disjoint() {
     // related (unlike a dependency) imposes no ordering: disjoint scopes -> one batch.
     assert_eq!(v["batches"].as_array().unwrap().len(), 1);
 }
+
+fn list_ids_where(repo: &Path, expr: &str) -> Vec<String> {
+    let out = tkt(repo)
+        .args(["list", "--where", expr, "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn list_where_filters_with_boolean_expressions() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--priority",
+            "p0",
+            "--tag",
+            "ux",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "b",
+            "--title",
+            "B",
+            "--priority",
+            "p1",
+            "--tag",
+            "ux",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "c",
+            "--title",
+            "C",
+            "--priority",
+            "p0",
+            "--tag",
+            "bug",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "b", "--status", "done"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        list_ids_where(repo, "tag:ux AND NOT status:done"),
+        vec!["a"]
+    );
+    assert_eq!(list_ids_where(repo, "priority:p0"), vec!["a", "c"]);
+    assert_eq!(
+        list_ids_where(repo, "(tag:bug OR tag:ux) AND priority:p0"),
+        vec!["a", "c"]
+    );
+    assert!(list_ids_where(repo, "tag:missing").is_empty());
+
+    // `--where` composes (AND) with the legacy single-axis flags.
+    let out = tkt(repo)
+        .args([
+            "list",
+            "--tag",
+            "ux",
+            "--where",
+            "priority:p0",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a"]);
+
+    // A bad field or expression fails loudly (exit 3).
+    tkt(repo)
+        .args(["list", "--where", "bogus:x"])
+        .assert()
+        .code(3);
+    tkt(repo)
+        .args(["list", "--where", "(tag:ux"])
+        .assert()
+        .code(3);
+}

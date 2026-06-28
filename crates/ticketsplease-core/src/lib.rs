@@ -15,6 +15,7 @@ pub mod guard;
 pub mod ids;
 pub mod lint;
 pub mod migrate;
+pub mod query;
 pub mod schedule;
 pub mod store;
 pub mod ticket;
