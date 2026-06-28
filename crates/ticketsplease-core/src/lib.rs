@@ -19,6 +19,7 @@ pub mod query;
 pub mod schedule;
 pub mod store;
 pub mod ticket;
+pub mod views;
 
 pub use error::{Error, Result};
 pub use store::Store;

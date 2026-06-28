@@ -64,11 +64,23 @@ JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`
 
 ```
 ticketsplease show <id> [--ref <branch>]
-ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--where <expr>] [--hide-done]
+ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--where <expr>] [--view <name>] [--hide-done]
 ```
 `show --format human` prints a rendered field view + body + comments; `--format json` → the ticket's fields. `--ref` reads the ticket as committed on a git ref (no checkout). `list` filters compose (AND); `--hide-done` drops completed tickets. A malformed ticket file degrades to a warning rather than failing the listing.
 
-`--where` is a boolean filter expression: `field:value` terms joined by `AND` / `OR` / `NOT` (case-insensitive) with parentheses; it composes (AND) with the single-axis flags. Fields: `status`, `priority`, `tag`, `scope`, `assignee`, `id`, `dep`, `related`. Values are barewords (`p0`, `query/planner`, slug ids) or quoted (`"needs review"`). `status:`/`priority:` values are validated, so a typo exits 3. Examples: `--where 'tag:dialect AND NOT status:done'`, `--where '(priority:p0 OR priority:p1) AND scope:core'`.
+`--where` is a boolean filter expression: `field:value` terms joined by `AND` / `OR` / `NOT` (case-insensitive) with parentheses; it composes (AND) with the single-axis flags. Fields: `status`, `priority`, `tag`, `scope`, `assignee`, `id`, `dep`, `related`. Values are barewords (`p0`, `query/planner`, slug ids) or quoted (`"needs review"`). `status:`/`priority:` values are validated, so a typo exits 3. Examples: `--where 'tag:dialect AND NOT status:done'`, `--where '(priority:p0 OR priority:p1) AND scope:core'`. `--view <name>` applies a saved expression and ANDs with `--where`.
+
+## view
+
+```
+ticketsplease view save <name> <expr>     # store/overwrite a named --where expression (validated)
+ticketsplease view list                   # all saved views
+ticketsplease view show <name>            # print one view's expression
+ticketsplease view delete <name>
+```
+Saved views live in `<repo>/.ticketsplease/views.toml` — a tool-owned, **committable** file (a shared "epic view"), separate from `ticketsplease.toml`. `save` validates the expression (a bad one exits 3, like `--where`); `show`/`delete` on an unknown name exit 4. Apply a view with `list --view <name>` (and `set --where`/`rollup` accept `--view` too).
+
+view JSON: `save` → `{ "schema_version", "name", "where", "replaced" }`; `list` → `{ "schema_version", "views": [ {name, where} ] }`; `show` → `{ "schema_version", "name", "where" }`; `delete` → `{ "schema_version", "name", "deleted" }`.
 
 list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags} ], "warnings": [...] }`.
 

@@ -3085,3 +3085,92 @@ fn list_where_filters_with_boolean_expressions() {
         .assert()
         .code(3);
 }
+
+#[test]
+fn saved_views_round_trip_and_resolve_in_list() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--tag",
+            "epic",
+            "--priority",
+            "p0",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--tag", "epic"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "b", "--status", "done"])
+        .assert()
+        .success();
+
+    // Save a view; the file lands under the committable .ticketsplease/ state dir.
+    tkt(repo)
+        .args(["view", "save", "open-epic", "tag:epic AND NOT status:done"])
+        .assert()
+        .success();
+    assert!(repo.join(".ticketsplease/views.toml").exists());
+
+    // A saved view resolves in `list --view` and composes (AND) with `--where`.
+    let ids = |args: &[&str]| -> Vec<String> {
+        let out = tkt(repo).args(args).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["list", "--view", "open-epic", "--format", "json"]),
+        vec!["a"]
+    );
+    assert_eq!(
+        ids(&[
+            "list",
+            "--view",
+            "open-epic",
+            "--where",
+            "priority:p0",
+            "--format",
+            "json"
+        ]),
+        vec!["a"]
+    );
+
+    // show / list / delete; saving a malformed expr fails; an unknown view is exit 4.
+    let shown = tkt(repo)
+        .args(["view", "show", "open-epic"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("tag:epic"));
+    tkt(repo).args(["view", "list"]).assert().success();
+    tkt(repo)
+        .args(["view", "save", "bad", "bogus:x"])
+        .assert()
+        .code(3);
+    tkt(repo).args(["list", "--view", "ghost"]).assert().code(4);
+    tkt(repo)
+        .args(["view", "delete", "open-epic"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["view", "show", "open-epic"])
+        .assert()
+        .code(4);
+    tkt(repo)
+        .args(["view", "delete", "open-epic"])
+        .assert()
+        .code(4);
+}

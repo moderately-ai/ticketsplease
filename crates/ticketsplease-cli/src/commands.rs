@@ -16,6 +16,7 @@ use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::store::{self, CreateOutcome};
+use ticketsplease_core::views::Views;
 use ticketsplease_core::{
     lint as lint_core, query, schedule, Error, Priority, Result, Status, Store, Ticket,
 };
@@ -23,8 +24,8 @@ use ticketsplease_core::{
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
     GuardArgs, InitArgs, LinkArgs, ListArgs, NextArgs, ReconcileArgs, ReleaseArgs, RenameArgs,
-    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, WatchArgs,
-    WhyArgs,
+    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs,
+    ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -748,9 +749,9 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
         .as_deref()
         .map(str::parse::<Priority>)
         .transpose()?;
-    // `--where` is a full boolean expression; it composes (AND) with the single-axis
-    // flags, so existing scripts keep working and `--where` adds power on top.
-    let predicate = args.where_.as_deref().map(query::parse).transpose()?;
+    // `--where`/`--view` are a full boolean expression; they compose (AND) with the
+    // single-axis flags, so existing scripts keep working and add power on top.
+    let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?;
     let (all, warnings) = store.load_all_lenient()?;
     let tickets: Vec<Ticket> = all
         .into_iter()
@@ -790,6 +791,111 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
             for warn in &warnings {
                 eprintln!("warning: skipped {warn}");
             }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the optional filter predicate from `--where` and/or `--view`. A `--view`
+/// names a saved expression (`tkt view save`); when both are given they are ANDed.
+/// Shared by `list`, `set --where`, and `rollup`.
+fn resolve_filter(
+    repo: &Path,
+    where_: Option<&str>,
+    view: Option<&str>,
+) -> Result<Option<query::Predicate>> {
+    let mut preds: Vec<query::Predicate> = Vec::new();
+    if let Some(name) = view {
+        let views = Views::load(repo)?;
+        let v = views
+            .get(name)
+            .ok_or_else(|| Error::NotFound(format!("view `{name}`")))?;
+        preds.push(query::parse(&v.where_expr)?);
+    }
+    if let Some(expr) = where_ {
+        preds.push(query::parse(expr)?);
+    }
+    Ok(preds
+        .into_iter()
+        .reduce(|a, b| query::Predicate::And(Box::new(a), Box::new(b))))
+}
+
+/// `view save` — store (or overwrite) a named filter expression, validating it first.
+pub fn view_save(repo: &Path, fmt: Format, args: &ViewSaveArgs) -> Result<()> {
+    let mut views = Views::load(repo)?;
+    let replaced = views.insert(&args.name, &args.expr)?;
+    views.save(repo)?;
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "name": args.name,
+            "where": args.expr,
+            "replaced": replaced,
+        })),
+        Format::Human => {
+            let verb = if replaced { "Updated" } else { "Saved" };
+            println!("{verb} view `{}`", args.name);
+            Ok(())
+        }
+    }
+}
+
+/// `view list` — show all saved views.
+pub fn view_list(repo: &Path, fmt: Format) -> Result<()> {
+    let views = Views::load(repo)?;
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = views
+                .all()
+                .iter()
+                .map(|(name, v)| json!({ "name": name, "where": v.where_expr }))
+                .collect();
+            print_json(&json!({ "schema_version": 1, "views": rows }))
+        }
+        Format::Human => {
+            if views.all().is_empty() {
+                println!("(no saved views)");
+            }
+            for (name, v) in views.all() {
+                println!("{name}: {}", v.where_expr);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `view show` — print a single view's expression (NotFound if absent).
+pub fn view_show(repo: &Path, fmt: Format, args: &ViewShowArgs) -> Result<()> {
+    let views = Views::load(repo)?;
+    let v = views
+        .get(&args.name)
+        .ok_or_else(|| Error::NotFound(format!("view `{}`", args.name)))?;
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "name": args.name,
+            "where": v.where_expr,
+        })),
+        Format::Human => {
+            println!("{}", v.where_expr);
+            Ok(())
+        }
+    }
+}
+
+/// `view delete` — remove a saved view (NotFound if absent).
+pub fn view_delete(repo: &Path, fmt: Format, args: &ViewShowArgs) -> Result<()> {
+    let mut views = Views::load(repo)?;
+    if !views.remove(&args.name) {
+        return Err(Error::NotFound(format!("view `{}`", args.name)));
+    }
+    views.save(repo)?;
+    match fmt {
+        Format::Json => {
+            print_json(&json!({ "schema_version": 1, "name": args.name, "deleted": true }))
+        }
+        Format::Human => {
+            println!("Deleted view `{}`", args.name);
             Ok(())
         }
     }

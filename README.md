@@ -45,6 +45,7 @@ tkt create --id build-index-trait --title "Build the index trait" --scope core
 tkt link add-vector-index --depends-on build-index-trait
 tkt ready                             # what's dispatchable now
 tkt list --where 'priority:p0 AND NOT status:done'   # boolean filter (AND/OR/NOT, parens)
+tkt view save epic 'tag:epic AND NOT status:done'    # save a reusable named view, then: tkt list --view epic
 tkt tracks                            # conflict-free parallel batches
 tkt next --parallel 4                 # four disjoint picks for four agents
 tkt guard my-branch                   # gate a branch before merge (exit 6 = conflict)
@@ -101,6 +102,10 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo). Each collision is tagged `cause: "direct"` (a real file/crate overlap) or `"transitive"` (reached only via the reverse-dep walk — safe for an additive change), and a per-scope `affected_causes` map lets a consumer triage which under-declarations and collisions are real rather than hand-diffing. Pass `guard --direct-only` (alias `--no-reverse-deps`) to gate on direct overlap only and skip the expansion entirely.
 
 `[external_scopes]` extends the guard beyond this repo: a branch that bumps a pinned `git = … rev = …` dependency (matched by `repo` against the changed manifest lines) — or edits an in-tree fork `paths` glob — is flagged against tickets declaring that external scope. Because external scopes are ordinary scope names, `tracks` already keeps two tickets touching the same fork in separate batches.
+
+## Tool-managed state — `.ticketsplease/`
+
+Saved views (and bundled body templates) live under `.ticketsplease/` at the repo root. Unlike most tool dot-dirs this is **meant to be committed** — a saved view like "the open p0/p1 epic" or a shared ticket-body template is a project artifact, not local state. Don't add it to `.gitignore`.
 
 ## The contract
 

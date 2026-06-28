@@ -43,6 +43,8 @@ pub enum Command {
     Show(ShowArgs),
     /// List tickets.
     List(ListArgs),
+    /// Manage saved filter views (named `--where` expressions).
+    View(ViewArgs),
     /// Report ticket status; with `--all-branches`, scan `tkt/*` branches.
     Status(StatusArgs),
     /// Cross-check ticket status against `tkt/*` branches and worktrees (drift report).
@@ -269,9 +271,48 @@ pub struct ListArgs {
     /// with the single-axis flags above.
     #[arg(long = "where")]
     pub where_: Option<String>,
+    /// Apply a saved view's expression (see `tkt view`); composes (AND) with `--where`.
+    #[arg(long)]
+    pub view: Option<String>,
     /// Hide completed (done) tickets.
     #[arg(long)]
     pub hide_done: bool,
+}
+
+/// `view` subcommand group.
+#[derive(Args)]
+pub struct ViewArgs {
+    #[command(subcommand)]
+    pub command: ViewCommand,
+}
+
+/// Subcommands under `view`.
+#[derive(Subcommand)]
+pub enum ViewCommand {
+    /// Save (or overwrite) a named filter expression.
+    Save(ViewSaveArgs),
+    /// List saved views.
+    List,
+    /// Print a single view's expression.
+    Show(ViewShowArgs),
+    /// Delete a saved view.
+    Delete(ViewShowArgs),
+}
+
+/// `view save` arguments.
+#[derive(Args)]
+pub struct ViewSaveArgs {
+    /// View name.
+    pub name: String,
+    /// The `--where` expression to store (validated before saving).
+    pub expr: String,
+}
+
+/// `view show` / `view delete` arguments.
+#[derive(Args)]
+pub struct ViewShowArgs {
+    /// View name.
+    pub name: String,
 }
 
 /// `status` arguments.
@@ -575,6 +616,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Link(a) => commands::link(repo, fmt, a),
         Command::Show(a) => commands::show(repo, fmt, a),
         Command::List(a) => commands::list(repo, fmt, a),
+        Command::View(a) => match &a.command {
+            ViewCommand::Save(a) => commands::view_save(repo, fmt, a),
+            ViewCommand::List => commands::view_list(repo, fmt),
+            ViewCommand::Show(a) => commands::view_show(repo, fmt, a),
+            ViewCommand::Delete(a) => commands::view_delete(repo, fmt, a),
+        },
         Command::Status(a) => commands::status(repo, fmt, a),
         Command::Reconcile(a) => commands::reconcile(repo, fmt, a),
         Command::Watch(a) => commands::watch(repo, fmt, a),
