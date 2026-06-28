@@ -1639,11 +1639,15 @@ pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
 /// lets cheaply-overlapping tickets share a batch).
 pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let tickets = store.load_all()?;
+    let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
     // Safe parallel width: the largest set runnable at once within the budget.
     let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
+    // `--overlap-matrix` hands back the raw conflict graph for self-service assignment.
+    if args.overlap_matrix {
+        return emit_overlap_matrix(fmt, &tickets, &weights, width);
+    }
     // `--width` is a terse one-number answer for "how many workers can I spin up".
     if args.width {
         return match fmt {
@@ -1710,7 +1714,7 @@ fn batch_overlap_cost(batches: &[Vec<&Ticket>], weights: &BTreeMap<String, i64>)
 /// `lanes` — plan worker queues that sequence conflicting work instead of dropping it.
 pub fn lanes(repo: &Path, fmt: Format, args: &LanesArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let tickets = store.load_all()?;
+    let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
     // Default the lane count to the safe parallel width (use as many workers as fit).
@@ -1750,6 +1754,76 @@ pub fn lanes(repo: &Path, fmt: Format, args: &LanesArgs) -> Result<()> {
     }
 }
 
+/// Apply the `--assume-shared` / `--strict` access-mode overrides to a throwaway copy
+/// of the tickets. Scheduling reads the typed scope fields, so we remap those directly;
+/// the `Document` is intentionally left alone (these clones are never saved).
+fn apply_mode_override(tickets: Vec<Ticket>, assume_shared: bool, strict: bool) -> Vec<Ticket> {
+    if !(assume_shared || strict) {
+        return tickets;
+    }
+    tickets
+        .into_iter()
+        .map(|mut t| {
+            if assume_shared {
+                // Everything becomes a shared (compatible) claim.
+                for s in std::mem::take(&mut t.scopes) {
+                    if !t.shared_scopes.contains(&s) {
+                        t.shared_scopes.push(s);
+                    }
+                }
+            } else {
+                // --strict: everything becomes an exclusive claim.
+                for s in std::mem::take(&mut t.shared_scopes) {
+                    if !t.scopes.contains(&s) {
+                        t.scopes.push(s);
+                    }
+                }
+            }
+            t
+        })
+        .collect()
+}
+
+/// Emit the conflict matrix for the ready set: every dispatchable pair with a real
+/// conflict, its conflicting scopes, and the (weighted) cost — for self-service
+/// assignment by an external orchestrator.
+fn emit_overlap_matrix(
+    fmt: Format,
+    tickets: &[Ticket],
+    weights: &BTreeMap<String, i64>,
+    width: usize,
+) -> Result<()> {
+    let ready = schedule::ready(tickets)?;
+    let mut rows: Vec<(String, String, Vec<String>, i64)> = Vec::new();
+    for i in 0..ready.len() {
+        for j in (i + 1)..ready.len() {
+            let scopes = schedule::conflicting_scopes(ready[i], ready[j]);
+            if !scopes.is_empty() {
+                let cost = schedule::conflict_cost(ready[i], ready[j], weights);
+                rows.push((ready[i].id.clone(), ready[j].id.clone(), scopes, cost));
+            }
+        }
+    }
+    match fmt {
+        Format::Json => {
+            let edges: Vec<Value> = rows
+                .iter()
+                .map(|(a, b, scopes, cost)| json!({ "a": a, "b": b, "scopes": scopes, "cost": cost }))
+                .collect();
+            print_json(&json!({ "schema_version": 1, "matrix": edges, "width": width }))
+        }
+        Format::Human => {
+            if rows.is_empty() {
+                println!("(no conflicts among ready tickets)");
+            }
+            for (a, b, scopes, cost) in &rows {
+                println!("{a} ~ {b}  cost {cost}  ({})", scopes.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Parse a `--max-overlap` budget: a non-negative integer, or `any` (unbounded).
 fn parse_overlap_budget(s: &str) -> Result<i64> {
     if s.eq_ignore_ascii_case("any") {
@@ -1765,7 +1839,7 @@ fn parse_overlap_budget(s: &str) -> Result<i64> {
 /// `next` — scored recommendation(s); `--parallel N` returns N disjoint picks.
 pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let tickets = store.load_all()?;
+    let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     // `--allow-overlap` is the unbounded alias; otherwise parse the per-pair budget.
     let max_overlap = if args.allow_overlap {
         i64::MAX

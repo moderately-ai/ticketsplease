@@ -520,6 +520,14 @@ pub struct NextArgs {
     /// with a live claim, so a dispatch loop needs no args.
     #[arg(long = "running", visible_alias = "avoid", value_delimiter = ',')]
     pub running: Vec<String>,
+    /// Treat every scope claim as shared (additive) — collapse conflicts and pack
+    /// picks; you reconcile at merge.
+    #[arg(long, conflicts_with = "strict")]
+    pub assume_shared: bool,
+    /// Treat every scope claim as exclusive — ignore `shared_scopes` and scope weights
+    /// (the conservative view, on demand).
+    #[arg(long)]
+    pub strict: bool,
     /// Atomically claim the first pick that is still free (race-safe dispatch).
     /// Requires `--as`. Tries picks in order so a lost race falls through to the next.
     #[arg(long)]
@@ -678,6 +686,16 @@ pub struct TracksArgs {
     /// budget) — how many workers you can usefully spin up right now.
     #[arg(long)]
     pub width: bool,
+    /// Emit the conflict matrix (every ready pair with its conflicting scopes and cost)
+    /// instead of batches, so you can do your own assignment.
+    #[arg(long)]
+    pub overlap_matrix: bool,
+    /// Treat every scope claim as shared (additive) — one batch; reconcile at merge.
+    #[arg(long, conflicts_with = "strict")]
+    pub assume_shared: bool,
+    /// Treat every scope claim as exclusive — ignore `shared_scopes` and scope weights.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// `lanes` arguments.
@@ -689,6 +707,12 @@ pub struct LanesArgs {
     /// Per-pair overlap budget tolerated within a concurrent round (see `tracks`).
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// Treat every scope claim as shared (additive) — collapse conflicts.
+    #[arg(long, conflicts_with = "strict")]
+    pub assume_shared: bool,
+    /// Treat every scope claim as exclusive — ignore `shared_scopes` and scope weights.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// `skill` subcommand group.

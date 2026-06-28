@@ -3916,3 +3916,84 @@ fn lanes_sequence_conflicts_onto_a_worker() {
     );
     assert_eq!(v["merge_order"].as_array().unwrap().len(), 3);
 }
+
+#[test]
+fn escape_hatches_override_modes_and_emit_matrix() {
+    let batches = |repo: &Path, args: &[&str]| -> usize {
+        let out = tkt(repo).args(args).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["batches"].as_array().unwrap().len()
+    };
+
+    // --assume-shared collapses an exclusive conflict; --overlap-matrix exposes it.
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--scope", "core"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "core"])
+        .assert()
+        .success();
+    assert_eq!(
+        batches(repo, &["tracks", "--format", "json"]),
+        2,
+        "exclusive conflict"
+    );
+    assert_eq!(
+        batches(repo, &["tracks", "--assume-shared", "--format", "json"]),
+        1,
+        "assume-shared collapses it"
+    );
+    let out = tkt(repo)
+        .args(["tracks", "--overlap-matrix", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let m = v["matrix"].as_array().unwrap();
+    assert_eq!(m.len(), 1);
+    assert_eq!(m[0]["cost"], 1);
+
+    // --strict forces shared (compatible) claims back to exclusive.
+    let dir2 = TempDir::new().unwrap();
+    let repo2 = dir2.path();
+    tkt(repo2).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo2, "\"core\" = [\"core/**\"]\n");
+    tkt(repo2)
+        .args([
+            "create",
+            "--id",
+            "d",
+            "--title",
+            "D",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    tkt(repo2)
+        .args([
+            "create",
+            "--id",
+            "e",
+            "--title",
+            "E",
+            "--shared-scope",
+            "core",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        batches(repo2, &["tracks", "--format", "json"]),
+        1,
+        "shared is compatible"
+    );
+    assert_eq!(
+        batches(repo2, &["tracks", "--strict", "--format", "json"]),
+        2,
+        "strict forces exclusive"
+    );
+}

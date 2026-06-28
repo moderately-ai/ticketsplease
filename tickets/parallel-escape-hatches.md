@@ -1,7 +1,7 @@
 ---
 id: parallel-escape-hatches
 title: "Escape hatches: --assume-shared / --strict / --overlap-matrix"
-status: todo
+status: done
 priority: p2
 dependencies: [overlap-tolerant-tracks-next]
 related: [scope-policy-defaults]

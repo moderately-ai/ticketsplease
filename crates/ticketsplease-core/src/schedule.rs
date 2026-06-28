@@ -648,8 +648,10 @@ fn claimed_scopes(t: &Ticket) -> BTreeSet<&str> {
 
 /// Scopes both tickets claim where at least one claims it *exclusively* — the scopes
 /// that prevent them running in parallel. Two *shared* (additive) claims on the same
-/// scope are compatible and excluded. Sorted, deduped.
-fn conflicting_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
+/// scope are compatible and excluded. Sorted, deduped. Exposed so a caller can build
+/// the conflict matrix for its own assignment.
+#[must_use]
+pub fn conflicting_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
     let a_claims = claimed_scopes(a);
     let b_claims = claimed_scopes(b);
     let a_shared: BTreeSet<&str> = a.shared_scopes.iter().map(String::as_str).collect();
