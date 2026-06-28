@@ -19,21 +19,23 @@ Exit codes: `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` cyc
 ```
 ticketsplease init [--dir tickets] [--force]
 ```
-Scaffolds `<dir>/` and `ticketsplease.toml`, and installs the bundled skill into `.claude/skills/ticketsplease/`. Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
+Scaffolds `<dir>/` and `ticketsplease.toml`, installs the bundled skill into `.claude/skills/ticketsplease/`, and seeds example body templates into `.ticketsplease/templates/` (for `create --template`). Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
 
-JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "git": bool }`.
+JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "templates_installed", "git": bool }`.
 
 ## create
 
 ```
 ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3]
                       [--depends-on a,b] [--related c,d] [--scope x,y] [--path 'glob'] [--tag t]
-                      [--body <s>] [--dry-run]
+                      [--body <s>] [--template <name>] [--dry-run]
 ticketsplease create --from <file|-> [--dry-run]
 ```
 Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
-`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?, tags?, body?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+`--template <name>` scaffolds the body from `.ticketsplease/templates/<name>.md` (seeded by `init`; add your own), substituting `{{title}}` and `{{id}}`. An explicit `--body` wins over `--template`; an unknown template is exit 4.
+
+`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 

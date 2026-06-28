@@ -3494,3 +3494,75 @@ fn graph_and_path_export_the_dependency_dag() {
     assert_eq!(ids, vec!["base", "mid", "leaf"]);
     tkt(repo).args(["path", "ghost"]).assert().code(4);
 }
+
+fn body_of(repo: &Path, id: &str) -> String {
+    std::fs::read_to_string(repo.join("tickets").join(format!("{id}.md"))).unwrap()
+}
+
+#[test]
+fn create_template_scaffolds_the_body() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // init seeds the example templates under the committable state dir.
+    assert!(repo.join(".ticketsplease/templates/default.md").exists());
+    assert!(repo.join(".ticketsplease/templates/audit.md").exists());
+
+    // --template fills the body and substitutes {{title}}/{{id}}.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "scaffolded",
+            "--title",
+            "Scaffolded Thing",
+            "--template",
+            "audit",
+        ])
+        .assert()
+        .success();
+    let body = body_of(repo, "scaffolded");
+    assert!(
+        body.contains("# Scaffolded Thing"),
+        "title substituted: {body}"
+    );
+    assert!(body.contains("## Gap"), "audit scaffold used");
+    assert!(body.contains("scaffolded"), "id substituted");
+    assert!(
+        !body.contains("{{title}}") && !body.contains("{{id}}"),
+        "no placeholders left"
+    );
+
+    // An explicit --body overrides the template.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "explicit",
+            "--title",
+            "Explicit",
+            "--template",
+            "audit",
+            "--body",
+            "just this",
+        ])
+        .assert()
+        .success();
+    let body = body_of(repo, "explicit");
+    assert!(body.contains("just this") && !body.contains("## Gap"));
+
+    // An unknown template is exit 4.
+    tkt(repo)
+        .args(["create", "--id", "x", "--title", "X", "--template", "ghost"])
+        .assert()
+        .code(4);
+
+    // A batch spec can name a template too (JSON), with per-id substitution.
+    tkt(repo)
+        .args(["create", "--from", "-"])
+        .write_stdin(r#"[{"id":"batched","title":"Batched","template":"default"}]"#)
+        .assert()
+        .success();
+    let body = body_of(repo, "batched");
+    assert!(body.contains("# Batched") && body.contains("## Goal"));
+}

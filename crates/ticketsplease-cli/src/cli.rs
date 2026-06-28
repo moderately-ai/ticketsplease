@@ -160,6 +160,10 @@ pub struct CreateArgs {
     /// Markdown body.
     #[arg(long, default_value = "")]
     pub body: String,
+    /// Scaffold the body from `.ticketsplease/templates/<name>.md` ({{title}}/{{id}}
+    /// substituted). Ignored if --body is non-empty.
+    #[arg(long)]
+    pub template: Option<String>,
     /// Preview what would be created without writing anything.
     #[arg(long)]
     pub dry_run: bool,

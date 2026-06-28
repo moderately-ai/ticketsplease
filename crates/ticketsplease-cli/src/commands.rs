@@ -29,6 +29,7 @@ use crate::cli::{
 };
 use crate::format::{print_json, Format};
 use crate::skill;
+use crate::templates;
 use crate::update;
 
 /// `init` — scaffold the tickets directory and config.
@@ -45,6 +46,9 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
                 .to_string(),
         )
     };
+    // Seed the example body templates so `create --template` has something to use and
+    // the house convention is discoverable.
+    let templates_path = templates::install(repo)?.display().to_string();
     let has_git = git_ref_exists(repo, "HEAD");
     match fmt {
         Format::Json => print_json(&json!({
@@ -52,6 +56,7 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
             "tickets_dir": dir,
             "wrote_config": outcome.wrote_config,
             "skill_installed": skill_path,
+            "templates_installed": templates_path,
             "git": has_git,
         })),
         Format::Human => {
@@ -62,6 +67,7 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
             if let Some(path) = &skill_path {
                 println!("Installed Claude skill to {path}");
             }
+            println!("Seeded body templates to {templates_path}");
             println!("\nNext steps:");
             println!("  1. Define your [scopes] in {CONFIG_FILE} (scope name -> path globs).");
             println!("  2. Create a ticket:  tkt create --title \"...\" --scope <scope>");
@@ -121,6 +127,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let tags = norm_list(&args.tags);
 
     let build = |id: &str| -> Result<String> {
+        let body = resolve_create_body(repo, &args.body, args.template.as_deref(), id, title)?;
         Ticket::new(
             id,
             title,
@@ -131,7 +138,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
             &scopes,
             &paths,
             &tags,
-            &args.body,
+            &body,
         )
         .map(|t| t.render())
     };
@@ -155,6 +162,26 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     // Single and batch create share one result shape: a `results` array of
     // per-ticket {id, created, path}. A consumer reads `.results[]` either way.
     emit_create_results(fmt, &store, &[(id, outcome)], false)
+}
+
+/// Resolve a new ticket's body: an explicit `--body` wins; otherwise a `--template`
+/// is loaded from `.ticketsplease/templates/` and `{{title}}`/`{{id}}`-substituted;
+/// otherwise the body is empty. `{{id}}` resolves to the *final* id (so an auto-id
+/// batch element gets the right substitution).
+fn resolve_create_body(
+    repo: &Path,
+    body: &str,
+    template: Option<&str>,
+    id: &str,
+    title: &str,
+) -> Result<String> {
+    if !body.is_empty() {
+        Ok(body.to_string())
+    } else if let Some(name) = template {
+        templates::load(repo, name, id, title)
+    } else {
+        Ok(String::new())
+    }
 }
 
 /// Preview outcome for `--dry-run`: a ticket that already exists would be unchanged,
@@ -239,6 +266,8 @@ struct TicketSpec {
     tags: Vec<String>,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    template: Option<String>,
 }
 
 /// The TOML manifest shape: `[[ticket]]` array-of-tables (also accepts `[[tickets]]`).
@@ -286,11 +315,15 @@ struct ParsedSpec {
     paths: Vec<String>,
     tags: Vec<String>,
     body: String,
+    template: Option<String>,
 }
 
 impl ParsedSpec {
-    /// Render this spec's ticket contents for a chosen id.
-    fn render(&self, id: &str) -> Result<String> {
+    /// Render this spec's ticket contents for a chosen id. `repo` is needed to resolve
+    /// a `template` body (with `{{id}}` bound to the final id).
+    fn render(&self, repo: &Path, id: &str) -> Result<String> {
+        let body =
+            resolve_create_body(repo, &self.body, self.template.as_deref(), id, &self.title)?;
         Ticket::new(
             id,
             &self.title,
@@ -301,7 +334,7 @@ impl ParsedSpec {
             &self.scopes,
             &self.paths,
             &self.tags,
-            &self.body,
+            &body,
         )
         .map(|t| t.render())
     }
@@ -331,6 +364,7 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
                 paths: norm_list(&s.paths),
                 tags: norm_list(&s.tags),
                 body: s.body,
+                template: s.template,
             })
         })
         .collect::<Result<_>>()?;
@@ -341,7 +375,7 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
     for spec in &specs {
         if let Some(id) = &spec.id {
             store::validate_slug(id)?;
-            let contents = spec.render(id)?;
+            let contents = spec.render(&store.repo_root, id)?;
             let path = store.path_for(id);
             if path.exists() && std::fs::read_to_string(&path).map_err(Error::Io)? != contents {
                 return Err(Error::Invalid(format!(
@@ -349,8 +383,8 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
                 )));
             }
         } else {
-            // Render at the base id just to surface any Ticket::new error before writing.
-            spec.render(&store::slugify(&spec.title))?;
+            // Render at the base id just to surface any render error before writing.
+            spec.render(&store.repo_root, &store::slugify(&spec.title))?;
         }
     }
 
@@ -374,9 +408,14 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
     let mut results = Vec::with_capacity(specs.len());
     for spec in &specs {
         let item = if let Some(id) = &spec.id {
-            (id.clone(), store.create_exact(id, &spec.render(id)?)?)
+            (
+                id.clone(),
+                store.create_exact(id, &spec.render(&store.repo_root, id)?)?,
+            )
         } else {
-            store.create_unique_idempotent(&store::slugify(&spec.title), |id| spec.render(id))?
+            store.create_unique_idempotent(&store::slugify(&spec.title), |id| {
+                spec.render(&store.repo_root, id)
+            })?
         };
         results.push(item);
     }

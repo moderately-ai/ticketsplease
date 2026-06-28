@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod format;
 mod skill;
+mod templates;
 mod update;
 
 use std::process::ExitCode;
