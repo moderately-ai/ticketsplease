@@ -267,6 +267,10 @@ pub struct SetArgs {
     /// Append the body from a file; `-` reads stdin.
     #[arg(long = "append-body-file")]
     pub append_body_file: Option<String>,
+    /// Bypass workflow transition enforcement for this change (records `forced` in the
+    /// emitted status event). No effect unless `[workflow] enforce_transitions` is on.
+    #[arg(long)]
+    pub force: bool,
     /// Preview the change without writing anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -283,6 +287,9 @@ pub struct CloseArgs {
     /// One-line note explaining the close.
     #[arg(long, allow_hyphen_values = true)]
     pub note: Option<String>,
+    /// Bypass workflow transition enforcement for this close.
+    #[arg(long)]
+    pub force: bool,
     /// Preview the change without writing anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -296,6 +303,9 @@ pub struct ReopenArgs {
     /// Active status to reopen into. Defaults to `todo`.
     #[arg(long, default_value = "todo")]
     pub status: String,
+    /// Bypass workflow transition enforcement for this reopen.
+    #[arg(long)]
+    pub force: bool,
     /// Preview the change without writing anything.
     #[arg(long)]
     pub dry_run: bool,

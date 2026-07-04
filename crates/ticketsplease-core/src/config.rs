@@ -85,6 +85,43 @@ impl Config {
             StateRegistry::from_defs(&self.workflow.states)
         }
     }
+
+    /// Whether a user-initiated `from -> to` status transition is permitted. Always `true`
+    /// when `[workflow] enforce_transitions` is off (the default, any-to-any) or the change
+    /// is a no-op; otherwise `true` only for an explicit `[workflow.transitions]` edge or a
+    /// `"*"` wildcard source. Case-insensitive. Engine-driven transitions (claim/release)
+    /// do not route through here and are never gated.
+    #[must_use]
+    pub fn can_transition(&self, from: &str, to: &str) -> bool {
+        if !self.workflow.enforce_transitions || from.eq_ignore_ascii_case(to) {
+            return true;
+        }
+        let permits = |src: &str| {
+            self.workflow
+                .transitions
+                .get(src)
+                .is_some_and(|targets| targets.iter().any(|t| t.eq_ignore_ascii_case(to)))
+        };
+        permits(&from.trim().to_ascii_lowercase()) || permits("*")
+    }
+
+    /// The legal target states from `from` under `[workflow.transitions]` (explicit edges
+    /// plus any `"*"` wildcard), for error messages. Sorted and deduped.
+    #[must_use]
+    pub fn legal_transitions(&self, from: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .workflow
+            .transitions
+            .get(&from.trim().to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(wild) = self.workflow.transitions.get("*") {
+            out.extend(wild.iter().cloned());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 /// Workflow configuration (`[workflow]`): custom lifecycle states and optional
@@ -241,5 +278,24 @@ mod tests {
         assert!(omitted.language.reverse_dep_expansion, "omitted -> true");
         let off: Config = toml::from_str("[language]\nreverse_dep_expansion = false\n").unwrap();
         assert!(!off.language.reverse_dep_expansion);
+    }
+
+    #[test]
+    fn transitions_enforced_only_when_enabled() {
+        // Enforcement off (the default): any transition is allowed.
+        let off = Config::default();
+        assert!(off.can_transition("todo", "done"));
+
+        let on: Config = toml::from_str(
+            "[workflow]\nenforce_transitions = true\n\
+             [workflow.transitions]\ntodo = [\"in-progress\"]\n\"*\" = [\"closed\"]\n",
+        )
+        .unwrap();
+        assert!(on.can_transition("todo", "in-progress")); // explicit edge
+        assert!(on.can_transition("review", "closed")); // "*" wildcard
+        assert!(on.can_transition("todo", "todo")); // no-op is always allowed
+        assert!(on.can_transition("TODO", "In-Progress")); // case-insensitive
+        assert!(!on.can_transition("todo", "review")); // not permitted
+        assert_eq!(on.legal_transitions("todo"), vec!["closed", "in-progress"]);
     }
 }

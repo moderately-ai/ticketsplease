@@ -609,12 +609,38 @@ fn apply_set_field_mutations(
 
 /// The `data` payload for a `status` activity event. Carries the close reason when the
 /// ticket landed in `closed`, so the log records *why* it ended, not just the transition.
-fn status_event_data(ticket: &Ticket, from: &str) -> Value {
+fn status_event_data(ticket: &Ticket, from: &str, forced: bool) -> Value {
     let mut data = json!({ "status": ticket.status, "from": from });
     if let Some(reason) = ticket.closed_reason {
         data["reason"] = json!(reason.as_str());
     }
+    if forced {
+        data["forced"] = json!(true);
+    }
     data
+}
+
+/// Enforce the workflow transition graph for a user-initiated status change. Returns
+/// whether the change was force-overridden (recorded on the audit event). A blocked
+/// transition without `--force` is a `Conflict` (exit 6); engine transitions
+/// (claim/release) do not route through here and are never gated.
+fn check_transition(config: &Config, from: &str, to: &str, force: bool) -> Result<bool> {
+    if config.can_transition(from, to) {
+        return Ok(false);
+    }
+    if force {
+        return Ok(true); // forced override
+    }
+    let legal = config.legal_transitions(from);
+    let targets = if legal.is_empty() {
+        "(none — add a `[workflow.transitions]` edge or pass --force)".to_string()
+    } else {
+        legal.join(", ")
+    };
+    Err(Error::Conflict(format!(
+        "transition `{from}` -> `{to}` is not an allowed workflow transition \
+         (legal from `{from}`: {targets}); pass --force to override"
+    )))
 }
 
 /// Single-ticket `set` (an explicit id). Body edits and title apply here.
@@ -625,6 +651,11 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
     let before = ticket.render();
     let status_before = ticket.status.clone();
 
+    // Enforce the workflow transition graph on a user status change, before mutating.
+    let forced = match &args.status {
+        Some(to) => check_transition(&store.config, &status_before, to, args.force)?,
+        None => false,
+    };
     let deps_added = apply_set_field_mutations(&mut ticket, args, &registry)?;
     // Reject a dependency edit that would close a cycle, exactly like `link`. Related
     // links carry no ordering, so they need no cycle check.
@@ -660,7 +691,7 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
                 "status",
                 &ticket.id,
                 None,
-                status_event_data(&ticket, &status_before),
+                status_event_data(&ticket, &status_before, forced),
             );
         }
     }
@@ -717,6 +748,21 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
         }
         let before = ticket.render();
         let status_before = ticket.status.clone();
+        // Skip (don't abort the whole batch) a matched ticket whose status change is a
+        // disallowed transition — the legal matches still advance.
+        let mut forced = false;
+        if let Some(to) = &args.status {
+            if !store.config.can_transition(&status_before, to) {
+                if args.force {
+                    forced = true;
+                } else {
+                    results.push(
+                        json!({ "id": ticket.id, "changed": false, "skipped": "illegal-transition" }),
+                    );
+                    continue;
+                }
+            }
+        }
         any_deps_added |= apply_set_field_mutations(ticket, args, &registry)?;
         if ticket.is_terminal() {
             ticket.clear_lease();
@@ -726,7 +772,10 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
         if changed {
             to_save.push(i);
             if ticket.status != status_before {
-                events.push((ticket.id.clone(), status_event_data(ticket, &status_before)));
+                events.push((
+                    ticket.id.clone(),
+                    status_event_data(ticket, &status_before, forced),
+                ));
             }
         }
     }
@@ -816,6 +865,7 @@ pub fn close(repo: &Path, fmt: Format, args: &CloseArgs) -> Result<()> {
     let before = ticket.render();
     let status_before = ticket.status.clone();
 
+    let forced = check_transition(&store.config, &status_before, &dropped, args.force)?;
     ticket.set_status(&dropped, &registry)?;
     if let Some(reason) = &args.reason {
         ticket.set_closed_reason(reason.parse()?)?;
@@ -833,7 +883,7 @@ pub fn close(repo: &Path, fmt: Format, args: &CloseArgs) -> Result<()> {
                 "status",
                 &ticket.id,
                 None,
-                status_event_data(&ticket, &status_before),
+                status_event_data(&ticket, &status_before, forced),
             );
         }
     }
@@ -871,6 +921,7 @@ pub fn reopen(repo: &Path, fmt: Format, args: &ReopenArgs) -> Result<()> {
             "reopen target `{target}` is itself terminal; choose an active status (e.g. todo)"
         )));
     }
+    let forced = check_transition(&store.config, &status_before, target, args.force)?;
     let before = ticket.render();
     ticket.set_status(target, &registry)?; // clears closed_reason/closed_note atomically
     let changed = ticket.render() != before;
@@ -880,7 +931,7 @@ pub fn reopen(repo: &Path, fmt: Format, args: &ReopenArgs) -> Result<()> {
             "status",
             &ticket.id,
             None,
-            status_event_data(&ticket, &status_before),
+            status_event_data(&ticket, &status_before, forced),
         );
     }
     emit_transition_result(

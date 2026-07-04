@@ -20,8 +20,9 @@ pub struct Diagnostic {
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
     /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id`
-    /// | `unknown-state` | `state-coverage` | `stale-resolution` | `missing-dep` |
-    /// `missing-related` | `cycle`.
+    /// | `unknown-state` | `state-coverage` | `unknown-transition-state` |
+    /// `dead-end-nonterminal` | `stale-resolution` | `missing-dep` | `missing-related` |
+    /// `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -42,6 +43,54 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
             code: "state-coverage",
             message: e.message(),
         });
+    }
+    // Validate the transition graph when one is declared: every edge must name a defined
+    // state, and — only under enforcement — a non-terminal state needs a way out (else a
+    // ticket there can never advance).
+    let wf = &store.config.workflow;
+    if !wf.transitions.is_empty() {
+        for (from, targets) in &wf.transitions {
+            if from != "*" && !registry.contains(from) {
+                diags.push(Diagnostic {
+                    file: CONFIG_FILE.to_string(),
+                    id: None,
+                    code: "unknown-transition-state",
+                    message: format!(
+                        "[workflow.transitions] source `{from}` is not a defined state"
+                    ),
+                });
+            }
+            for to in targets {
+                if !registry.contains(to) {
+                    diags.push(Diagnostic {
+                        file: CONFIG_FILE.to_string(),
+                        id: None,
+                        code: "unknown-transition-state",
+                        message: format!(
+                            "[workflow.transitions] `{from}` -> `{to}` targets an undefined state"
+                        ),
+                    });
+                }
+            }
+        }
+        if wf.enforce_transitions {
+            let wildcard_out = wf.transitions.get("*").is_some_and(|t| !t.is_empty());
+            for name in registry.ordered_names() {
+                let has_out =
+                    wf.transitions.get(name).is_some_and(|t| !t.is_empty()) || wildcard_out;
+                if !registry.class(name).is_terminal() && !has_out {
+                    diags.push(Diagnostic {
+                        file: CONFIG_FILE.to_string(),
+                        id: None,
+                        code: "dead-end-nonterminal",
+                        message: format!(
+                            "state `{name}` is non-terminal but has no outbound transition — a \
+                             ticket there can never advance"
+                        ),
+                    });
+                }
+            }
+        }
     }
     // A scope is "defined" if it has a glob mapping, an owning crate, or an external
     // descriptor. A ticket declaring an undefined scope (a typo) would otherwise only

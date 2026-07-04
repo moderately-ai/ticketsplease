@@ -107,6 +107,7 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 "core" = { weight = 0 }        # weight 0 = a free-to-co-edit hub; higher = riskier (default 1)
 
 [workflow]                     # custom lifecycle states (optional; omit for the built-in set)
+enforce_transitions = false    # opt-in state machine; default off (any state -> any state)
 [workflow.states.todo]
 category = "dispatchable"       # dispatchable | open | parked | terminal — the engine contract
 [workflow.states.qa]
@@ -117,6 +118,10 @@ satisfies_dependents = true    # a completed terminal state — unblocks depende
 [workflow.states.wontfix]
 category = "terminal"
 satisfies_dependents = false   # a dropped/cancelled terminal state — orphans dependents
+[workflow.transitions]         # only consulted when enforce_transitions = true
+todo = ["qa"]
+qa   = ["shipped", "wontfix"]
+"*"  = ["wontfix"]            # escape hatch: cancel from any state
 ```
 
 When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo). Each collision is tagged `cause: "direct"` (a real file/crate overlap) or `"transitive"` (reached only via the reverse-dep walk — safe for an additive change), and a per-scope `affected_causes` map lets a consumer triage which under-declarations and collisions are real rather than hand-diffing. Pass `guard --direct-only` (alias `--no-reverse-deps`) to gate on direct overlap only and skip the expansion entirely.
@@ -124,6 +129,8 @@ When `backend = "rust"`, the guard maps a branch's changed files to crates and w
 `[external_scopes]` extends the guard beyond this repo: a branch that bumps a pinned `git = … rev = …` dependency (matched by `repo` against the changed manifest lines) — or edits an in-tree fork `paths` glob — is flagged against tickets declaring that external scope. Because external scopes are ordinary scope names, `tracks` already keeps two tickets touching the same fork in separate batches.
 
 **Custom workflow states.** With no `[workflow]` table a repo uses the built-in states (`todo`, `ready`, `in-progress`, `blocked`, `review`, `done`, `closed`). Define `[workflow.states]` to declare your own — each state's **name** is yours to choose, but it must be pinned to one engine **category** the scheduler/guard/rollup reason about: `dispatchable` (pickable), `open` (occupies its scopes for the guard, blocks conflicting parallel work), `parked` (held but not finished, like `blocked`), or `terminal` (finished, excluded from scheduling). A terminal state's `satisfies_dependents` bit *is* the done-vs-closed distinction — `true` unblocks dependents, `false` orphans them. `tkt states` lists the effective registry; `tkt lint` rejects a config with no dispatchable or terminal state; `tkt migrate --remap old=new` moves tickets stranded by a renamed/removed state. Because the engine keys on the category (never the name), renaming a state while keeping its category never breaks scheduling.
+
+**Enforced transitions (opt-in).** Set `enforce_transitions = true` and declare a `[workflow.transitions]` adjacency map (`from = [to, …]`) to make `set`/`close`/`reopen` reject any move that isn't a listed edge — for a QA gate or a no-skip-review rule. It is **off by default** (any-to-any): the engine's real invariants ride on categories, not edges, so the transition graph is a convenience constraint, not a requirement — add it only when you have evidence you need it. A `"*"` source is an escape hatch (e.g. close-from-anywhere), `--force` overrides a single move (recorded as `forced` on the event), and `claim`/`release` are engine transitions exempt from the graph. Bulk `set --where` advances the legal matches and reports the rest as skipped rather than aborting. `tkt lint` flags transition edges that name undefined states and non-terminal dead-ends (a state with no way out).
 
 ## Tool-managed state — `.ticketsplease/`
 

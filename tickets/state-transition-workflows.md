@@ -1,7 +1,7 @@
 ---
 id: state-transition-workflows
 title: "Opt-in state-transition enforcement (allowed transitions)"
-status: todo
+status: done
 priority: p2
 dependencies: [config-custom-states]
 related: [closed-status-resolution]

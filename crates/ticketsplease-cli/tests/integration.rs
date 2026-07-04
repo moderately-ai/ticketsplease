@@ -4411,3 +4411,126 @@ fn workflow_coverage_is_validated() {
         .any(|d| d["code"] == "state-coverage"));
     tkt(repo).args(["lint"]).assert().code(3);
 }
+
+/// A workflow with `enforce_transitions` and an explicit graph (todo → in-progress →
+/// {review, done}, plus a `"*"` → closed escape hatch).
+const ENFORCED_WORKFLOW: &str = "\n[workflow]\nenforce_transitions = true\n\
+     [workflow.states.todo]\ncategory = \"dispatchable\"\n\
+     [workflow.states.in-progress]\ncategory = \"open\"\n\
+     [workflow.states.review]\ncategory = \"open\"\n\
+     [workflow.states.done]\ncategory = \"terminal\"\nsatisfies_dependents = true\n\
+     [workflow.states.closed]\ncategory = \"terminal\"\nsatisfies_dependents = false\n\
+     [workflow.transitions]\ntodo = [\"in-progress\"]\nin-progress = [\"review\", \"done\"]\n\
+     review = [\"in-progress\", \"done\"]\n\"*\" = [\"closed\"]\n";
+
+#[test]
+fn transition_enforcement_gates_status_changes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    git_init_commit(repo);
+    append_config(repo, ENFORCED_WORKFLOW);
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+
+    // An illegal jump (todo -> done) is refused with a Conflict (exit 6)...
+    tkt(repo)
+        .args(["set", "t", "--status", "done"])
+        .assert()
+        .code(6);
+    // ...but the legal edge todo -> in-progress works, then in-progress -> done.
+    tkt(repo)
+        .args(["set", "t", "--status", "in-progress"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "t", "--status", "done"])
+        .assert()
+        .success();
+    // The `"*"` wildcard lets any state reach `closed`.
+    tkt(repo)
+        .args(["set", "t", "--status", "closed"])
+        .assert()
+        .success();
+    // --force overrides a blocked transition (closed -> in-progress is not an edge) and
+    // records `forced` on the emitted event.
+    let out = tkt(repo)
+        .args(["set", "t", "--status", "in-progress", "--force"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // claim is an engine transition, exempt from the graph: reset to todo (forced) then
+    // claim advances it to the open state without a `todo -> in-progress` gate check.
+    tkt(repo)
+        .args(["set", "t", "--status", "todo", "--force"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["claim", "t", "--as", "w1"])
+        .assert()
+        .success();
+
+    // Bulk `set` skips illegal transitions instead of aborting: with `a` todo and `b`
+    // in-progress, `--status done` advances only `b` (in-progress -> done is legal).
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "b", "--status", "in-progress"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args([
+            "set",
+            "--where",
+            "id:a OR id:b",
+            "--status",
+            "done",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = v["results"].as_array().unwrap();
+    let a = results.iter().find(|r| r["id"] == "a").unwrap();
+    let b = results.iter().find(|r| r["id"] == "b").unwrap();
+    assert_eq!(a["skipped"], "illegal-transition");
+    assert_eq!(b["changed"], true);
+}
+
+#[test]
+fn enforced_dead_end_state_is_linted() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // `review` is a non-terminal open state with no outbound edge and no `"*"` — a ticket
+    // there could never advance, so lint flags it.
+    append_config(
+        repo,
+        "\n[workflow]\nenforce_transitions = true\n\
+         [workflow.states.todo]\ncategory = \"dispatchable\"\n\
+         [workflow.states.review]\ncategory = \"open\"\n\
+         [workflow.states.done]\ncategory = \"terminal\"\nsatisfies_dependents = true\n\
+         [workflow.transitions]\ntodo = [\"review\"]\n",
+    );
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "dead-end-nonterminal"
+            && d["message"].as_str().unwrap().contains("review")));
+}
