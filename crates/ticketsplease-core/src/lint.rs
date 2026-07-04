@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::config::CONFIG_FILE;
 use crate::error::{Error, Result};
 use crate::store::Store;
-use crate::ticket::Ticket;
+use crate::ticket::{Status, Ticket};
 
 /// A single lint finding.
 #[derive(Debug, Clone, Serialize)]
@@ -20,7 +20,7 @@ pub struct Diagnostic {
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
     /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id`
-    /// | `missing-dep` | `missing-related` | `cycle`.
+    /// | `stale-resolution` | `missing-dep` | `missing-related` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -112,6 +112,22 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                             ),
                         });
                     }
+                }
+                // Resolution metadata is only meaningful on a `closed` ticket. If it
+                // lingers on a non-closed one (e.g. a hand-edit that flipped status but
+                // left the reason), the "why" contradicts the live status.
+                if ticket.status != Status::Closed
+                    && (ticket.closed_reason.is_some() || ticket.closed_note.is_some())
+                {
+                    diags.push(Diagnostic {
+                        file: file.clone(),
+                        id: Some(ticket.id.clone()),
+                        code: "stale-resolution",
+                        message: format!(
+                            "has closed_reason/closed_note but status is `{}`, not `closed`",
+                            ticket.status
+                        ),
+                    });
                 }
                 if let Some(prev) = seen.insert(ticket.id.clone(), file.clone()) {
                     diags.push(Diagnostic {

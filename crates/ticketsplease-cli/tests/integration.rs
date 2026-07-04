@@ -4159,3 +4159,134 @@ fn skill_links_to_canonical_and_sync_refreshes() {
     assert!(tkt_x(&["skill", "sync"]).status.success());
     assert!(skill_check("skill_canonical"), "sync clears the drift");
 }
+
+#[test]
+fn close_reopen_and_orphaned_dependents() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "base", "--title", "Base", "--tag", "m1"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "web",
+            "--title",
+            "Web",
+            "--tag",
+            "m1",
+            "--depends-on",
+            "base",
+        ])
+        .assert()
+        .success();
+    git_init_commit(repo);
+
+    // --reason without --status closed is rejected (exit 3).
+    tkt(repo)
+        .args(["set", "base", "--reason", "wontdo"])
+        .assert()
+        .code(3);
+
+    // Close base as abandoned: it leaves the ready frontier and records the resolution.
+    tkt(repo)
+        .args([
+            "close",
+            "base",
+            "--reason",
+            "wontdo",
+            "--note",
+            "superseded",
+        ])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["show", "base", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "closed");
+    assert_eq!(v["closed_reason"], "wontdo");
+    assert_eq!(v["closed_note"], "superseded");
+
+    // A closed dependency does NOT satisfy: web is never silently dispatched.
+    assert!(!ready_ids(repo).iter().any(|id| id == "web"));
+
+    // rollup: base counts as closed (not done); web is orphaned, not merely blocked.
+    let out = tkt(repo)
+        .args(["rollup", "--tag", "m1", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["done"], 0);
+    assert_eq!(v["closed"], 1);
+    assert_eq!(v["by_status"]["closed"], 1);
+    let orphaned = v["orphaned"].as_array().unwrap();
+    assert_eq!(orphaned.len(), 1);
+    assert_eq!(orphaned[0]["id"], "web");
+    assert_eq!(orphaned[0]["closed_deps"][0], "base");
+    assert!(v["blocked"].as_array().unwrap().is_empty());
+
+    // The reason is queryable; a typo fails loudly (exit 3).
+    let out = tkt(repo)
+        .args(["list", "--where", "reason:wontdo", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["base"]);
+    tkt(repo)
+        .args(["list", "--where", "reason:bogus"])
+        .assert()
+        .code(3);
+
+    // Claiming the orphan is refused with an orphan-specific message (exit 6).
+    let out = tkt(repo)
+        .args(["claim", "web", "--as", "w1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("orphaned"),
+        "claim error names the orphan"
+    );
+
+    // lint fails while the orphan stands — a dead dependency link, like a dangling dep.
+    tkt(repo).args(["lint"]).assert().code(3);
+
+    // Reopen base into an active status, clearing the resolution atomically.
+    tkt(repo).args(["reopen", "base"]).assert().success();
+    let out = tkt(repo)
+        .args(["show", "base", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "todo");
+    assert!(v["closed_reason"].is_null());
+    assert!(v["closed_note"].is_null());
+
+    // base is now todo (not done): web is merely blocked, not orphaned, and lint is clean.
+    let out = tkt(repo)
+        .args(["rollup", "--tag", "m1", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["orphaned"].as_array().unwrap().is_empty());
+    assert_eq!(v["blocked"].as_array().unwrap()[0]["id"], "web");
+    tkt(repo).args(["lint"]).assert().success();
+
+    // Completing base the normal way unblocks web.
+    tkt(repo)
+        .args(["set", "base", "--status", "done"])
+        .assert()
+        .success();
+    assert_eq!(ready_ids(repo), vec!["web"]);
+}

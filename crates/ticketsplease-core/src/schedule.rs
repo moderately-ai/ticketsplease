@@ -41,15 +41,15 @@ impl<'a> Graph<'a> {
         if let Some(cycle) = find_cycle(&by_id) {
             return Err(Error::Cycle(cycle.join(" -> ")));
         }
-        // Reverse edges for `next` scoring: id -> NOT-done tickets that depend on it.
-        // Done dependents are excluded so "downstream work this unblocks" counts only
-        // work that is actually still waiting.
+        // Reverse edges for `next` scoring: id -> unfinished tickets that depend on it.
+        // Terminal dependents (done or closed) are excluded so "downstream work this
+        // unblocks" counts only work that is actually still waiting.
         let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for t in tickets {
             dependents.entry(t.id.as_str()).or_default();
         }
         for t in tickets {
-            if t.status == Status::Done {
+            if t.status.is_terminal() {
                 continue;
             }
             for d in &t.dependencies {
@@ -66,13 +66,16 @@ impl<'a> Graph<'a> {
         Ok(Self { by_id, dependents })
     }
 
-    /// Dispatchable = open for dispatch (todo/ready) with every dependency done.
+    /// Dispatchable = open for dispatch (todo/ready) with every dependency satisfied
+    /// (each prerequisite `done`). A `closed` (abandoned) dependency does *not* satisfy,
+    /// so the dependent is held out of dispatch — surfaced as orphaned, never silently
+    /// scheduled onto dropped work.
     fn is_dispatchable(&self, t: &Ticket) -> bool {
         t.status.is_dispatchable()
             && t.dependencies.iter().all(|d| {
                 self.by_id
                     .get(d.as_str())
-                    .is_some_and(|dep| dep.status == Status::Done)
+                    .is_some_and(|dep| dep.status.completes_dependencies())
             })
     }
 
@@ -341,13 +344,33 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
     let by_id: BTreeMap<&str, &Ticket> = tickets.iter().map(|t| (t.id.as_str(), t)).collect();
     for t in tickets {
         for d in &t.dependencies {
-            if !by_id.contains_key(d.as_str()) {
-                out.push(Diagnostic {
+            match by_id.get(d.as_str()) {
+                None => out.push(Diagnostic {
                     file: format!("{}.md", t.id),
                     id: Some(t.id.clone()),
                     code: "missing-dep",
                     message: format!("depends on missing ticket `{d}`"),
-                });
+                }),
+                // A live ticket whose prerequisite was `closed` (terminal but not
+                // completing) is orphaned: it will never be dispatched and never
+                // deadlock-visibly — surface it like a dead dependency so it is
+                // re-pointed, waived, or closed rather than silently stuck.
+                Some(dep)
+                    if !t.status.is_terminal()
+                        && dep.status.is_terminal()
+                        && !dep.status.completes_dependencies() =>
+                {
+                    out.push(Diagnostic {
+                        file: format!("{}.md", t.id),
+                        id: Some(t.id.clone()),
+                        code: "orphaned-by-closed-dep",
+                        message: format!(
+                            "depends on `{d}` which was closed without completing \
+                             (re-point, waive, or close this ticket)"
+                        ),
+                    });
+                }
+                Some(_) => {}
             }
         }
         // Related links are non-blocking (no ordering), so a dangling one is a typo
@@ -1006,6 +1029,28 @@ mod tests {
     }
 
     #[test]
+    fn link_diagnostics_flags_orphaned_by_closed_dependency() {
+        // `a` (live) depends on `base`, which was closed without completing: a is orphaned.
+        let orphan = vec![
+            t("base", "closed", "p1", &[], &[]),
+            t("a", "todo", "p1", &["base"], &[]),
+        ];
+        assert!(link_diagnostics(&orphan)
+            .iter()
+            .any(|d| d.code == "orphaned-by-closed-dep" && d.id.as_deref() == Some("a")));
+        // A done dependency is satisfied, not an orphan; a terminal dependent is moot.
+        let ok = vec![
+            t("base", "done", "p1", &[], &[]),
+            t("a", "todo", "p1", &["base"], &[]),
+            t("b", "closed", "p1", &["base2"], &[]),
+            t("base2", "closed", "p1", &[], &[]),
+        ];
+        assert!(!link_diagnostics(&ok)
+            .iter()
+            .any(|d| d.code == "orphaned-by-closed-dep"));
+    }
+
+    #[test]
     fn graph_export_carries_edges_and_scoring_metrics() {
         let tickets = vec![
             t("base", "todo", "p0", &[], &[]),
@@ -1124,6 +1169,36 @@ mod tests {
         );
         // And `why` should not order them: neither depends on the other.
         assert!(!why(&tickets, "a", "b").unwrap().dependency_ordered);
+    }
+
+    #[test]
+    fn closed_dependency_does_not_satisfy_dependents() {
+        // base is CLOSED (abandoned), not done: `a` must NOT become ready — a closed
+        // prerequisite must never silently unblock work built on top of it.
+        let orphaned = vec![
+            t("base", "closed", "p1", &[], &[]),
+            t("a", "todo", "p1", &["base"], &[]),
+        ];
+        let ids: Vec<&str> = ready(&orphaned)
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(
+            ids.is_empty(),
+            "a is orphaned by a closed dep, not ready: {ids:?}"
+        );
+        // Contrast: a done prerequisite does satisfy it.
+        let done = vec![
+            t("base", "done", "p1", &[], &[]),
+            t("a", "todo", "p1", &["base"], &[]),
+        ];
+        let ids: Vec<&str> = ready(&done)
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a"]);
     }
 
     #[test]

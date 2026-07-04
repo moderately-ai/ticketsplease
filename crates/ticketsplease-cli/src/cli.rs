@@ -40,6 +40,11 @@ pub enum Command {
     Create(CreateArgs),
     /// Update a ticket's fields.
     Set(SetArgs),
+    /// Close a ticket as terminated-without-completion (won't-do, duplicate, obsolete,
+    /// …) — terminal like `done`, but does not satisfy its dependents.
+    Close(CloseArgs),
+    /// Reopen a closed (or done) ticket into an active status, clearing its resolution.
+    Reopen(ReopenArgs),
     /// Add or remove a dependency link between tickets.
     Link(LinkArgs),
     /// Show a single ticket.
@@ -139,7 +144,7 @@ pub struct CreateArgs {
     /// Explicit id (slug); defaults to a slug of the title.
     #[arg(long)]
     pub id: Option<String>,
-    /// Status: todo | ready | in-progress | blocked | review | done.
+    /// Status: todo | ready | in-progress | blocked | review | done | closed.
     #[arg(long, default_value = "todo")]
     pub status: String,
     /// Priority: p0 | p1 | p2 | p3.
@@ -199,6 +204,14 @@ pub struct SetArgs {
     /// New status.
     #[arg(long)]
     pub status: Option<String>,
+    /// Close reason — only valid alongside `--status closed`: duplicate | wontdo |
+    /// obsolete | superseded | cancelled. Cleared automatically when the ticket
+    /// later leaves `closed`.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// One-line note explaining a close — only valid alongside `--status closed`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub note: Option<String>,
     /// New priority.
     #[arg(long)]
     pub priority: Option<String>,
@@ -252,6 +265,35 @@ pub struct SetArgs {
     /// Append the body from a file; `-` reads stdin.
     #[arg(long = "append-body-file")]
     pub append_body_file: Option<String>,
+    /// Preview the change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// `close` arguments.
+#[derive(Args)]
+pub struct CloseArgs {
+    /// Ticket id to close.
+    pub id: String,
+    /// Why it is being closed: duplicate | wontdo | obsolete | superseded | cancelled.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// One-line note explaining the close.
+    #[arg(long, allow_hyphen_values = true)]
+    pub note: Option<String>,
+    /// Preview the change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// `reopen` arguments.
+#[derive(Args)]
+pub struct ReopenArgs {
+    /// Ticket id to reopen (must currently be terminal: closed or done).
+    pub id: String,
+    /// Active status to reopen into. Defaults to `todo`.
+    #[arg(long, default_value = "todo")]
+    pub status: String,
     /// Preview the change without writing anything.
     #[arg(long)]
     pub dry_run: bool,
@@ -752,6 +794,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Init(a) => commands::init(repo, fmt, a),
         Command::Create(a) => commands::create(repo, fmt, a),
         Command::Set(a) => commands::set(repo, fmt, a),
+        Command::Close(a) => commands::close(repo, fmt, a),
+        Command::Reopen(a) => commands::reopen(repo, fmt, a),
         Command::Link(a) => commands::link(repo, fmt, a),
         Command::Show(a) => commands::show(repo, fmt, a),
         Command::List(a) => commands::list(repo, fmt, a),

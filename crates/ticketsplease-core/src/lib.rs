@@ -23,4 +23,4 @@ pub mod views;
 
 pub use error::{Error, Result};
 pub use store::Store;
-pub use ticket::{Priority, Status, Ticket};
+pub use ticket::{ClosedReason, Priority, Status, Ticket};

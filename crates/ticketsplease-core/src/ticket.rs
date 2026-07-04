@@ -28,8 +28,12 @@ pub enum Status {
     Blocked,
     /// Awaiting review.
     Review,
-    /// Complete.
+    /// Completed successfully.
     Done,
+    /// Terminated without completion — won't-do, duplicate, obsolete, superseded,
+    /// cancelled. Terminal like `done` (excluded from scheduling, drops its claim) but
+    /// deliberately does *not* satisfy dependents; see [`Status::completes_dependencies`].
+    Closed,
 }
 
 impl Status {
@@ -43,6 +47,7 @@ impl Status {
             Status::Blocked => "blocked",
             Status::Review => "review",
             Status::Done => "done",
+            Status::Closed => "closed",
         }
     }
 
@@ -58,6 +63,23 @@ impl Status {
     pub fn is_open(self) -> bool {
         matches!(self, Status::InProgress | Status::Review)
     }
+
+    /// Whether this is a terminal status (finished for scheduling): `done` or `closed`.
+    /// Terminal tickets are excluded from the ready/dispatch queue and drop their claim,
+    /// but only `done` also [`completes_dependencies`](Self::completes_dependencies).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Status::Done | Status::Closed)
+    }
+
+    /// Whether reaching this status satisfies a dependent's dependency — `done` only.
+    /// A `closed` (abandoned) prerequisite is terminal but deliberately does *not*
+    /// unblock its dependents: they are surfaced as orphaned rather than silently
+    /// dispatched onto dropped work or silently deadlocked.
+    #[must_use]
+    pub fn completes_dependencies(self) -> bool {
+        matches!(self, Status::Done)
+    }
 }
 
 impl FromStr for Status {
@@ -70,16 +92,74 @@ impl FromStr for Status {
             "blocked" => Status::Blocked,
             "review" => Status::Review,
             "done" => Status::Done,
+            "closed" => Status::Closed,
             _ => {
                 return Err(Error::Invalid(format!(
-                    "unknown status `{s}` (expected todo|ready|in-progress|blocked|review|done)"
-                )))
+                "unknown status `{s}` (expected todo|ready|in-progress|blocked|review|done|closed)"
+            )))
             }
         })
     }
 }
 
 impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a ticket was `closed` (terminated without completion). A deliberately small,
+/// fixed vocabulary — closed like GitHub's handful of close reasons, not Jira's
+/// sprawling customizable list — so it stays queryable and stable. A ticket may be
+/// closed with no reason at all; this is only recorded when one is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClosedReason {
+    /// A duplicate of another ticket.
+    Duplicate,
+    /// Decided against — will not be done.
+    WontDo,
+    /// No longer relevant.
+    Obsolete,
+    /// Replaced by a different ticket or approach.
+    Superseded,
+    /// Cancelled for another reason.
+    Cancelled,
+}
+
+impl ClosedReason {
+    /// The canonical lowercase string written to frontmatter.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClosedReason::Duplicate => "duplicate",
+            ClosedReason::WontDo => "wontdo",
+            ClosedReason::Obsolete => "obsolete",
+            ClosedReason::Superseded => "superseded",
+            ClosedReason::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for ClosedReason {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "duplicate" => ClosedReason::Duplicate,
+            "wontdo" => ClosedReason::WontDo,
+            "obsolete" => ClosedReason::Obsolete,
+            "superseded" => ClosedReason::Superseded,
+            "cancelled" => ClosedReason::Cancelled,
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "unknown close reason `{s}` (expected duplicate|wontdo|obsolete|superseded|cancelled)"
+                )))
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for ClosedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -173,6 +253,11 @@ pub struct Ticket {
     /// The status the ticket held before it was claimed, so `release` can restore it
     /// instead of unconditionally landing in `ready`. Present only while claimed.
     pub claimed_from: Option<Status>,
+    /// Why the ticket was closed, when `status: closed` and a reason was recorded.
+    /// Only meaningful while `closed`; cleared on any transition away.
+    pub closed_reason: Option<ClosedReason>,
+    /// A free-text one-line note accompanying a close. Cleared with `closed_reason`.
+    pub closed_note: Option<String>,
     doc: Document,
     /// The file this ticket was loaded from, if any. `save` writes back here so a
     /// ticket whose frontmatter `id` has drifted from its filename updates in place
@@ -217,6 +302,10 @@ impl Ticket {
             assignee: optional_string(y, "assignee"),
             lease_expires_at: optional_string(y, "lease_expires_at").and_then(|s| s.parse().ok()),
             claimed_from: optional_string(y, "claimed_from").and_then(|s| s.parse().ok()),
+            closed_reason: optional_string(y, "closed_reason")
+                .map(|s| s.parse())
+                .transpose()?,
+            closed_note: optional_string(y, "closed_note"),
             doc,
             source_path: None,
         })
@@ -250,11 +339,41 @@ impl Ticket {
         self.doc.render()
     }
 
-    /// Set the status (surgical write).
+    /// Set the status (surgical write). Any transition *away* from `closed` clears the
+    /// resolution metadata (`closed_reason`/`closed_note`) in the same write, so the
+    /// live frontmatter never carries a stale "why" contradicting the current status —
+    /// this is what makes `reopen` atomic and self-cleaning.
     pub fn set_status(&mut self, status: Status) -> Result<()> {
         self.doc.set_scalar("status", status.as_str())?;
+        if status != Status::Closed {
+            self.clear_closed_meta();
+        }
         self.status = status;
         Ok(())
+    }
+
+    /// Record why a `closed` ticket was closed (surgical). The caller is responsible for
+    /// ensuring the status is `closed` — a reason on a non-closed ticket is meaningless.
+    pub fn set_closed_reason(&mut self, reason: ClosedReason) -> Result<()> {
+        self.doc.set_scalar("closed_reason", reason.as_str())?;
+        self.closed_reason = Some(reason);
+        Ok(())
+    }
+
+    /// Attach a free-text one-line close note (surgical).
+    pub fn set_closed_note(&mut self, note: &str) -> Result<()> {
+        self.doc.set_scalar("closed_note", note)?;
+        self.closed_note = Some(note.to_string());
+        Ok(())
+    }
+
+    /// Drop the close reason + note. Called on any transition out of `closed` (see
+    /// [`set_status`](Self::set_status)); idempotent when neither is present.
+    pub fn clear_closed_meta(&mut self) {
+        self.doc.remove_key("closed_reason");
+        self.doc.remove_key("closed_note");
+        self.closed_reason = None;
+        self.closed_note = None;
     }
 
     /// Set the priority (surgical write).
@@ -613,6 +732,63 @@ mod tests {
             err.contains("expected todo|ready"),
             "lists valid values: {err}"
         );
+    }
+
+    #[test]
+    fn closed_is_terminal_but_does_not_complete_dependencies() {
+        assert_eq!("closed".parse::<Status>().unwrap(), Status::Closed);
+        assert_eq!(Status::Closed.as_str(), "closed");
+        assert!(Status::Closed.is_terminal());
+        assert!(Status::Done.is_terminal());
+        // The whole point: closed is terminal but does NOT satisfy dependents.
+        assert!(!Status::Closed.completes_dependencies());
+        assert!(Status::Done.completes_dependencies());
+        assert!(!Status::Closed.is_dispatchable());
+        assert!(!Status::Closed.is_open());
+    }
+
+    #[test]
+    fn closed_reason_round_trips_and_reopen_clears_it() {
+        let mut t = Ticket::parse(SAMPLE).unwrap();
+        t.set_status(Status::Closed).unwrap();
+        t.set_closed_reason(ClosedReason::WontDo).unwrap();
+        t.set_closed_note("superseded by a new approach").unwrap();
+        let out = t.render();
+        assert!(out.contains("status: closed\n"));
+        assert!(out.contains("closed_reason: wontdo\n"));
+        assert!(out.contains("closed_note:"));
+        // The written form reparses to the same typed values.
+        let again = Ticket::parse(&out).unwrap();
+        assert_eq!(again.status, Status::Closed);
+        assert_eq!(again.closed_reason, Some(ClosedReason::WontDo));
+        assert_eq!(
+            again.closed_note.as_deref(),
+            Some("superseded by a new approach")
+        );
+
+        // Reopening (any transition away from closed) clears the resolution atomically.
+        let mut reopened = again;
+        reopened.set_status(Status::Todo).unwrap();
+        assert_eq!(reopened.status, Status::Todo);
+        assert!(reopened.closed_reason.is_none());
+        assert!(reopened.closed_note.is_none());
+        let out2 = reopened.render();
+        assert!(!out2.contains("closed_reason"));
+        assert!(!out2.contains("closed_note"));
+    }
+
+    #[test]
+    fn close_reason_parses_case_insensitively_and_rejects_typos() {
+        assert_eq!(
+            "WontDo".parse::<ClosedReason>().unwrap(),
+            ClosedReason::WontDo
+        );
+        assert_eq!(
+            " duplicate ".parse::<ClosedReason>().unwrap(),
+            ClosedReason::Duplicate
+        );
+        let err = "nope".parse::<ClosedReason>().unwrap_err().to_string();
+        assert!(err.contains("expected duplicate|wontdo"), "{err}");
     }
 
     #[test]

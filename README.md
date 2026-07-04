@@ -62,7 +62,7 @@ A **ticket** is a markdown file under `tickets/` with YAML frontmatter:
 ---
 id: add-vector-index          # slug; equals the filename
 title: Add vector index
-status: todo                  # todo | ready | in-progress | blocked | review | done
+status: todo                  # todo | ready | in-progress | blocked | review | done | closed
 priority: p1                  # p0 (highest) .. p3
 dependencies: [build-index-trait]   # hard, scheduling-blocking; cycle-checked
 related: []                   # soft "see also"; ignored by scheduling
@@ -76,6 +76,8 @@ Free-form markdown body.
 ```
 
 Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes and leaves unknown keys, key order, comments, and the body byte-for-byte. Hand-editing is fully supported.
+
+**Terminal states — `done` vs `closed`.** Both take a ticket out of scheduling, but they mean different things. `done` = completed: it *satisfies* dependents, so they become ready. `closed` = terminated without completing (won't-do, duplicate, obsolete, superseded, cancelled): it does **not** satisfy dependents — instead they surface as **orphaned** (`rollup` lists them, `lint` fails on them, and `claim` refuses with a pointed message) so you re-point, waive, or close them rather than silently building on abandoned work. `tkt close <id> --reason <duplicate|wontdo|obsolete|superseded|cancelled> --note <text>` records an optional resolution; `tkt reopen <id>` returns it to an active status and clears the reason in the same write. The reason is queryable (`list --where 'reason:duplicate'`).
 
 A **scope** is a stable abstract name for an area of the codebase. Tickets reference scopes; `ticketsplease.toml` maps them to file globs (and, for Rust repos, to crates). Two tickets that share a scope never land in the same parallel batch, and the guard fails a branch that touches a scope its ticket didn't declare.
 

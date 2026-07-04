@@ -9,11 +9,11 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 
 ## Contents
 
-`init` · `create` · `set` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
+`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
 
 ## Conventions
 
-- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `close`/`reopen`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 - **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
@@ -56,12 +56,24 @@ ticketsplease set (<id> | --where <expr> | --view <name>)
                        [--add-related r] [--remove-related s]
                        [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run]
 ```
-Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. Setting status `done` clears the claim (assignee + lease). `--dry-run` previews without writing.
+Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. Setting a terminal status (`done` or `closed`) clears the claim (assignee + lease). `--reason <duplicate|wontdo|obsolete|superseded|cancelled>` and `--note <text>` are valid only alongside `--status closed` (they record the resolution, and are cleared automatically when the ticket later leaves `closed`); prefer the `close`/`reopen` verbs below. `--dry-run` previews without writing.
 
 **Single vs bulk:** pass an `id` to edit one ticket, or `--where`/`--view` to edit **every matching ticket** in one operation (exactly one of the two; passing both, or neither, is exit 3). Bulk applies field edits only — `--title` and the body edits are single-target and rejected with `--where`/`--view`. A single cycle check runs over the whole edited set after all dependency edits.
 
 Single JSON: `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 Bulk JSON: `{ "schema_version", "matched": N, "results": [ {id, changed: bool} ], "dry_run": bool }`.
+
+## close / reopen
+
+```
+ticketsplease close  <id> [--reason <duplicate|wontdo|obsolete|superseded|cancelled>] [--note <text>] [--dry-run]
+ticketsplease reopen <id> [--status <active-status>] [--dry-run]     # default --status todo
+```
+`close` terminates a ticket **without** completing it — the terminal counterpart to `done`. Like `done` it is excluded from scheduling and drops any claim, **but it does not satisfy dependents**: a ticket that depends on a closed one is *orphaned* (listed by `rollup`, failed by `lint`, and refused by `claim` with a pointed message) so you re-point it, waive the dependency (`set --remove-dependency`), or close it too — it is never silently dispatched onto abandoned work. The optional `--reason` (a small fixed vocabulary) and `--note` are stored in frontmatter (`closed_reason`/`closed_note`) and echoed on the status event; query them with `list --where 'reason:duplicate'`.
+
+`reopen` returns a terminal (closed **or** done) ticket to an active status and **clears `closed_reason`/`closed_note` in the same write** — the resolution never lingers to contradict the live status (the prior reason survives in the activity log / git history). Reopening a non-terminal ticket, or into a terminal target, is exit 3. `close` is sugar for `set --status closed --reason … --note …`; `reopen` is the atomic clear-on-transition that raw `set` can't express as cleanly.
+
+JSON (both): `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 
 ## link
 
@@ -78,9 +90,9 @@ JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`
 ticketsplease show <id> [--ref <branch>]
 ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--where <expr>] [--view <name>] [--hide-done]
 ```
-`show --format human` prints a rendered field view + body + comments; `--format json` → the ticket's fields. `--ref` reads the ticket as committed on a git ref (no checkout). `list` filters compose (AND); `--hide-done` drops completed tickets. A malformed ticket file degrades to a warning rather than failing the listing.
+`show --format human` prints a rendered field view + body + comments (including the close reason/note on a closed ticket); `--format json` → the ticket's fields (`closed_reason`/`closed_note` included). `--ref` reads the ticket as committed on a git ref (no checkout). `list` filters compose (AND); `--hide-done` drops terminal tickets (`done` + `closed`). A malformed ticket file degrades to a warning rather than failing the listing.
 
-`--where` is a boolean filter expression: `field:value` terms joined by `AND` / `OR` / `NOT` (case-insensitive) with parentheses; it composes (AND) with the single-axis flags. Fields: `status`, `priority`, `tag`, `scope`, `assignee`, `id`, `dep`, `related`. Values are barewords (`p0`, `query/planner`, slug ids) or quoted (`"needs review"`). `status:`/`priority:` values are validated, so a typo exits 3. Examples: `--where 'tag:dialect AND NOT status:done'`, `--where '(priority:p0 OR priority:p1) AND scope:core'`. `--view <name>` applies a saved expression and ANDs with `--where`.
+`--where` is a boolean filter expression: `field:value` terms joined by `AND` / `OR` / `NOT` (case-insensitive) with parentheses; it composes (AND) with the single-axis flags. Fields: `status`, `priority`, `tag`, `scope`, `assignee`, `id`, `dep`, `related`, `reason`. Values are barewords (`p0`, `query/planner`, slug ids) or quoted (`"needs review"`). `status:`/`priority:`/`reason:` values are validated, so a typo exits 3. Examples: `--where 'tag:dialect AND NOT status:done'`, `--where 'status:closed AND reason:duplicate'`, `--where '(priority:p0 OR priority:p1) AND scope:core'`. `--view <name>` applies a saved expression and ANDs with `--where`.
 
 ## view
 

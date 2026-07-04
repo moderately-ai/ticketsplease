@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::store::Store;
-use crate::Status;
+use crate::{Status, Ticket};
 
 /// Default claim lease (one hour): long enough for a coding-agent task, short
 /// enough that a crashed agent stops blocking the ticket promptly.
@@ -81,20 +81,38 @@ pub fn claim(
         )));
     }
 
-    // Don't start work whose prerequisites aren't done — this mirrors `ready`/`next`,
-    // which exclude such tickets from dispatch. Dangling deps are lint's concern, not
-    // a claim blocker, so only existing, non-done dependencies gate.
-    let blocking: Vec<String> = ticket
+    // Don't start work whose prerequisites aren't satisfied — this mirrors `ready`/`next`,
+    // which exclude such tickets from dispatch. Only `done` satisfies. A `closed`
+    // (abandoned) dependency is called out distinctly: the ticket is orphaned, so the
+    // operator should re-point it, waive the dep, or close it — not wait on work that will
+    // never land. Dangling deps are lint's concern, so only existing deps gate.
+    let unmet: Vec<Ticket> = ticket
         .dependencies
         .iter()
         .filter_map(|dep| store.load(dep).ok())
-        .filter(|d| d.status != Status::Done)
+        .filter(|d| !d.status.completes_dependencies())
+        .collect();
+    let closed: Vec<String> = unmet
+        .iter()
+        .filter(|d| d.status.is_terminal())
         .map(|d| d.id.clone())
         .collect();
-    if !blocking.is_empty() {
+    if !closed.is_empty() {
+        return Err(Error::Conflict(format!(
+            "ticket `{id}` is orphaned: dependency {} was closed without completing \
+             (re-point it, waive it with `set --remove-dependency`, or close this ticket)",
+            closed.join(", ")
+        )));
+    }
+    let pending: Vec<String> = unmet
+        .iter()
+        .filter(|d| !d.status.is_terminal())
+        .map(|d| d.id.clone())
+        .collect();
+    if !pending.is_empty() {
         return Err(Error::Conflict(format!(
             "ticket `{id}` has unfinished dependencies: {} (finish them before claiming)",
-            blocking.join(", ")
+            pending.join(", ")
         )));
     }
 

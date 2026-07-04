@@ -19,7 +19,7 @@
 use std::str::FromStr;
 
 use crate::error::{Error, Result};
-use crate::ticket::{Priority, Status, Ticket};
+use crate::ticket::{ClosedReason, Priority, Status, Ticket};
 
 /// A parsed `--where` expression, evaluated against a ticket with [`Predicate::matches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,10 +58,12 @@ pub enum Field {
     Dep,
     /// `related:<value>` — membership in `related`.
     Related,
+    /// `reason:<value>` — exact close reason (only set on `closed` tickets).
+    Reason,
 }
 
 /// The queryable field names, for error messages and help text.
-const VALID_FIELDS: &str = "status, priority, tag, scope, assignee, id, dep, related";
+const VALID_FIELDS: &str = "status, priority, tag, scope, assignee, id, dep, related, reason";
 
 impl Field {
     fn parse(name: &str) -> Result<Self> {
@@ -74,6 +76,7 @@ impl Field {
             "id" => Field::Id,
             "dep" | "dependency" => Field::Dep,
             "related" => Field::Related,
+            "reason" => Field::Reason,
             other => {
                 return Err(Error::Invalid(format!(
                     "unknown query field `{other}` (valid: {VALID_FIELDS})"
@@ -101,6 +104,9 @@ impl Predicate {
                 Field::Id => ticket.id == *value,
                 Field::Dep => ticket.dependencies.iter().any(|x| x == value),
                 Field::Related => ticket.related.iter().any(|x| x == value),
+                Field::Reason => {
+                    ClosedReason::from_str(value).is_ok_and(|r| ticket.closed_reason == Some(r))
+                }
             },
         }
     }
@@ -289,6 +295,9 @@ fn parse_term(word: &str) -> Result<Predicate> {
         Field::Priority => {
             Priority::from_str(value)?;
         }
+        Field::Reason => {
+            ClosedReason::from_str(value)?;
+        }
         _ => {}
     }
     Ok(Predicate::Term {
@@ -363,6 +372,18 @@ mod tests {
         assert!(parse("tag:x AND").is_err()); // dangling operator
         assert!(parse("AND tag:x").is_err()); // leading operator
         assert!(parse("tag:x tag:y").is_err()); // missing operator -> trailing input
+    }
+
+    #[test]
+    fn reason_field_matches_and_validates() {
+        let closed = "---\nid: x\ntitle: T\nstatus: closed\nclosed_reason: duplicate\n---\n";
+        assert!(matches("reason:duplicate", closed));
+        assert!(!matches("reason:wontdo", closed));
+        // A ticket with no close reason never matches a reason term.
+        assert!(!matches("reason:duplicate", "---\nid: y\ntitle: T\n---\n"));
+        // An invalid reason value fails loudly at parse time (exit 3), like status.
+        assert!(parse("reason:bogus").is_err());
+        assert!(matches("status:closed AND reason:duplicate", closed));
     }
 
     #[test]

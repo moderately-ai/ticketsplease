@@ -22,10 +22,11 @@ use ticketsplease_core::{
 };
 
 use crate::cli::{
-    ClaimArgs, ClaimsArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs, EventsArgs,
-    GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, NextArgs, PathArgs,
-    ReconcileArgs, ReleaseArgs, RenameArgs, RollupArgs, SelfUpdateArgs, SetArgs, ShowArgs,
-    SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
+    ClaimArgs, ClaimsArgs, CloseArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs,
+    EventsArgs, GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, NextArgs, PathArgs,
+    ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs, RollupArgs, SelfUpdateArgs, SetArgs,
+    ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs,
+    WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -516,6 +517,22 @@ fn apply_set_field_mutations(ticket: &mut Ticket, args: &SetArgs) -> Result<bool
     if let Some(status) = &args.status {
         ticket.set_status(status.parse()?)?;
     }
+    // Resolution metadata rides only on a `closed` ticket. Applied after the status
+    // mutation so `set --status closed --reason X --note Y` lands in one call; rejected
+    // on anything that is not (now) closed so a stray reason can't contradict the status.
+    if args.reason.is_some() || args.note.is_some() {
+        if ticket.status != Status::Closed {
+            return Err(Error::Invalid(
+                "--reason/--note are only valid with --status closed".into(),
+            ));
+        }
+        if let Some(reason) = &args.reason {
+            ticket.set_closed_reason(reason.parse()?)?;
+        }
+        if let Some(note) = &args.note {
+            ticket.set_closed_note(note)?;
+        }
+    }
     if let Some(priority) = &args.priority {
         ticket.set_priority(priority.parse()?)?;
     }
@@ -565,6 +582,16 @@ fn apply_set_field_mutations(ticket: &mut Ticket, args: &SetArgs) -> Result<bool
     Ok(deps_added)
 }
 
+/// The `data` payload for a `status` activity event. Carries the close reason when the
+/// ticket landed in `closed`, so the log records *why* it ended, not just the transition.
+fn status_event_data(ticket: &Ticket, from: Status) -> Value {
+    let mut data = json!({ "status": ticket.status.as_str(), "from": from.as_str() });
+    if let Some(reason) = ticket.closed_reason {
+        data["reason"] = json!(reason.as_str());
+    }
+    data
+}
+
 /// Single-ticket `set` (an explicit id). Body edits and title apply here.
 fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
     let id = args.id.as_deref().expect("single set has an id");
@@ -591,8 +618,9 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
     )? {
         ticket.append_body(&text);
     }
-    // Completion implicitly ends a claim — a done ticket must not keep looking owned.
-    if ticket.status == Status::Done {
+    // Reaching a terminal status (done or closed) implicitly ends a claim — the ticket
+    // must not keep looking owned.
+    if ticket.status.is_terminal() {
         ticket.clear_lease();
     }
 
@@ -606,7 +634,7 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
                 "status",
                 &ticket.id,
                 None,
-                json!({ "status": ticket.status.as_str(), "from": status_before.as_str() }),
+                status_event_data(&ticket, status_before),
             );
         }
     }
@@ -654,7 +682,7 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
     let mut all = store.load_all()?;
     let mut any_deps_added = false;
     let mut to_save: Vec<usize> = Vec::new();
-    let mut events: Vec<(String, Status, Status)> = Vec::new();
+    let mut events: Vec<(String, Value)> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
     for (i, ticket) in all.iter_mut().enumerate() {
         if !predicate.matches(ticket) {
@@ -663,7 +691,7 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
         let before = ticket.render();
         let status_before = ticket.status;
         any_deps_added |= apply_set_field_mutations(ticket, args)?;
-        if ticket.status == Status::Done {
+        if ticket.status.is_terminal() {
             ticket.clear_lease();
         }
         let changed = ticket.render() != before;
@@ -671,7 +699,7 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
         if changed {
             to_save.push(i);
             if ticket.status != status_before {
-                events.push((ticket.id.clone(), status_before, ticket.status));
+                events.push((ticket.id.clone(), status_event_data(ticket, status_before)));
             }
         }
     }
@@ -683,13 +711,8 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
         for &i in &to_save {
             store.save(&all[i])?;
         }
-        for (id, from, to) in &events {
-            let _ = store.emit_event(
-                "status",
-                id,
-                None,
-                json!({ "status": to.as_str(), "from": from.as_str() }),
-            );
+        for (id, data) in &events {
+            let _ = store.emit_event("status", id, None, data.clone());
         }
     }
 
@@ -712,6 +735,115 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
             Ok(())
         }
     }
+}
+
+/// Emit a single-ticket transition result (id + changed + dry_run) in both formats,
+/// with caller-supplied human verbs `(did, would)`.
+fn emit_transition_result(
+    fmt: Format,
+    id: &str,
+    changed: bool,
+    dry_run: bool,
+    verbs: (&str, &str),
+) -> Result<()> {
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "id": id,
+            "changed": changed,
+            "dry_run": dry_run,
+        })),
+        Format::Human => {
+            let (did, would) = verbs;
+            let msg = match (changed, dry_run) {
+                (true, false) => format!("{did} `{id}`"),
+                (true, true) => format!("{would} `{id}`"),
+                (false, _) => format!("No change to `{id}`"),
+            };
+            println!("{msg}");
+            Ok(())
+        }
+    }
+}
+
+/// `close` — terminate a ticket without completing it (won't-do, duplicate, obsolete,
+/// superseded, cancelled). Terminal like `done` but does *not* satisfy dependents; drops
+/// any live claim and records the optional reason + note. Convenience sugar over
+/// `set --status closed --reason … --note …`.
+pub fn close(repo: &Path, fmt: Format, args: &CloseArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let mut ticket = store.load(&args.id)?;
+    let before = ticket.render();
+    let status_before = ticket.status;
+
+    ticket.set_status(Status::Closed)?;
+    if let Some(reason) = &args.reason {
+        ticket.set_closed_reason(reason.parse()?)?;
+    }
+    if let Some(note) = &args.note {
+        ticket.set_closed_note(note)?;
+    }
+    ticket.clear_lease(); // a closed ticket must not keep looking owned
+
+    let changed = ticket.render() != before;
+    if changed && !args.dry_run {
+        store.save(&ticket)?;
+        if ticket.status != status_before {
+            let _ = store.emit_event(
+                "status",
+                &ticket.id,
+                None,
+                status_event_data(&ticket, status_before),
+            );
+        }
+    }
+    emit_transition_result(
+        fmt,
+        &ticket.id,
+        changed,
+        args.dry_run,
+        ("Closed", "Would close"),
+    )
+}
+
+/// `reopen` — return a terminal (closed or done) ticket to an active status, clearing its
+/// resolution metadata in the same write (atomic, self-cleaning). The prior reason lives
+/// on in the activity log / git history, never as a stale live field.
+pub fn reopen(repo: &Path, fmt: Format, args: &ReopenArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let mut ticket = store.load(&args.id)?;
+    let status_before = ticket.status;
+    if !ticket.status.is_terminal() {
+        return Err(Error::Invalid(format!(
+            "ticket `{}` is `{}`, not terminal — reopen applies to a closed or done ticket",
+            args.id, ticket.status
+        )));
+    }
+    let target: Status = args.status.parse()?;
+    if target.is_terminal() {
+        return Err(Error::Invalid(format!(
+            "reopen target `{target}` is itself terminal; choose an active status (e.g. todo)"
+        )));
+    }
+    let before = ticket.render();
+    ticket.set_status(target)?; // clears closed_reason/closed_note atomically
+    let changed = ticket.render() != before;
+    if changed && !args.dry_run {
+        store.save(&ticket)?;
+        let _ = store.emit_event(
+            "status",
+            &ticket.id,
+            None,
+            status_event_data(&ticket, status_before),
+        );
+    }
+    emit_transition_result(
+        fmt,
+        &ticket.id,
+        changed,
+        args.dry_run,
+        ("Reopened", "Would reopen"),
+    )
 }
 
 /// `link` — add or remove a link between tickets. `--depends-on` is a hard,
@@ -821,6 +953,12 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
             line("tags:    ", &ticket.tags);
             if let Some(a) = &ticket.assignee {
                 println!("  assignee: {a}");
+            }
+            if let Some(r) = ticket.closed_reason {
+                println!("  closed:   {r}");
+            }
+            if let Some(n) = &ticket.closed_note {
+                println!("  note:     {n}");
             }
             let body = ticket.body().trim_end();
             if !body.trim().is_empty() {
@@ -1002,7 +1140,7 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
         .filter(|t| priority.map_or(true, |p| t.priority == p))
         .filter(|t| args.scope.as_ref().map_or(true, |s| t.scopes.contains(s)))
         .filter(|t| args.tag.as_ref().map_or(true, |tg| t.tags.contains(tg)))
-        .filter(|t| !args.hide_done || t.status != Status::Done)
+        .filter(|t| !args.hide_done || !t.status.is_terminal())
         .filter(|t| predicate.as_ref().map_or(true, |p| p.matches(t)))
         .collect();
 
@@ -1167,6 +1305,10 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
     }
     let total = selected.len();
     let done = selected.iter().filter(|t| t.status == Status::Done).count();
+    let closed = selected
+        .iter()
+        .filter(|t| t.status == Status::Closed)
+        .count();
     let percent_done = (done * 100).checked_div(total).unwrap_or(0);
 
     // Ready frontier: dispatchable over the full board ∩ the selection.
@@ -1183,24 +1325,34 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
     let ready_refs: Vec<&Ticket> = ready.iter().map(|t| **t).collect();
     let width = schedule::max_compatible_among(&ready_refs, 0, &weights);
 
-    // Blocked: in the selection, dispatchable-status but with ≥1 dependency not done.
+    // Blocked vs orphaned: a selected dispatchable-status ticket whose dependencies are
+    // not all satisfied. A `closed` (abandoned) dependency can never complete, so its
+    // dependent is *orphaned* — reported apart from a merely-not-yet-done (`blocked`)
+    // dependency because the remedy differs: re-point / waive / cascade-close, versus just
+    // wait. A ticket with any closed dependency is orphaned even if it also has pending ones.
     let status_by_id: BTreeMap<&str, Status> =
         all.iter().map(|t| (t.id.as_str(), t.status)).collect();
-    let blocked: Vec<(&Ticket, Vec<&str>)> = selected
-        .iter()
-        .filter_map(|t| {
-            if !t.status.is_dispatchable() {
-                return None;
+    let mut blocked: Vec<(&Ticket, Vec<&str>)> = Vec::new();
+    let mut orphaned: Vec<(&Ticket, Vec<&str>)> = Vec::new();
+    for t in &selected {
+        if !t.status.is_dispatchable() {
+            continue;
+        }
+        let mut pending: Vec<&str> = Vec::new();
+        let mut closed_deps: Vec<&str> = Vec::new();
+        for d in &t.dependencies {
+            match status_by_id.get(d.as_str()).copied() {
+                Some(s) if s.completes_dependencies() => {} // satisfied
+                Some(Status::Closed) => closed_deps.push(d.as_str()),
+                _ => pending.push(d.as_str()), // not-yet-done, or dangling (lint's concern)
             }
-            let unmet: Vec<&str> = t
-                .dependencies
-                .iter()
-                .filter(|d| status_by_id.get(d.as_str()).copied() != Some(Status::Done))
-                .map(String::as_str)
-                .collect();
-            (!unmet.is_empty()).then_some((*t, unmet))
-        })
-        .collect();
+        }
+        if !closed_deps.is_empty() {
+            orphaned.push((*t, closed_deps));
+        } else if !pending.is_empty() {
+            blocked.push((*t, pending));
+        }
+    }
 
     match fmt {
         Format::Json => print_json(&json!({
@@ -1208,6 +1360,7 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
             "selector": { "tag": args.tag, "where": args.where_, "view": args.view },
             "total": total,
             "done": done,
+            "closed": closed,
             "percent_done": percent_done,
             "width": width,
             "by_status": by_status,
@@ -1218,6 +1371,9 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
             "blocked": blocked.iter().map(|(t, unmet)| json!({
                 "id": t.id, "title": t.title, "unmet": unmet,
             })).collect::<Vec<_>>(),
+            "orphaned": orphaned.iter().map(|(t, closed_deps)| json!({
+                "id": t.id, "title": t.title, "closed_deps": closed_deps,
+            })).collect::<Vec<_>>(),
         })),
         Format::Human => {
             let scope = match (&args.tag, &args.where_, &args.view) {
@@ -1226,7 +1382,14 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 (None, Some(_), None) => "filter".to_string(),
                 (None, None, None) => "(whole board)".to_string(),
             };
-            println!("initiative {scope}: {total} ticket(s), {done} done ({percent_done}%)");
+            let closed_note = if closed > 0 {
+                format!(", {closed} closed")
+            } else {
+                String::new()
+            };
+            println!(
+                "initiative {scope}: {total} ticket(s), {done} done ({percent_done}%){closed_note}"
+            );
             // Status counts in lifecycle order, skipping absent buckets.
             let order = [
                 Status::Todo,
@@ -1235,6 +1398,7 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 Status::Blocked,
                 Status::Review,
                 Status::Done,
+                Status::Closed,
             ];
             let statuses: Vec<String> = order
                 .iter()
@@ -1263,6 +1427,18 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 println!("  blocked ({}):", blocked.len());
                 for (t, unmet) in &blocked {
                     println!("    {}  (waiting on: {})", t.id, unmet.join(", "));
+                }
+            }
+            // Orphaned is an exceptional condition (a blocker was abandoned), so it prints
+            // only when non-empty rather than as a standing "(0)" bucket.
+            if !orphaned.is_empty() {
+                println!("  orphaned ({}):", orphaned.len());
+                for (t, closed_deps) in &orphaned {
+                    println!(
+                        "    {}  (blocker closed: {} — re-point, waive, or close)",
+                        t.id,
+                        closed_deps.join(", ")
+                    );
                 }
             }
             Ok(())
@@ -1506,8 +1682,9 @@ pub fn watch(repo: &Path, fmt: Format, args: &WatchArgs) -> Result<()> {
             Some(r) => store.load_at_ref(&args.id, r)?,
             None => store.load(&args.id)?,
         };
-        // `done` is always terminal, so a ticket that skips past the target still ends the wait.
-        if ticket.status == target || ticket.status == Status::Done {
+        // A terminal status (done or closed) always ends the wait, so a ticket that skips
+        // past the target still returns rather than hanging until timeout.
+        if ticket.status == target || ticket.status.is_terminal() {
             emit_watch(fmt, args, resolved_ref.as_deref(), ticket.status, true)?;
             return Ok(());
         }
@@ -2973,5 +3150,7 @@ fn ticket_json(ticket: &Ticket) -> Value {
         "tags": ticket.tags,
         "assignee": ticket.assignee,
         "lease_expires_at": ticket.lease_expires_at,
+        "closed_reason": ticket.closed_reason.map(|r| r.as_str()),
+        "closed_note": ticket.closed_note,
     })
 }

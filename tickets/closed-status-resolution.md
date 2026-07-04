@@ -1,7 +1,7 @@
 ---
 id: closed-status-resolution
 title: "Closed status: terminal-but-not-done, with optional resolution"
-status: todo
+status: done
 priority: p1
 dependencies: []
 related: [config-custom-states]
