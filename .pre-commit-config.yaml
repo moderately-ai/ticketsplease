@@ -26,24 +26,29 @@ repos:
         stages: [commit-msg]
 
   - repo: local
+    # Route the Rust hooks through `rustup run stable` rather than a bare `cargo` so they
+    # always use the rustup toolchain pinned in rust-toolchain.toml — even on a machine
+    # that also has a standalone Homebrew `rust` earlier on PATH (which ignores
+    # rust-toolchain.toml and ships its own rustfmt/clippy, causing formatting churn).
+    # Keep `stable` in sync with rust-toolchain.toml's channel.
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --all
+        entry: rustup run stable cargo fmt --all
         language: system
         pass_filenames: false
         types: [rust]
 
       - id: cargo-check
         name: cargo check
-        entry: cargo check --all-targets
+        entry: rustup run stable cargo check --all-targets
         language: system
         pass_filenames: false
         types: [rust]
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets -- -D warnings
+        entry: rustup run stable cargo clippy --all-targets -- -D warnings
         language: system
         pass_filenames: false
         types: [rust]
@@ -51,7 +56,7 @@ repos:
       - id: cargo-deny
         name: cargo deny check
         # Requires `cargo install cargo-deny` (one-time). Config: deny.toml.
-        entry: cargo deny check
+        entry: rustup run stable cargo deny check
         language: system
         pass_filenames: false
         types: [rust]
