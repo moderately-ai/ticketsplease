@@ -62,7 +62,7 @@ A **ticket** is a markdown file under `tickets/` with YAML frontmatter:
 ---
 id: add-vector-index          # slug; equals the filename
 title: Add vector index
-status: todo                  # todo | ready | in-progress | blocked | review | done | closed
+status: todo                  # built-in: todo|ready|in-progress|blocked|review|done|closed (or your [workflow.states])
 priority: p1                  # p0 (highest) .. p3
 dependencies: [build-index-trait]   # hard, scheduling-blocking; cycle-checked
 related: []                   # soft "see also"; ignored by scheduling
@@ -105,11 +105,25 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 
 [scope_policy]                 # per-scope clash cost for tracks/next --max-overlap
 "core" = { weight = 0 }        # weight 0 = a free-to-co-edit hub; higher = riskier (default 1)
+
+[workflow]                     # custom lifecycle states (optional; omit for the built-in set)
+[workflow.states.todo]
+category = "dispatchable"       # dispatchable | open | parked | terminal — the engine contract
+[workflow.states.qa]
+category = "open"              # occupies its scopes for the guard; excluded from `ready`
+[workflow.states.shipped]
+category = "terminal"
+satisfies_dependents = true    # a completed terminal state — unblocks dependents
+[workflow.states.wontfix]
+category = "terminal"
+satisfies_dependents = false   # a dropped/cancelled terminal state — orphans dependents
 ```
 
 When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo). Each collision is tagged `cause: "direct"` (a real file/crate overlap) or `"transitive"` (reached only via the reverse-dep walk — safe for an additive change), and a per-scope `affected_causes` map lets a consumer triage which under-declarations and collisions are real rather than hand-diffing. Pass `guard --direct-only` (alias `--no-reverse-deps`) to gate on direct overlap only and skip the expansion entirely.
 
 `[external_scopes]` extends the guard beyond this repo: a branch that bumps a pinned `git = … rev = …` dependency (matched by `repo` against the changed manifest lines) — or edits an in-tree fork `paths` glob — is flagged against tickets declaring that external scope. Because external scopes are ordinary scope names, `tracks` already keeps two tickets touching the same fork in separate batches.
+
+**Custom workflow states.** With no `[workflow]` table a repo uses the built-in states (`todo`, `ready`, `in-progress`, `blocked`, `review`, `done`, `closed`). Define `[workflow.states]` to declare your own — each state's **name** is yours to choose, but it must be pinned to one engine **category** the scheduler/guard/rollup reason about: `dispatchable` (pickable), `open` (occupies its scopes for the guard, blocks conflicting parallel work), `parked` (held but not finished, like `blocked`), or `terminal` (finished, excluded from scheduling). A terminal state's `satisfies_dependents` bit *is* the done-vs-closed distinction — `true` unblocks dependents, `false` orphans them. `tkt states` lists the effective registry; `tkt lint` rejects a config with no dispatchable or terminal state; `tkt migrate --remap old=new` moves tickets stranded by a renamed/removed state. Because the engine keys on the category (never the name), renaming a state while keeping its category never breaks scheduling.
 
 ## Tool-managed state — `.ticketsplease/`
 

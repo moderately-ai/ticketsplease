@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::lint::Diagnostic;
-use crate::ticket::{Priority, Status, Ticket};
+use crate::ticket::{Priority, Ticket};
 
 /// Validated view over a set of tickets.
 struct Graph<'a> {
@@ -49,7 +49,7 @@ impl<'a> Graph<'a> {
             dependents.entry(t.id.as_str()).or_default();
         }
         for t in tickets {
-            if t.status.is_terminal() {
+            if t.is_terminal() {
                 continue;
             }
             for d in &t.dependencies {
@@ -71,11 +71,11 @@ impl<'a> Graph<'a> {
     /// so the dependent is held out of dispatch — surfaced as orphaned, never silently
     /// scheduled onto dropped work.
     fn is_dispatchable(&self, t: &Ticket) -> bool {
-        t.status.is_dispatchable()
+        t.is_dispatchable()
             && t.dependencies.iter().all(|d| {
                 self.by_id
                     .get(d.as_str())
-                    .is_some_and(|dep| dep.status.completes_dependencies())
+                    .is_some_and(|dep| dep.completes_dependencies())
             })
     }
 
@@ -356,9 +356,7 @@ pub fn link_diagnostics(tickets: &[Ticket]) -> Vec<Diagnostic> {
                 // deadlock-visibly — surface it like a dead dependency so it is
                 // re-pointed, waived, or closed rather than silently stuck.
                 Some(dep)
-                    if !t.status.is_terminal()
-                        && dep.status.is_terminal()
-                        && !dep.status.completes_dependencies() =>
+                    if !t.is_terminal() && dep.is_terminal() && !dep.completes_dependencies() =>
                 {
                     out.push(Diagnostic {
                         file: format!("{}.md", t.id),
@@ -471,8 +469,8 @@ pub struct GraphNode {
     pub id: String,
     /// Ticket title.
     pub title: String,
-    /// Lifecycle status.
-    pub status: Status,
+    /// Lifecycle status name.
+    pub status: String,
     /// Priority.
     pub priority: Priority,
     /// `next` score: `1000*priority + 10*critical_path + downstream_count`.
@@ -516,7 +514,7 @@ pub fn graph_export(tickets: &[Ticket]) -> Result<GraphExport> {
             GraphNode {
                 id: t.id.clone(),
                 title: t.title.clone(),
-                status: t.status,
+                status: t.status.clone(),
                 priority: t.priority,
                 score: 1000 * priority_value(t.priority) + 10 * critical_path + downstream_count,
                 critical_path,
@@ -813,7 +811,7 @@ mod tests {
         Ticket::new(
             id,
             id,
-            status.parse().unwrap(),
+            status,
             priority.parse().unwrap(),
             &d,
             &[],
@@ -833,7 +831,7 @@ mod tests {
         Ticket::new(
             id,
             id,
-            status.parse().unwrap(),
+            status,
             "p2".parse().unwrap(),
             &d,
             &r,
@@ -853,7 +851,7 @@ mod tests {
         Ticket::new(
             id,
             id,
-            "todo".parse().unwrap(),
+            "todo",
             "p2".parse().unwrap(),
             &[],
             &[],

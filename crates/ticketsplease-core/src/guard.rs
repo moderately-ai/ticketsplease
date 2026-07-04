@@ -459,7 +459,7 @@ pub fn evaluate(
 
     let mut collisions = Vec::new();
     for other in all {
-        if other.id == target.id || !other.status.is_open() {
+        if other.id == target.id || !other.is_open() {
             continue;
         }
         // The other ticket claims a scope in either mode; both count for overlap.
@@ -532,7 +532,7 @@ mod tests {
         Ticket::new(
             id,
             id,
-            status.parse().unwrap(),
+            status,
             "p2".parse().unwrap(),
             &[],
             &[],

@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::config::CONFIG_FILE;
 use crate::error::{Error, Result};
 use crate::store::Store;
-use crate::ticket::{Status, Ticket};
+use crate::ticket::Ticket;
 
 /// A single lint finding.
 #[derive(Debug, Clone, Serialize)]
@@ -20,7 +20,8 @@ pub struct Diagnostic {
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
     /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id`
-    /// | `stale-resolution` | `missing-dep` | `missing-related` | `cycle`.
+    /// | `unknown-state` | `state-coverage` | `stale-resolution` | `missing-dep` |
+    /// `missing-related` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -31,6 +32,17 @@ pub struct Diagnostic {
 pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let registry = store.config.state_registry();
+    // A workflow with no dispatchable or no terminal state is unusable (nothing can be
+    // started or finished) — surface it once against the config.
+    if let Err(e) = registry.validate() {
+        diags.push(Diagnostic {
+            file: CONFIG_FILE.to_string(),
+            id: None,
+            code: "state-coverage",
+            message: e.message(),
+        });
+    }
     // A scope is "defined" if it has a glob mapping, an owning crate, or an external
     // descriptor. A ticket declaring an undefined scope (a typo) would otherwise only
     // surface as a baffling later guard CONFLICT, so flag it like a dangling dep.
@@ -113,10 +125,24 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                         });
                     }
                 }
-                // Resolution metadata is only meaningful on a `closed` ticket. If it
-                // lingers on a non-closed one (e.g. a hand-edit that flipped status but
-                // left the reason), the "why" contradicts the live status.
-                if ticket.status != Status::Closed
+                // A state the registry doesn't define (a typo, or a state removed from
+                // config that a ticket still occupies). The engine treats it as inert.
+                if !registry.contains(&ticket.status) {
+                    diags.push(Diagnostic {
+                        file: file.clone(),
+                        id: Some(ticket.id.clone()),
+                        code: "unknown-state",
+                        message: format!(
+                            "status `{}` is not a defined workflow state",
+                            ticket.status
+                        ),
+                    });
+                }
+                // Resolution metadata is only meaningful on a *dropped* (terminal,
+                // non-satisfying) state like `closed`. If it lingers elsewhere (e.g. a
+                // hand-edit that flipped status but left the reason), the "why"
+                // contradicts the live status.
+                if !registry.class(&ticket.status).is_dropped()
                     && (ticket.closed_reason.is_some() || ticket.closed_note.is_some())
                 {
                     diags.push(Diagnostic {
@@ -124,7 +150,7 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                         id: Some(ticket.id.clone()),
                         code: "stale-resolution",
                         message: format!(
-                            "has closed_reason/closed_note but status is `{}`, not `closed`",
+                            "has closed_reason/closed_note but status `{}` is not a dropped (closed) state",
                             ticket.status
                         ),
                     });

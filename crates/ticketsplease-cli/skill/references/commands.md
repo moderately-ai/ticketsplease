@@ -9,7 +9,7 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 
 ## Contents
 
-`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
+`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
 
 ## Conventions
 
@@ -273,12 +273,20 @@ ticketsplease guide
 ```
 `doctor` validates setup: config present, git repo with a commit, scope globs compile, base ref resolves (exit non-zero on any failure). It also reports two **advisory** (non-gating) skill checks — `skill_canonical` (the canonical copy matches this binary; else run `skill sync`) and `skill_link` (the project links to it; else run `migrate`/`skill install`). JSON: `{ "schema_version", "ok": bool, "checks": [ {check, ok, detail} ] }`. `guide` prints the conceptual model (scopes, tracks, scoring, guard, claims). JSON: `{ "schema_version", "guide": "<text>" }`.
 
+## states
+
+```
+ticketsplease states                       # list the effective workflow states + categories
+ticketsplease migrate --remap old=new      # move tickets stranded in a renamed/removed state
+```
+By default a repo uses the built-in states (`todo`, `ready`, `in-progress`, `blocked`, `review`, `done`, `closed`). Define `[workflow.states]` in `ticketsplease.toml` to declare your own: each state's **name** is free, but it must pin to one engine **category** — `dispatchable` (pickable), `open` (occupies its scopes for the guard, blocks conflicting parallel work), `parked` (held, like `blocked`), or `terminal` (finished). A terminal state's `satisfies_dependents` bit *is* the done-vs-closed distinction (`true` unblocks dependents; `false` orphans them). The engine reasons on the category, never the name, so custom states schedule/guard/roll-up correctly and renaming a state (same category) never breaks anything. `set`/`create`/`reopen`/`watch --until` validate the status against this registry (an undefined state is exit 3). `states` JSON: `{ states: [{name, category, terminal, satisfies_dependents}], default, primary_open, primary_dropped, custom }`. When a config change removes/renames a state that live tickets still occupy, `lint` flags them `unknown-state` and `migrate --remap old=new` (repeatable) rewrites them.
+
 ## lint
 
 ```
 ticketsplease lint
 ```
-Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists, a scope claimed both exclusive and shared, and `[scope_policy]` keys that name no scope), links (dangling dependencies and dangling related links), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id` | `missing-dep` | `missing-related` | `cycle`). A dangling `related` is flagged but a `related` cycle is never an error.
+Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists, a scope claimed both exclusive and shared, `[scope_policy]` keys that name no scope, an **unknown workflow state**, resolution metadata on a non-closed ticket, and **workflow category coverage** — a config with no dispatchable or terminal state), links (dangling dependencies, dangling related links, and tickets **orphaned** by a closed dependency), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id` | `unknown-state` | `state-coverage` | `stale-resolution` | `missing-dep` | `missing-related` | `orphaned-by-closed-dep` | `cycle`). A dangling `related` is flagged but a `related` cycle is never an error.
 
 JSON: `{ "schema_version", "ok": bool, "diagnostics": [ {file, id, code, message} ] }`.
 

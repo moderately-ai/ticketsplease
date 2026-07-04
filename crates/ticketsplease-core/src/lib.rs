@@ -17,10 +17,12 @@ pub mod lint;
 pub mod migrate;
 pub mod query;
 pub mod schedule;
+pub mod states;
 pub mod store;
 pub mod ticket;
 pub mod views;
 
 pub use error::{Error, Result};
+pub use states::{Category, StateClass, StateRegistry};
 pub use store::Store;
-pub use ticket::{ClosedReason, Priority, Status, Ticket};
+pub use ticket::{ClosedReason, Priority, Ticket};

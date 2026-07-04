@@ -18,15 +18,16 @@ use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::views::Views;
 use ticketsplease_core::{
-    lint as lint_core, query, schedule, Error, Priority, Result, Status, Store, Ticket,
+    lint as lint_core, query, schedule, Error, Priority, Result, StateClass, StateRegistry, Store,
+    Ticket,
 };
 
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CloseArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs,
-    EventsArgs, GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, NextArgs, PathArgs,
-    ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs, RollupArgs, SelfUpdateArgs, SetArgs,
-    ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs,
-    WhyArgs,
+    EventsArgs, GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, MigrateArgs,
+    NextArgs, PathArgs, ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs, RollupArgs,
+    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs,
+    ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
 use crate::skill;
@@ -171,7 +172,13 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
         .title
         .as_deref()
         .ok_or_else(|| Error::Invalid("provide --title or --from".into()))?;
-    let status: Status = args.status.parse()?;
+    let registry = store.config.state_registry();
+    if !registry.contains(&args.status) {
+        return Err(Error::Invalid(format!(
+            "unknown status `{}` (not a defined workflow state; see `tkt states`)",
+            args.status
+        )));
+    }
     let priority: Priority = args.priority.parse()?;
     let depends_on = norm_list(&args.depends_on);
     let related = norm_list(&args.related);
@@ -185,7 +192,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
         Ticket::new(
             id,
             title,
-            status,
+            &args.status,
             priority,
             &depends_on,
             &related,
@@ -364,7 +371,7 @@ fn parse_manifest(from: &str, raw: &str) -> Result<Vec<TicketSpec>> {
 struct ParsedSpec {
     id: Option<String>,
     title: String,
-    status: Status,
+    status: String,
     priority: Priority,
     depends_on: Vec<String>,
     related: Vec<String>,
@@ -385,7 +392,7 @@ impl ParsedSpec {
         Ticket::new(
             id,
             &self.title,
-            self.status,
+            &self.status,
             self.priority,
             &self.depends_on,
             &self.related,
@@ -413,7 +420,7 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
         .enumerate()
         .map(|(i, s)| {
             Ok(ParsedSpec {
-                status: parse_field(s.status.as_deref().unwrap_or("todo"), i)?,
+                status: s.status.clone().unwrap_or_else(|| "todo".to_string()),
                 priority: parse_field(s.priority.as_deref().unwrap_or("p2"), i)?,
                 id: s.id,
                 title: s.title,
@@ -432,7 +439,14 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
     // Validate pass (no writes): render each ticket, and reject an explicit id that is
     // invalid or already on disk with different content — so the batch is all-or-nothing
     // for these failure modes rather than applying partially.
+    let registry = store.config.state_registry();
     for spec in &specs {
+        if !registry.contains(&spec.status) {
+            return Err(Error::Invalid(format!(
+                "unknown status `{}` (not a defined workflow state; see `tkt states`)",
+                spec.status
+            )));
+        }
         if let Some(id) = &spec.id {
             store::validate_slug(id)?;
             let contents = spec.render(&store.repo_root, id)?;
@@ -510,20 +524,31 @@ pub fn set(repo: &Path, fmt: Format, args: &SetArgs) -> Result<()> {
 /// Apply the field mutations shared by single and bulk `set`, returning whether any
 /// dependency was added (so the caller runs one cycle check). `--title` and body
 /// edits are single-target only and are handled by [`set_single`], not here.
-fn apply_set_field_mutations(ticket: &mut Ticket, args: &SetArgs) -> Result<bool> {
+fn apply_set_field_mutations(
+    ticket: &mut Ticket,
+    args: &SetArgs,
+    registry: &StateRegistry,
+) -> Result<bool> {
     if let Some(title) = &args.title {
         ticket.set_title(title)?;
     }
     if let Some(status) = &args.status {
-        ticket.set_status(status.parse()?)?;
+        if !registry.contains(status) {
+            return Err(Error::Invalid(format!(
+                "unknown status `{status}` (not a defined workflow state; see `tkt states`)"
+            )));
+        }
+        ticket.set_status(status, registry)?;
     }
-    // Resolution metadata rides only on a `closed` ticket. Applied after the status
-    // mutation so `set --status closed --reason X --note Y` lands in one call; rejected
-    // on anything that is not (now) closed so a stray reason can't contradict the status.
+    // Resolution metadata rides only on a *dropped* (terminal, non-satisfying) state.
+    // Applied after the status mutation so `set --status closed --reason X --note Y` lands
+    // in one call; rejected on anything that is not now a dropped state.
     if args.reason.is_some() || args.note.is_some() {
-        if ticket.status != Status::Closed {
+        if !ticket.class.is_dropped() {
             return Err(Error::Invalid(
-                "--reason/--note are only valid with --status closed".into(),
+                "--reason/--note are only valid when closing (a terminal state that does not \
+                 satisfy dependents, e.g. `closed`)"
+                    .into(),
             ));
         }
         if let Some(reason) = &args.reason {
@@ -584,8 +609,8 @@ fn apply_set_field_mutations(ticket: &mut Ticket, args: &SetArgs) -> Result<bool
 
 /// The `data` payload for a `status` activity event. Carries the close reason when the
 /// ticket landed in `closed`, so the log records *why* it ended, not just the transition.
-fn status_event_data(ticket: &Ticket, from: Status) -> Value {
-    let mut data = json!({ "status": ticket.status.as_str(), "from": from.as_str() });
+fn status_event_data(ticket: &Ticket, from: &str) -> Value {
+    let mut data = json!({ "status": ticket.status, "from": from });
     if let Some(reason) = ticket.closed_reason {
         data["reason"] = json!(reason.as_str());
     }
@@ -595,11 +620,12 @@ fn status_event_data(ticket: &Ticket, from: Status) -> Value {
 /// Single-ticket `set` (an explicit id). Body edits and title apply here.
 fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
     let id = args.id.as_deref().expect("single set has an id");
+    let registry = store.config.state_registry();
     let mut ticket = store.load(id)?;
     let before = ticket.render();
-    let status_before = ticket.status;
+    let status_before = ticket.status.clone();
 
-    let deps_added = apply_set_field_mutations(&mut ticket, args)?;
+    let deps_added = apply_set_field_mutations(&mut ticket, args, &registry)?;
     // Reject a dependency edit that would close a cycle, exactly like `link`. Related
     // links carry no ordering, so they need no cycle check.
     if deps_added {
@@ -620,7 +646,7 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
     }
     // Reaching a terminal status (done or closed) implicitly ends a claim — the ticket
     // must not keep looking owned.
-    if ticket.status.is_terminal() {
+    if ticket.is_terminal() {
         ticket.clear_lease();
     }
 
@@ -634,7 +660,7 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
                 "status",
                 &ticket.id,
                 None,
-                status_event_data(&ticket, status_before),
+                status_event_data(&ticket, &status_before),
             );
         }
     }
@@ -679,6 +705,7 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
     let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?
         .ok_or_else(|| Error::Invalid("bulk set requires --where or --view".into()))?;
 
+    let registry = store.config.state_registry();
     let mut all = store.load_all()?;
     let mut any_deps_added = false;
     let mut to_save: Vec<usize> = Vec::new();
@@ -689,9 +716,9 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
             continue;
         }
         let before = ticket.render();
-        let status_before = ticket.status;
-        any_deps_added |= apply_set_field_mutations(ticket, args)?;
-        if ticket.status.is_terminal() {
+        let status_before = ticket.status.clone();
+        any_deps_added |= apply_set_field_mutations(ticket, args, &registry)?;
+        if ticket.is_terminal() {
             ticket.clear_lease();
         }
         let changed = ticket.render() != before;
@@ -699,7 +726,7 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
         if changed {
             to_save.push(i);
             if ticket.status != status_before {
-                events.push((ticket.id.clone(), status_event_data(ticket, status_before)));
+                events.push((ticket.id.clone(), status_event_data(ticket, &status_before)));
             }
         }
     }
@@ -772,11 +799,24 @@ fn emit_transition_result(
 /// `set --status closed --reason … --note …`.
 pub fn close(repo: &Path, fmt: Format, args: &CloseArgs) -> Result<()> {
     let store = Store::open(repo)?;
+    let registry = store.config.state_registry();
+    // Close moves the ticket to the workflow's primary dropped state (a terminal state
+    // that does not satisfy dependents — `closed` by default).
+    let dropped = registry
+        .primary_dropped()
+        .ok_or_else(|| {
+            Error::Invalid(
+                "workflow has no closable state (a terminal state that does not satisfy \
+                 dependents, e.g. `closed`)"
+                    .into(),
+            )
+        })?
+        .to_string();
     let mut ticket = store.load(&args.id)?;
     let before = ticket.render();
-    let status_before = ticket.status;
+    let status_before = ticket.status.clone();
 
-    ticket.set_status(Status::Closed)?;
+    ticket.set_status(&dropped, &registry)?;
     if let Some(reason) = &args.reason {
         ticket.set_closed_reason(reason.parse()?)?;
     }
@@ -793,7 +833,7 @@ pub fn close(repo: &Path, fmt: Format, args: &CloseArgs) -> Result<()> {
                 "status",
                 &ticket.id,
                 None,
-                status_event_data(&ticket, status_before),
+                status_event_data(&ticket, &status_before),
             );
         }
     }
@@ -811,22 +851,28 @@ pub fn close(repo: &Path, fmt: Format, args: &CloseArgs) -> Result<()> {
 /// on in the activity log / git history, never as a stale live field.
 pub fn reopen(repo: &Path, fmt: Format, args: &ReopenArgs) -> Result<()> {
     let store = Store::open(repo)?;
+    let registry = store.config.state_registry();
     let mut ticket = store.load(&args.id)?;
-    let status_before = ticket.status;
-    if !ticket.status.is_terminal() {
+    let status_before = ticket.status.clone();
+    if !ticket.is_terminal() {
         return Err(Error::Invalid(format!(
             "ticket `{}` is `{}`, not terminal — reopen applies to a closed or done ticket",
             args.id, ticket.status
         )));
     }
-    let target: Status = args.status.parse()?;
-    if target.is_terminal() {
+    let target = &args.status;
+    if !registry.contains(target) {
+        return Err(Error::Invalid(format!(
+            "unknown status `{target}` (not a defined workflow state; see `tkt states`)"
+        )));
+    }
+    if registry.class(target).is_terminal() {
         return Err(Error::Invalid(format!(
             "reopen target `{target}` is itself terminal; choose an active status (e.g. todo)"
         )));
     }
     let before = ticket.render();
-    ticket.set_status(target)?; // clears closed_reason/closed_note atomically
+    ticket.set_status(target, &registry)?; // clears closed_reason/closed_note atomically
     let changed = ticket.render() != before;
     if changed && !args.dry_run {
         store.save(&ticket)?;
@@ -834,7 +880,7 @@ pub fn reopen(repo: &Path, fmt: Format, args: &ReopenArgs) -> Result<()> {
             "status",
             &ticket.id,
             None,
-            status_event_data(&ticket, status_before),
+            status_event_data(&ticket, &status_before),
         );
     }
     emit_transition_result(
@@ -1120,11 +1166,9 @@ fn print_events(fmt: Format, evs: &[Event]) -> Result<()> {
 /// `list` — list tickets, optionally filtered by status.
 pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let status = args
-        .status
-        .as_deref()
-        .map(str::parse::<Status>)
-        .transpose()?;
+    // `--status` matches a workflow state name (custom states allowed); a typo simply
+    // matches nothing, like the `--where status:` term.
+    let status = args.status.as_deref();
     let priority = args
         .priority
         .as_deref()
@@ -1136,11 +1180,11 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
     let (all, warnings) = store.load_all_lenient()?;
     let tickets: Vec<Ticket> = all
         .into_iter()
-        .filter(|t| status.map_or(true, |f| t.status == f))
+        .filter(|t| status.map_or(true, |f| t.status.eq_ignore_ascii_case(f)))
         .filter(|t| priority.map_or(true, |p| t.priority == p))
         .filter(|t| args.scope.as_ref().map_or(true, |s| t.scopes.contains(s)))
         .filter(|t| args.tag.as_ref().map_or(true, |tg| t.tags.contains(tg)))
-        .filter(|t| !args.hide_done || !t.status.is_terminal())
+        .filter(|t| !args.hide_done || !t.is_terminal())
         .filter(|t| predicate.as_ref().map_or(true, |p| p.matches(t)))
         .collect();
 
@@ -1304,11 +1348,13 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
         *by_priority.entry(t.priority.as_str()).or_default() += 1;
     }
     let total = selected.len();
-    let done = selected.iter().filter(|t| t.status == Status::Done).count();
-    let closed = selected
+    // `done` = a completed terminal state (satisfies dependents); `closed` = a dropped
+    // (terminal, non-satisfying) one. Both are terminal, but only `done` counts toward %.
+    let done = selected
         .iter()
-        .filter(|t| t.status == Status::Closed)
+        .filter(|t| t.completes_dependencies())
         .count();
+    let closed = selected.iter().filter(|t| t.class.is_dropped()).count();
     let percent_done = (done * 100).checked_div(total).unwrap_or(0);
 
     // Ready frontier: dispatchable over the full board ∩ the selection.
@@ -1330,20 +1376,20 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
     // dependent is *orphaned* — reported apart from a merely-not-yet-done (`blocked`)
     // dependency because the remedy differs: re-point / waive / cascade-close, versus just
     // wait. A ticket with any closed dependency is orphaned even if it also has pending ones.
-    let status_by_id: BTreeMap<&str, Status> =
-        all.iter().map(|t| (t.id.as_str(), t.status)).collect();
+    let class_by_id: BTreeMap<&str, StateClass> =
+        all.iter().map(|t| (t.id.as_str(), t.class)).collect();
     let mut blocked: Vec<(&Ticket, Vec<&str>)> = Vec::new();
     let mut orphaned: Vec<(&Ticket, Vec<&str>)> = Vec::new();
     for t in &selected {
-        if !t.status.is_dispatchable() {
+        if !t.is_dispatchable() {
             continue;
         }
         let mut pending: Vec<&str> = Vec::new();
         let mut closed_deps: Vec<&str> = Vec::new();
         for d in &t.dependencies {
-            match status_by_id.get(d.as_str()).copied() {
-                Some(s) if s.completes_dependencies() => {} // satisfied
-                Some(Status::Closed) => closed_deps.push(d.as_str()),
+            match class_by_id.get(d.as_str()).copied() {
+                Some(c) if c.completes_dependencies() => {} // satisfied
+                Some(c) if c.is_dropped() => closed_deps.push(d.as_str()),
                 _ => pending.push(d.as_str()), // not-yet-done, or dangling (lint's concern)
             }
         }
@@ -1390,24 +1436,20 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
             println!(
                 "initiative {scope}: {total} ticket(s), {done} done ({percent_done}%){closed_note}"
             );
-            // Status counts in lifecycle order, skipping absent buckets.
-            let order = [
-                Status::Todo,
-                Status::Ready,
-                Status::InProgress,
-                Status::Blocked,
-                Status::Review,
-                Status::Done,
-                Status::Closed,
-            ];
-            let statuses: Vec<String> = order
+            // Status counts in the workflow's lifecycle order, skipping absent buckets.
+            let registry = store.config.state_registry();
+            let ordered = registry.ordered_names();
+            let mut statuses: Vec<String> = ordered
                 .iter()
-                .filter_map(|s| {
-                    by_status
-                        .get(s.as_str())
-                        .map(|n| format!("{} {n}", s.as_str()))
-                })
+                .filter_map(|&s| by_status.get(s).map(|n| format!("{s} {n}")))
                 .collect();
+            // Surface any count in a state the registry doesn't define (a lint error) so
+            // it is not silently dropped from the summary.
+            for (&s, n) in &by_status {
+                if !ordered.contains(&s) {
+                    statuses.push(format!("{s} {n}"));
+                }
+            }
             println!("  status:   {}", join_or_none(&statuses));
             let prios: Vec<String> = ["p0", "p1", "p2", "p3"]
                 .iter()
@@ -1666,7 +1708,14 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
 /// working tree or a git ref. Times out (exit 7) when `--timeout` elapses.
 pub fn watch(repo: &Path, fmt: Format, args: &WatchArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let target: Status = args.until.parse()?;
+    let registry = store.config.state_registry();
+    if !registry.contains(&args.until) {
+        return Err(Error::Invalid(format!(
+            "unknown --until status `{}` (not a defined workflow state; see `tkt states`)",
+            args.until
+        )));
+    }
+    let target = args.until.trim().to_ascii_lowercase();
     // Resolve which ref to poll: explicit --ref, else the conventional
     // `<prefix><id>` branch if it exists, else the working tree.
     let resolved_ref: Option<String> = match &args.r#ref {
@@ -1684,13 +1733,13 @@ pub fn watch(repo: &Path, fmt: Format, args: &WatchArgs) -> Result<()> {
         };
         // A terminal status (done or closed) always ends the wait, so a ticket that skips
         // past the target still returns rather than hanging until timeout.
-        if ticket.status == target || ticket.status.is_terminal() {
-            emit_watch(fmt, args, resolved_ref.as_deref(), ticket.status, true)?;
+        if ticket.status == target || ticket.is_terminal() {
+            emit_watch(fmt, args, resolved_ref.as_deref(), &ticket.status, true)?;
             return Ok(());
         }
         if let Some(timeout) = args.timeout {
             if start.elapsed().as_secs() >= timeout {
-                emit_watch(fmt, args, resolved_ref.as_deref(), ticket.status, false)?;
+                emit_watch(fmt, args, resolved_ref.as_deref(), &ticket.status, false)?;
                 return Err(Error::Timeout(format!(
                     "ticket `{}` did not reach `{}` within {timeout}s",
                     args.id, args.until
@@ -1707,7 +1756,7 @@ fn emit_watch(
     fmt: Format,
     args: &WatchArgs,
     git_ref: Option<&str>,
-    status: Status,
+    status: &str,
     reached: bool,
 ) -> Result<()> {
     match fmt {
@@ -1715,20 +1764,16 @@ fn emit_watch(
             "schema_version": 1,
             "id": args.id,
             "ref": git_ref,
-            "status": status.as_str(),
+            "status": status,
             "reached": reached,
             "timed_out": !reached,
         })),
         Format::Human => {
             let location = git_ref.unwrap_or("(working tree)");
             if reached {
-                println!("{} reached `{}` (at {location})", args.id, status.as_str());
+                println!("{} reached `{status}` (at {location})", args.id);
             } else {
-                println!(
-                    "{} timed out at `{}` (at {location})",
-                    args.id,
-                    status.as_str()
-                );
+                println!("{} timed out at `{status}` (at {location})", args.id);
             }
             Ok(())
         }
@@ -2082,7 +2127,7 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
         let now = now_epoch();
         tickets
             .iter()
-            .filter(|t| t.status == Status::InProgress && t.lease_live(now))
+            .filter(|t| t.is_open() && t.lease_live(now))
             .collect()
     } else {
         let ids = norm_list(&args.running);
@@ -2166,8 +2211,36 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
 /// `migrate` — bring ticket frontmatter up to the current schema (round-trip-safe) and
 /// repair a stale project skill (an old real-dir copy or broken link) into a symlink to
 /// the refreshed canonical copy.
-pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
+pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
     let store = Store::open(repo)?;
+    let registry = store.config.state_registry();
+    // Apply --remap old=new first: move tickets stuck in a since-removed/renamed state to a
+    // current one, so a config change never silently strands a ticket in an unknown state.
+    let mut remaps: Vec<(String, String)> = Vec::new();
+    for spec in &args.remap {
+        let (old, new) = spec
+            .split_once('=')
+            .ok_or_else(|| Error::Invalid(format!("--remap expects `old=new`, got `{spec}`")))?;
+        let new = new.trim().to_ascii_lowercase();
+        if !registry.contains(&new) {
+            return Err(Error::Invalid(format!(
+                "--remap target `{new}` is not a defined workflow state (see `tkt states`)"
+            )));
+        }
+        remaps.push((old.trim().to_ascii_lowercase(), new));
+    }
+    let mut remapped: Vec<String> = Vec::new();
+    for mut ticket in store.load_all()? {
+        if let Some((_, new)) = remaps
+            .iter()
+            .find(|(old, _)| ticket.status.eq_ignore_ascii_case(old))
+        {
+            ticket.set_status(new, &registry)?;
+            store.save(&ticket)?;
+            remapped.push(ticket.id.clone());
+        }
+    }
+    remapped.sort();
     let report = migrate_core::migrate(&store)?;
     // Repair the project skill link if it exists but is stale, and refresh canonical.
     let link_path = skill::project_path(repo, ".claude/skills");
@@ -2184,6 +2257,7 @@ pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
         Format::Json => print_json(&json!({
             "schema_version": 1,
             "migrated": report.migrated,
+            "remapped": remapped,
             "unchanged": report.unchanged,
             "skill_relinked": skill_relinked,
         })),
@@ -2195,6 +2269,13 @@ pub fn migrate(repo: &Path, fmt: Format) -> Result<()> {
                     "Migrated {} ticket(s): {}",
                     report.migrated.len(),
                     report.migrated.join(", ")
+                );
+            }
+            if !remapped.is_empty() {
+                println!(
+                    "Remapped {} ticket(s): {}",
+                    remapped.len(),
+                    remapped.join(", ")
                 );
             }
             if skill_relinked {
@@ -2726,26 +2807,26 @@ pub fn reconcile(repo: &Path, fmt: Format, args: &ReconcileArgs) -> Result<()> {
     let mut findings: Vec<Value> = Vec::new();
     for t in &tickets {
         let has_branch = branch_ids.contains(&t.id);
-        match t.status {
-            // Marked busy, but nothing is actually running.
-            Status::InProgress if !has_branch => findings.push(json!({
+        if t.is_open() && !has_branch {
+            // Marked busy (an open state), but nothing is actually running.
+            findings.push(json!({
                 "id": t.id,
                 "issue": "in-progress-no-branch",
-                "status": t.status.as_str(),
+                "status": t.status,
                 "branch": false,
                 "worktree": false,
-                "detail": "in-progress but no work branch exists (abandoned or never-started dispatch)",
-            })),
+                "detail": "in an open state but no work branch exists (abandoned or never-started dispatch)",
+            }));
+        } else if t.is_dispatchable() && has_branch {
             // Live branch, but the board says the work hasn't started.
-            Status::Todo | Status::Ready if has_branch => findings.push(json!({
+            findings.push(json!({
                 "id": t.id,
                 "issue": "branch-without-active-ticket",
-                "status": t.status.as_str(),
+                "status": t.status,
                 "branch": true,
                 "worktree": has_worktree(&t.id),
-                "detail": "a work branch exists but the ticket is not in-progress (untracked in-flight work)",
-            })),
-            _ => {}
+                "detail": "a work branch exists but the ticket is not in an open state (untracked in-flight work)",
+            }));
         }
     }
     for id in &branch_ids {
@@ -3086,6 +3167,56 @@ Exit codes: 0 ok · 3 invalid · 4 not-found · 5 cycle · 6 conflict · 7 timeo
 JSON: every command supports --format json with schema_version: 1.
 
 The bundled Claude skill (installed by `tkt init`) has the full workflow guide.";
+
+/// `states` — list the effective workflow state registry (names + categories + roles).
+pub fn states(repo: &Path, fmt: Format) -> Result<()> {
+    let store = Store::open(repo)?;
+    let registry = store.config.state_registry();
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = registry
+                .iter_ordered()
+                .map(|(name, c)| {
+                    json!({
+                        "name": name,
+                        "category": c.category.as_str(),
+                        "terminal": c.is_terminal(),
+                        "satisfies_dependents": c.completes_dependencies(),
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "schema_version": 1,
+                "states": rows,
+                "default": registry.default_state(),
+                "primary_open": registry.primary_open(),
+                "primary_dropped": registry.primary_dropped(),
+                "custom": !store.config.workflow.states.is_empty(),
+            }))
+        }
+        Format::Human => {
+            let source = if store.config.workflow.states.is_empty() {
+                "built-in defaults"
+            } else {
+                "ticketsplease.toml [workflow.states]"
+            };
+            println!("workflow states ({source}):");
+            for (name, c) in registry.iter_ordered() {
+                let note = if c.is_terminal() {
+                    if c.completes_dependencies() {
+                        "  (satisfies dependents)"
+                    } else {
+                        "  (does NOT satisfy dependents)"
+                    }
+                } else {
+                    ""
+                };
+                println!("  {:<14} {}{note}", name, c.category.as_str());
+            }
+            Ok(())
+        }
+    }
+}
 
 /// `guide` — print the conceptual model (scopes, tracks, scoring, guard, claims).
 pub fn guide(fmt: Format) -> Result<()> {

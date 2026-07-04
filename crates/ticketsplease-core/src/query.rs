@@ -19,7 +19,7 @@
 use std::str::FromStr;
 
 use crate::error::{Error, Result};
-use crate::ticket::{ClosedReason, Priority, Status, Ticket};
+use crate::ticket::{ClosedReason, Priority, Ticket};
 
 /// A parsed `--where` expression, evaluated against a ticket with [`Predicate::matches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,8 +95,10 @@ impl Predicate {
             Predicate::Or(a, b) => a.matches(ticket) || b.matches(ticket),
             Predicate::Not(a) => !a.matches(ticket),
             Predicate::Term { field, value } => match field {
-                // Validated at parse time, so the re-parse here cannot fail.
-                Field::Status => Status::from_str(value).is_ok_and(|s| ticket.status == s),
+                // Status is a workflow-defined string (custom states allowed), so it is a
+                // plain name match — a typo simply matches nothing, like `tag:`.
+                Field::Status => ticket.status == *value,
+                // Priority is validated at parse time, so the re-parse here cannot fail.
                 Field::Priority => Priority::from_str(value).is_ok_and(|p| ticket.priority == p),
                 Field::Tag => ticket.tags.iter().any(|x| x == value),
                 Field::Scope => ticket.scopes.iter().any(|x| x == value),
@@ -287,11 +289,9 @@ fn parse_term(word: &str) -> Result<Predicate> {
         return Err(Error::Invalid(format!("missing value for `{name}:`")));
     }
     let field = Field::parse(name)?;
-    // Fail loud on an invalid enum value rather than silently matching nothing.
+    // Fail loud on an invalid *fixed-enum* value rather than silently matching nothing.
+    // `status` is workflow-defined (custom states), so it is not validated here.
     match field {
-        Field::Status => {
-            Status::from_str(value)?;
-        }
         Field::Priority => {
             Priority::from_str(value)?;
         }
@@ -358,8 +358,11 @@ mod tests {
     #[test]
     fn invalid_field_and_value_fail_loudly() {
         assert!(parse("bogus:x").is_err());
-        assert!(parse("status:doing").is_err()); // invalid enum value
+        // `status` is workflow-defined now, so a bad status name is not a parse error
+        // (it just matches nothing) — unlike the fixed `priority`/`reason` enums.
+        assert!(parse("status:doing").is_ok());
         assert!(parse("priority:p9").is_err());
+        assert!(parse("reason:bogus").is_err());
         assert!(parse("").is_err());
         assert!(parse("   ").is_err());
         assert!(parse("tag:").is_err());

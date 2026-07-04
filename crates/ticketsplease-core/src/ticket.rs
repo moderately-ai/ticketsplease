@@ -11,102 +11,7 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::error::{Error, Result};
 use crate::frontmatter::Document;
-
-/// Ticket lifecycle status. Ordering follows declaration order and is not
-/// otherwise meaningful.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Status {
-    /// Newly created, not yet started.
-    #[default]
-    Todo,
-    /// Author-flagged as ready to pick up.
-    Ready,
-    /// Actively being worked.
-    InProgress,
-    /// Cannot proceed.
-    Blocked,
-    /// Awaiting review.
-    Review,
-    /// Completed successfully.
-    Done,
-    /// Terminated without completion — won't-do, duplicate, obsolete, superseded,
-    /// cancelled. Terminal like `done` (excluded from scheduling, drops its claim) but
-    /// deliberately does *not* satisfy dependents; see [`Status::completes_dependencies`].
-    Closed,
-}
-
-impl Status {
-    /// The canonical lowercase/kebab string written to frontmatter.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Status::Todo => "todo",
-            Status::Ready => "ready",
-            Status::InProgress => "in-progress",
-            Status::Blocked => "blocked",
-            Status::Review => "review",
-            Status::Done => "done",
-            Status::Closed => "closed",
-        }
-    }
-
-    /// Whether a ticket in this status is eligible for dispatch (todo or ready).
-    #[must_use]
-    pub fn is_dispatchable(self) -> bool {
-        matches!(self, Status::Todo | Status::Ready)
-    }
-
-    /// Whether a ticket in this status is actively open (in-progress or review),
-    /// which the guard treats as occupying its declared scopes.
-    #[must_use]
-    pub fn is_open(self) -> bool {
-        matches!(self, Status::InProgress | Status::Review)
-    }
-
-    /// Whether this is a terminal status (finished for scheduling): `done` or `closed`.
-    /// Terminal tickets are excluded from the ready/dispatch queue and drop their claim,
-    /// but only `done` also [`completes_dependencies`](Self::completes_dependencies).
-    #[must_use]
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Status::Done | Status::Closed)
-    }
-
-    /// Whether reaching this status satisfies a dependent's dependency — `done` only.
-    /// A `closed` (abandoned) prerequisite is terminal but deliberately does *not*
-    /// unblock its dependents: they are surfaced as orphaned rather than silently
-    /// dispatched onto dropped work or silently deadlocked.
-    #[must_use]
-    pub fn completes_dependencies(self) -> bool {
-        matches!(self, Status::Done)
-    }
-}
-
-impl FromStr for Status {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self> {
-        Ok(match s.trim().to_ascii_lowercase().as_str() {
-            "todo" => Status::Todo,
-            "ready" => Status::Ready,
-            "in-progress" => Status::InProgress,
-            "blocked" => Status::Blocked,
-            "review" => Status::Review,
-            "done" => Status::Done,
-            "closed" => Status::Closed,
-            _ => {
-                return Err(Error::Invalid(format!(
-                "unknown status `{s}` (expected todo|ready|in-progress|blocked|review|done|closed)"
-            )))
-            }
-        })
-    }
-}
-
-impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use crate::states::{StateClass, StateRegistry};
 
 /// Why a ticket was `closed` (terminated without completion). A deliberately small,
 /// fixed vocabulary — closed like GitHub's handful of close reasons, not Jira's
@@ -225,8 +130,12 @@ pub struct Ticket {
     pub id: String,
     /// Human-readable title.
     pub title: String,
-    /// Lifecycle status.
-    pub status: Status,
+    /// Lifecycle status name (validated against the workflow registry).
+    pub status: String,
+    /// The resolved behavioural class of `status` (category + `satisfies_dependents`),
+    /// stamped from the [`StateRegistry`](crate::StateRegistry) at parse/load. The
+    /// scheduler/guard/rollup read this, not the name, so custom states behave correctly.
+    pub class: StateClass,
     /// Priority.
     pub priority: Priority,
     /// IDs of tickets this one depends on.
@@ -251,8 +160,8 @@ pub struct Ticket {
     /// Claim lease expiry (epoch seconds), if claimed.
     pub lease_expires_at: Option<u64>,
     /// The status the ticket held before it was claimed, so `release` can restore it
-    /// instead of unconditionally landing in `ready`. Present only while claimed.
-    pub claimed_from: Option<Status>,
+    /// instead of unconditionally landing in the default state. Present only while claimed.
+    pub claimed_from: Option<String>,
     /// Why the ticket was closed, when `status: closed` and a reason was recorded.
     /// Only meaningful while `closed`; cleared on any transition away.
     pub closed_reason: Option<ClosedReason>,
@@ -280,9 +189,11 @@ impl Ticket {
         let id = require_string(y, "id")?;
         let title = require_string(y, "title")?;
         let status = optional_string(y, "status")
-            .map(|s| s.parse())
-            .transpose()?
-            .unwrap_or_default();
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "todo".to_string());
+        // Stamp the behavioural class from the built-in registry; `Store` re-stamps with
+        // the repo's configured registry on load, where custom states resolve correctly.
+        let class = StateRegistry::builtin().class(&status);
         let priority = optional_string(y, "priority")
             .map(|s| s.parse())
             .transpose()?
@@ -292,6 +203,7 @@ impl Ticket {
             id,
             title,
             status,
+            class,
             priority,
             dependencies: string_list(y, "dependencies"),
             related: string_list(y, "related"),
@@ -301,7 +213,7 @@ impl Ticket {
             tags: string_list(y, "tags"),
             assignee: optional_string(y, "assignee"),
             lease_expires_at: optional_string(y, "lease_expires_at").and_then(|s| s.parse().ok()),
-            claimed_from: optional_string(y, "claimed_from").and_then(|s| s.parse().ok()),
+            claimed_from: optional_string(y, "claimed_from"),
             closed_reason: optional_string(y, "closed_reason")
                 .map(|s| s.parse())
                 .transpose()?,
@@ -339,17 +251,53 @@ impl Ticket {
         self.doc.render()
     }
 
-    /// Set the status (surgical write). Any transition *away* from `closed` clears the
-    /// resolution metadata (`closed_reason`/`closed_note`) in the same write, so the
-    /// live frontmatter never carries a stale "why" contradicting the current status —
-    /// this is what makes `reopen` atomic and self-cleaning.
-    pub fn set_status(&mut self, status: Status) -> Result<()> {
-        self.doc.set_scalar("status", status.as_str())?;
-        if status != Status::Closed {
+    /// Set the status (surgical write), re-stamping the behavioural [`class`](Self::class)
+    /// from `registry`. A transition to any state that is not a *dropped* (terminal,
+    /// non-satisfying) state clears the resolution metadata (`closed_reason`/`closed_note`)
+    /// in the same write, so the live frontmatter never carries a stale "why" — this is what
+    /// makes `reopen` atomic and self-cleaning, and it generalizes to any custom dropped state.
+    pub fn set_status(&mut self, status: &str, registry: &StateRegistry) -> Result<()> {
+        // Canonicalize to lowercase so stored status names stay consistent regardless of
+        // input case (matching the historical case-insensitive `Status` parse).
+        let status = status.trim().to_ascii_lowercase();
+        self.doc.set_scalar("status", &status)?;
+        self.class = registry.class(&status);
+        self.status = status;
+        if !self.class.is_dropped() {
             self.clear_closed_meta();
         }
-        self.status = status;
         Ok(())
+    }
+
+    /// Re-stamp the behavioural [`class`](Self::class) from a registry — used by `Store`
+    /// after load to resolve custom states against the repo's configured workflow.
+    pub fn resolve_class(&mut self, registry: &StateRegistry) {
+        self.class = registry.class(&self.status);
+    }
+
+    /// Whether this ticket is eligible for dispatch (its state's category is `dispatchable`).
+    #[must_use]
+    pub fn is_dispatchable(&self) -> bool {
+        self.class.is_dispatchable()
+    }
+
+    /// Whether this ticket is actively open (occupies its scopes for the guard).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.class.is_open()
+    }
+
+    /// Whether this ticket is terminal (finished for scheduling; drops its claim).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.class.is_terminal()
+    }
+
+    /// Whether reaching this ticket's state satisfies its dependents (a completed
+    /// terminal state, e.g. `done` — not an abandoned one, e.g. `closed`).
+    #[must_use]
+    pub fn completes_dependencies(&self) -> bool {
+        self.class.completes_dependencies()
     }
 
     /// Record why a `closed` ticket was closed (surgical). The caller is responsible for
@@ -508,15 +456,25 @@ impl Ticket {
         Ok(changed)
     }
 
-    /// Record a claim: set status in-progress, assignee, and the lease expiry.
-    pub fn set_claim(&mut self, assignee: &str, lease_expires_at: u64) -> Result<()> {
-        // Remember the pre-claim status so `release` can restore it. Don't overwrite
-        // it when renewing a claim that is already in-progress.
-        if self.status != Status::InProgress {
-            self.doc.set_scalar("claimed_from", self.status.as_str())?;
-            self.claimed_from = Some(self.status);
+    /// Record a claim: move the ticket to the workflow's primary open state (the claim
+    /// target), set the assignee, and the lease expiry.
+    pub fn set_claim(
+        &mut self,
+        assignee: &str,
+        lease_expires_at: u64,
+        registry: &StateRegistry,
+    ) -> Result<()> {
+        let open = registry
+            .primary_open()
+            .ok_or_else(|| Error::Invalid("workflow has no open state to claim into".into()))?
+            .to_string();
+        // Remember the pre-claim status so `release` can restore it. Don't overwrite it
+        // when renewing a claim that already sits at the open state.
+        if self.status != open {
+            self.doc.set_scalar("claimed_from", &self.status)?;
+            self.claimed_from = Some(self.status.clone());
         }
-        self.set_status(Status::InProgress)?;
+        self.set_status(&open, registry)?;
         self.doc.set_scalar("assignee", assignee)?;
         // Write the lease as a bare integer so frontmatter matches the JSON type.
         self.doc
@@ -526,14 +484,17 @@ impl Ticket {
         Ok(())
     }
 
-    /// Clear a claim. If the ticket is still `in-progress` (the claim never advanced),
-    /// restore the pre-claim status (`claimed_from`, default `ready`); if the worker
-    /// already moved it on (review/blocked/done), keep that — releasing must not
-    /// revert real progress.
-    pub fn clear_claim(&mut self) -> Result<()> {
-        if self.status == Status::InProgress {
-            let restore = self.claimed_from.unwrap_or(Status::Ready);
-            self.set_status(restore)?;
+    /// Clear a claim. If the ticket still sits at the open state the claim put it in (the
+    /// claim never advanced), restore the pre-claim status (`claimed_from`, else the
+    /// workflow default state); if the worker already moved it on (review/terminal), keep
+    /// that — releasing must not revert real progress.
+    pub fn clear_claim(&mut self, registry: &StateRegistry) -> Result<()> {
+        if registry.primary_open() == Some(self.status.as_str()) {
+            let restore = self
+                .claimed_from
+                .clone()
+                .unwrap_or_else(|| registry.default_state().to_string());
+            self.set_status(&restore, registry)?;
         }
         self.clear_lease();
         Ok(())
@@ -572,7 +533,7 @@ impl Ticket {
     pub fn new(
         id: &str,
         title: &str,
-        status: Status,
+        status: &str,
         priority: Priority,
         dependencies: &[String],
         related: &[String],
@@ -587,7 +548,7 @@ impl Ticket {
         s.push_str("---\n");
         s.push_str(&format!("id: {}\n", render_scalar(id)));
         s.push_str(&format!("title: {}\n", render_scalar(title)));
-        s.push_str(&format!("status: {}\n", status.as_str()));
+        s.push_str(&format!("status: {status}\n"));
         s.push_str(&format!("priority: {}\n", priority.as_str()));
         s.push_str(&format!(
             "dependencies: {}\n",
@@ -647,18 +608,20 @@ mod tests {
         let t = Ticket::parse(SAMPLE).unwrap();
         assert_eq!(t.id, "foo");
         assert_eq!(t.title, "A title");
-        assert_eq!(t.status, Status::Review);
+        assert_eq!(t.status, "review");
         assert_eq!(t.priority, Priority::P1);
         assert_eq!(t.dependencies, vec!["a", "b"]);
         assert_eq!(t.scopes, vec!["one"]);
-        assert!(t.status.is_open());
+        // `review` is an open state in the built-in registry, stamped at parse.
+        assert!(t.is_open());
     }
 
     #[test]
     fn missing_status_priority_default() {
         let raw = "---\nid: x\ntitle: T\n---\n";
         let t = Ticket::parse(raw).unwrap();
-        assert_eq!(t.status, Status::Todo);
+        assert_eq!(t.status, "todo");
+        assert!(t.is_dispatchable());
         assert_eq!(t.priority, Priority::P2);
     }
 
@@ -670,15 +633,17 @@ mod tests {
 
     #[test]
     fn mutation_round_trips_through_document() {
+        let reg = StateRegistry::builtin();
         let mut t = Ticket::parse(SAMPLE).unwrap();
-        t.set_status(Status::Done).unwrap();
+        t.set_status("done", &reg).unwrap();
+        assert!(t.completes_dependencies());
         assert!(t.add_dependency("c").unwrap());
         let out = t.render();
         assert!(out.contains("status: done\n"));
         assert!(out.contains("dependencies: [a, b, c]\n"));
         // Reparse to confirm the written form is valid and consistent.
         let again = Ticket::parse(&out).unwrap();
-        assert_eq!(again.status, Status::Done);
+        assert_eq!(again.status, "done");
         assert_eq!(again.dependencies, vec!["a", "b", "c"]);
     }
 
@@ -695,7 +660,7 @@ mod tests {
         let t = Ticket::new(
             "foo",
             "T",
-            Status::Todo,
+            "todo",
             Priority::P2,
             &["a".into()],
             &["b".into()],
@@ -720,37 +685,32 @@ mod tests {
     }
 
     #[test]
-    fn status_and_priority_parse_case_insensitively() {
-        assert_eq!("TODO".parse::<Status>().unwrap(), Status::Todo);
-        assert_eq!(
-            " In-Progress ".parse::<Status>().unwrap(),
-            Status::InProgress
-        );
+    fn priority_parses_case_insensitively() {
         assert_eq!("P0".parse::<Priority>().unwrap(), Priority::P0);
-        let err = "doing".parse::<Status>().unwrap_err().to_string();
-        assert!(
-            err.contains("expected todo|ready"),
-            "lists valid values: {err}"
-        );
+        assert_eq!(" p2 ".parse::<Priority>().unwrap(), Priority::P2);
+        assert!("p9".parse::<Priority>().is_err());
     }
 
     #[test]
-    fn closed_is_terminal_but_does_not_complete_dependencies() {
-        assert_eq!("closed".parse::<Status>().unwrap(), Status::Closed);
-        assert_eq!(Status::Closed.as_str(), "closed");
-        assert!(Status::Closed.is_terminal());
-        assert!(Status::Done.is_terminal());
+    fn closed_ticket_is_terminal_but_does_not_complete_dependencies() {
+        let raw = "---\nid: x\ntitle: T\nstatus: closed\n---\n";
+        let t = Ticket::parse(raw).unwrap();
+        assert_eq!(t.status, "closed");
+        assert!(t.is_terminal());
         // The whole point: closed is terminal but does NOT satisfy dependents.
-        assert!(!Status::Closed.completes_dependencies());
-        assert!(Status::Done.completes_dependencies());
-        assert!(!Status::Closed.is_dispatchable());
-        assert!(!Status::Closed.is_open());
+        assert!(!t.completes_dependencies());
+        assert!(!t.is_dispatchable());
+        assert!(!t.is_open());
+        // Contrast: a done ticket completes its dependencies.
+        let done = Ticket::parse("---\nid: y\ntitle: T\nstatus: done\n---\n").unwrap();
+        assert!(done.is_terminal() && done.completes_dependencies());
     }
 
     #[test]
     fn closed_reason_round_trips_and_reopen_clears_it() {
+        let reg = StateRegistry::builtin();
         let mut t = Ticket::parse(SAMPLE).unwrap();
-        t.set_status(Status::Closed).unwrap();
+        t.set_status("closed", &reg).unwrap();
         t.set_closed_reason(ClosedReason::WontDo).unwrap();
         t.set_closed_note("superseded by a new approach").unwrap();
         let out = t.render();
@@ -759,17 +719,17 @@ mod tests {
         assert!(out.contains("closed_note:"));
         // The written form reparses to the same typed values.
         let again = Ticket::parse(&out).unwrap();
-        assert_eq!(again.status, Status::Closed);
+        assert_eq!(again.status, "closed");
         assert_eq!(again.closed_reason, Some(ClosedReason::WontDo));
         assert_eq!(
             again.closed_note.as_deref(),
             Some("superseded by a new approach")
         );
 
-        // Reopening (any transition away from closed) clears the resolution atomically.
+        // Reopening (a transition to a non-dropped state) clears the resolution atomically.
         let mut reopened = again;
-        reopened.set_status(Status::Todo).unwrap();
-        assert_eq!(reopened.status, Status::Todo);
+        reopened.set_status("todo", &reg).unwrap();
+        assert_eq!(reopened.status, "todo");
         assert!(reopened.closed_reason.is_none());
         assert!(reopened.closed_note.is_none());
         let out2 = reopened.render();

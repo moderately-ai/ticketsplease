@@ -4290,3 +4290,124 @@ fn close_reopen_and_orphaned_dependents() {
         .success();
     assert_eq!(ready_ids(repo), vec!["web"]);
 }
+
+/// Append a `[workflow]` block to a repo's config.
+fn append_config(repo: &Path, toml: &str) {
+    let path = repo.join("ticketsplease.toml");
+    let mut cfg = std::fs::read_to_string(&path).unwrap();
+    cfg.push_str(toml);
+    std::fs::write(&path, cfg).unwrap();
+}
+
+#[test]
+fn custom_workflow_states_and_categories() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // A fully custom workflow: todo -> qa (open) -> shipped (done) plus a wontfix drop.
+    append_config(
+        repo,
+        "\n[workflow.states.todo]\ncategory = \"dispatchable\"\n\
+         [workflow.states.qa]\ncategory = \"open\"\n\
+         [workflow.states.shipped]\ncategory = \"terminal\"\nsatisfies_dependents = true\n\
+         [workflow.states.wontfix]\ncategory = \"terminal\"\nsatisfies_dependents = false\n",
+    );
+
+    // `tkt states` reflects the custom registry and its derived roles.
+    let out = tkt(repo)
+        .args(["states", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["custom"], true);
+    assert_eq!(v["primary_open"], "qa");
+    assert_eq!(v["primary_dropped"], "wontfix");
+    let names: Vec<&str> = v["states"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"qa") && names.contains(&"shipped") && names.contains(&"wontfix"));
+
+    tkt(repo)
+        .args(["create", "--id", "base", "--title", "Base"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "web",
+            "--title",
+            "Web",
+            "--depends-on",
+            "base",
+        ])
+        .assert()
+        .success();
+
+    // `qa` is a first-class open state: accepted, and excluded from the ready frontier.
+    tkt(repo)
+        .args(["set", "base", "--status", "qa"])
+        .assert()
+        .success();
+    assert!(!ready_ids(repo).iter().any(|id| id == "base"));
+    // An undefined state is rejected (exit 3).
+    tkt(repo)
+        .args(["set", "base", "--status", "qaa"])
+        .assert()
+        .code(3);
+
+    // A satisfies-dependents terminal state unblocks the dependent...
+    tkt(repo)
+        .args(["set", "base", "--status", "shipped"])
+        .assert()
+        .success();
+    assert_eq!(ready_ids(repo), vec!["web"]);
+    // ...while a non-satisfying terminal (wontfix) orphans it — the config reproduces the
+    // built-in done-vs-closed behaviour purely from categories.
+    tkt(repo)
+        .args(["set", "base", "--status", "wontfix"])
+        .assert()
+        .success();
+    assert!(!ready_ids(repo).iter().any(|id| id == "web"));
+    let out = tkt(repo)
+        .args(["rollup", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["orphaned"].as_array().unwrap()[0]["id"], "web");
+    assert_eq!(v["closed"], 1); // wontfix is a dropped (terminal, non-satisfying) state
+
+    // Renaming a state: `migrate --remap` moves stranded tickets to a current state.
+    tkt(repo)
+        .args(["migrate", "--remap", "wontfix=shipped"])
+        .assert()
+        .success();
+    assert_eq!(ready_ids(repo), vec!["web"]);
+}
+
+#[test]
+fn workflow_coverage_is_validated() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // A workflow with no terminal state can never finish work — a config error.
+    append_config(
+        repo,
+        "\n[workflow.states.todo]\ncategory = \"dispatchable\"\n\
+         [workflow.states.doing]\ncategory = \"open\"\n",
+    );
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "state-coverage"));
+    tkt(repo).args(["lint"]).assert().code(3);
+}

@@ -76,10 +76,12 @@ impl Store {
 
     /// Load and parse every ticket (sorted by id). Fails if any file is invalid.
     pub fn load_all(&self) -> Result<Vec<Ticket>> {
+        let reg = self.config.state_registry();
         let mut tickets = Vec::new();
         for path in self.ticket_files()? {
-            let ticket = Ticket::load(&path)
+            let mut ticket = Ticket::load(&path)
                 .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
+            ticket.resolve_class(&reg);
             tickets.push(ticket);
         }
         tickets.sort_by(|a, b| a.id.cmp(&b.id));
@@ -91,11 +93,15 @@ impl Store {
     /// malformed file can't black out the whole board; scheduling commands keep
     /// the strict [`load_all`](Self::load_all).
     pub fn load_all_lenient(&self) -> Result<(Vec<Ticket>, Vec<String>)> {
+        let reg = self.config.state_registry();
         let mut tickets = Vec::new();
         let mut warnings = Vec::new();
         for path in self.ticket_files()? {
             match Ticket::load(&path) {
-                Ok(t) => tickets.push(t),
+                Ok(mut t) => {
+                    t.resolve_class(&reg);
+                    tickets.push(t);
+                }
                 Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
             }
         }
@@ -109,7 +115,9 @@ impl Store {
         if !path.exists() {
             return Err(Error::NotFound(id.to_string()));
         }
-        Ticket::load(&path)
+        let mut ticket = Ticket::load(&path)?;
+        ticket.resolve_class(&self.config.state_registry());
+        Ok(ticket)
     }
 
     /// Load a ticket as committed on a git ref (e.g. a `tkt/<id>` branch), via
@@ -139,7 +147,10 @@ impl Store {
             return Err(Error::Invalid(format!("`git show {spec}` failed: {s}")));
         }
         let raw = String::from_utf8_lossy(&output.stdout);
-        Ticket::parse(&raw).map_err(|e| Error::Invalid(format!("{id} @ {git_ref}: {e}")))
+        let mut ticket =
+            Ticket::parse(&raw).map_err(|e| Error::Invalid(format!("{id} @ {git_ref}: {e}")))?;
+        ticket.resolve_class(&self.config.state_registry());
+        Ok(ticket)
     }
 
     /// Load the config as committed on a git ref (e.g. the guard `--base`). Returns

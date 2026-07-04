@@ -1,7 +1,7 @@
 ---
 id: config-custom-states
 title: "Config-driven custom states, each pinned to an engine category"
-status: todo
+status: done
 priority: p2
 dependencies: [closed-status-resolution]
 related: [state-transition-workflows]

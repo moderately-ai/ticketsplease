@@ -24,7 +24,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::store::Store;
-use crate::{Status, Ticket};
+use crate::Ticket;
 
 /// Default claim lease (one hour): long enough for a coding-agent task, short
 /// enough that a crashed agent stops blocking the ticket promptly.
@@ -70,13 +70,14 @@ pub fn claim(
     force: bool,
 ) -> Result<ClaimOutcome> {
     let ticket = store.load(id)?; // NotFound (exit 4) if the id is unknown
-    if !matches!(
-        ticket.status,
-        Status::Todo | Status::Ready | Status::InProgress
-    ) {
-        // A state conflict (the ticket is done/blocked/review), not bad input.
+    let registry = store.config.state_registry();
+    // Claimable = a dispatchable state, or already at the claim target (a renewal). A
+    // terminal/parked ticket is a state conflict, not bad input.
+    let claimable =
+        ticket.is_dispatchable() || registry.primary_open() == Some(ticket.status.as_str());
+    if !claimable {
         return Err(Error::Conflict(format!(
-            "ticket `{id}` is `{}`, not claimable (only todo/ready/in-progress can be claimed)",
+            "ticket `{id}` is `{}`, not claimable (only dispatchable or in-progress tickets can be claimed)",
             ticket.status
         )));
     }
@@ -90,11 +91,11 @@ pub fn claim(
         .dependencies
         .iter()
         .filter_map(|dep| store.load(dep).ok())
-        .filter(|d| !d.status.completes_dependencies())
+        .filter(|d| !d.completes_dependencies())
         .collect();
     let closed: Vec<String> = unmet
         .iter()
-        .filter(|d| d.status.is_terminal())
+        .filter(|d| d.is_terminal())
         .map(|d| d.id.clone())
         .collect();
     if !closed.is_empty() {
@@ -106,7 +107,7 @@ pub fn claim(
     }
     let pending: Vec<String> = unmet
         .iter()
-        .filter(|d| !d.status.is_terminal())
+        .filter(|d| !d.is_terminal())
         .map(|d| d.id.clone())
         .collect();
     if !pending.is_empty() {
@@ -154,7 +155,7 @@ fn claim_locked(
     };
 
     let lease = now.saturating_add(ttl_secs);
-    ticket.set_claim(agent, lease)?;
+    ticket.set_claim(agent, lease, &store.config.state_registry())?;
     store.save(&ticket)?;
     Ok(ClaimOutcome {
         id: id.to_string(),
@@ -178,7 +179,8 @@ pub fn release(store: &Store, id: &str, agent: Option<&str>, force: bool) -> Res
 
 fn release_locked(store: &Store, id: &str, agent: Option<&str>, force: bool) -> Result<bool> {
     let mut ticket = store.load(id)?;
-    if ticket.assignee.is_none() && ticket.status != Status::InProgress {
+    let registry = store.config.state_registry();
+    if ticket.assignee.is_none() && registry.primary_open() != Some(ticket.status.as_str()) {
         return Ok(false); // nothing to release
     }
     if !force {
@@ -200,7 +202,7 @@ fn release_locked(store: &Store, id: &str, agent: Option<&str>, force: bool) -> 
             _ => {}
         }
     }
-    ticket.clear_claim()?;
+    ticket.clear_claim(&registry)?;
     store.save(&ticket)?;
     Ok(true)
 }

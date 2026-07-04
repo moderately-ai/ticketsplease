@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::states::{StateDef, StateRegistry};
 
 /// Config file name, located at the repository root.
 pub const CONFIG_FILE: &str = "ticketsplease.toml";
@@ -50,6 +51,9 @@ pub struct Config {
     /// count for more. Default weight is 1; a shared-by-both claim is always free.
     #[serde(default)]
     pub scope_policy: BTreeMap<String, ScopePolicy>,
+    /// Workflow: custom lifecycle states (+ categories) and optional transition rules.
+    #[serde(default)]
+    pub workflow: Workflow,
 }
 
 /// Per-scope scheduling policy (see [`Config::scope_policy`]).
@@ -70,6 +74,33 @@ impl Config {
             .map(|(k, v)| (k.clone(), v.weight))
             .collect()
     }
+
+    /// The effective workflow state registry: the built-in default states when the repo
+    /// declares no `[workflow.states]`, else the configured set.
+    #[must_use]
+    pub fn state_registry(&self) -> StateRegistry {
+        if self.workflow.states.is_empty() {
+            StateRegistry::builtin()
+        } else {
+            StateRegistry::from_defs(&self.workflow.states)
+        }
+    }
+}
+
+/// Workflow configuration (`[workflow]`): custom lifecycle states and optional
+/// transition enforcement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Workflow {
+    /// Custom state definitions (`[workflow.states.<name>]`). Empty → the built-in states.
+    #[serde(default)]
+    pub states: BTreeMap<String, StateDef>,
+    /// Whether to enforce the `transitions` adjacency graph. Default off (any-to-any).
+    /// Consumed by the transition-enforcement feature.
+    #[serde(default)]
+    pub enforce_transitions: bool,
+    /// Allowed `state -> [states]` transitions. Only consulted when `enforce_transitions`.
+    #[serde(default)]
+    pub transitions: BTreeMap<String, Vec<String>>,
 }
 
 /// An external/forked dependency that lives outside this repo (pinned via
@@ -131,6 +162,7 @@ impl Default for Config {
             scope_crates: BTreeMap::new(),
             external_scopes: BTreeMap::new(),
             scope_policy: BTreeMap::new(),
+            workflow: Workflow::default(),
         }
     }
 }

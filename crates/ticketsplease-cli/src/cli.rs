@@ -95,6 +95,8 @@ pub enum Command {
     Rename(RenameArgs),
     /// Check repository setup (config, git, scope globs, base ref).
     Doctor,
+    /// List the configured workflow states with their engine category and roles.
+    States,
     /// Print a short conceptual guide (scopes, tracks, scoring, guard, claims).
     Guide,
     /// Explain why two tickets can or cannot run in parallel.
@@ -711,7 +713,17 @@ macro_rules! empty_args {
     };
 }
 
-empty_args!(ReadyArgs, LintArgs, MigrateArgs,);
+empty_args!(ReadyArgs, LintArgs,);
+
+/// `migrate` arguments.
+#[derive(Args)]
+pub struct MigrateArgs {
+    /// Rewrite tickets stuck in a since-renamed/removed state to a current one:
+    /// `--remap old=new` (repeatable). `new` must be a defined workflow state. Use when a
+    /// config change renames or drops a state that live tickets still occupy.
+    #[arg(long = "remap", value_name = "OLD=NEW")]
+    pub remap: Vec<String>,
+}
 
 /// `tracks` arguments.
 #[derive(Args)]
@@ -827,10 +839,11 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Delete(a) => commands::delete(repo, fmt, a),
         Command::Rename(a) => commands::rename(repo, fmt, a),
         Command::Doctor => commands::doctor(repo, fmt),
+        Command::States => commands::states(repo, fmt),
         Command::Guide => commands::guide(fmt),
         Command::Why(a) => commands::why(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
-        Command::Migrate(_) => commands::migrate(repo, fmt),
+        Command::Migrate(a) => commands::migrate(repo, fmt, a),
         Command::Skill(a) => match &a.command {
             SkillCommand::Install(a) => commands::skill_install(repo, fmt, a),
             SkillCommand::Sync => commands::skill_sync(fmt),
