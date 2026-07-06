@@ -1,7 +1,7 @@
 //! Schema-level linting of tickets. Link validation and cycle detection live in
 //! the scheduling layer (milestone M3) and reuse these diagnostics.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
@@ -92,17 +92,10 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
             }
         }
     }
-    // A scope is "defined" if it has a glob mapping, an owning crate, or an external
-    // descriptor. A ticket declaring an undefined scope (a typo) would otherwise only
-    // surface as a baffling later guard CONFLICT, so flag it like a dangling dep.
-    let defined_scopes: BTreeSet<&str> = store
-        .config
-        .scopes
-        .keys()
-        .chain(store.config.scope_crates.keys())
-        .chain(store.config.external_scopes.keys())
-        .map(String::as_str)
-        .collect();
+    // A ticket declaring an undefined scope (a typo) would otherwise only surface as a
+    // baffling later guard CONFLICT, so flag it like a dangling dep. `create`/`set`
+    // reuse the same vocabulary to reject a bad scope at write time.
+    let defined_scopes = store.config.defined_scopes();
     for path in store.ticket_files()? {
         let file = rel(&store.repo_root, &path);
         let stem = path

@@ -22,9 +22,9 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 ## init
 
 ```
-ticketsplease init [--dir tickets] [--force]
+ticketsplease init [--dir tickets] [--force] [--no-skill] [--harness claude|codex|opencode|pi-agent]
 ```
-Scaffolds `<dir>/` and `ticketsplease.toml`, links the bundled skill into `.claude/skills/ticketsplease` (a gitignored symlink to the canonical copy — see `skill`), and seeds example body templates into `.ticketsplease/templates/` (for `create --template`). Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
+Scaffolds `<dir>/` and `ticketsplease.toml`, links the bundled skill into the chosen harness's skills directory (default `--harness claude` → `.claude/skills/ticketsplease`; a gitignored symlink to the canonical copy — see `skill`), and seeds example body templates into `.ticketsplease/templates/` (for `create --template`). `--no-skill` skips the skill link. Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
 
 JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "templates_installed", "git": bool }`.
 
@@ -33,14 +33,16 @@ JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "te
 ```
 ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3]
                       [--depends-on a,b] [--related c,d] [--scope x,y] [--shared-scope z]
-                      [--path 'glob'] [--tag t] [--body <s>] [--template <name>] [--dry-run]
-ticketsplease create --from <file|-> [--dry-run]
+                      [--path 'glob'] [--tag t] [--body <s>] [--template <name>] [--dry-run] [--no-validate]
+ticketsplease create --from <file|-> [--dry-run] [--no-validate]
 ```
 Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
 `--template <name>` scaffolds the body from `.ticketsplease/templates/<name>.md` (seeded by `init`; add your own), substituting `{{title}}` and `{{id}}`. An explicit `--body` wins over `--template`; an unknown template is exit 4.
 
 `--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+
+**Write-time validation (default on).** `create` rejects (exit 3) a declared **scope not defined** in `ticketsplease.toml` (`[scopes]`/`[scope_crates]`/`[external_scopes]`) and a **dangling `related`/`depends_on`** id, so a bad batch fails at filing rather than surfacing later at `lint`/`guard`. A `--from` batch resolves cross-references among its own members, so a self-consistent batch passes. Pass **`--no-validate`** for a forward reference to a ticket or scope you will add next. (Same checks apply to `set`/`link` — see below.)
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
@@ -54,9 +56,9 @@ ticketsplease set (<id> | --where <expr> | --view <name>)
                        [--add-path 'glob'] [--remove-path 'glob']
                        [--add-dependency d] [--remove-dependency e]
                        [--add-related r] [--remove-related s]
-                       [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run]
+                       [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run] [--no-validate]
 ```
-Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. Setting a terminal status (`done` or `closed`) clears the claim (assignee + lease). `--reason <duplicate|wontdo|obsolete|superseded|cancelled>` and `--note <text>` are valid only alongside `--status closed` (they record the resolution, and are cleared automatically when the ticket later leaves `closed`); prefer the `close`/`reopen` verbs below. When `[workflow] enforce_transitions` is on, a status change that is not a permitted transition is rejected (exit 6) unless `--force` is passed (bulk `--where` skips illegal ones instead). `--dry-run` previews without writing.
+Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. An **added** scope that is undefined, or an added `related`/`depends_on` id that does not resolve, is rejected (exit 3) — only the additions are checked, so an unrelated edit never trips on a pre-existing dangling link; `--no-validate` skips it. Setting a terminal status (`done` or `closed`) clears the claim (assignee + lease). `--reason <duplicate|wontdo|obsolete|superseded|cancelled>` and `--note <text>` are valid only alongside `--status closed` (they record the resolution, and are cleared automatically when the ticket later leaves `closed`); prefer the `close`/`reopen` verbs below. When `[workflow] enforce_transitions` is on, a status change that is not a permitted transition is rejected (exit 6) unless `--force` is passed (bulk `--where` skips illegal ones instead). `--dry-run` previews without writing.
 
 **Single vs bulk:** pass an `id` to edit one ticket, or `--where`/`--view` to edit **every matching ticket** in one operation (exactly one of the two; passing both, or neither, is exit 3). Bulk applies field edits only — `--title` and the body edits are single-target and rejected with `--where`/`--view`. A single cycle check runs over the whole edited set after all dependency edits.
 
@@ -78,9 +80,9 @@ JSON (both): `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 ## link
 
 ```
-ticketsplease link <id> (--depends-on <other> | --related <other>) [--remove]
+ticketsplease link <id> (--depends-on <other> | --related <other>) [--remove] [--no-validate]
 ```
-Adds (or with `--remove`, removes) a link. `--depends-on` is a hard, cycle-checked **dependency** edge; `--related` is a soft, non-blocking cross-reference that scheduling ignores (and so is never cycle-checked). Exactly one of the two is required. A dangling target is **permitted** (lint reports it as `missing-dep`/`missing-related`) — consistent with `create`; only a dependency edge that closes a **cycle** is rejected at write time (exit 5). `--remove` never validates the target, so a link to a deleted ticket can be cleaned. A self-link is rejected (exit 3).
+Adds (or with `--remove`, removes) a link. `--depends-on` is a hard, cycle-checked **dependency** edge; `--related` is a soft, non-blocking cross-reference that scheduling ignores (and so is never cycle-checked). Exactly one of the two is required. A dangling target is **rejected** at write time (exit 3) unless `--no-validate` — consistent with `create`/`set` (`--no-validate` allows a forward reference, which `lint` then reports as `missing-dep`/`missing-related`). A dependency edge that closes a **cycle** is rejected regardless (exit 5). `--remove` never validates the target, so a link to a deleted ticket can be cleaned. A self-link is rejected (exit 3).
 
 JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`.
 
@@ -143,7 +145,7 @@ Without flags, the working-tree status of every ticket. `--all-branches` scans `
 ticketsplease reconcile [--prefix tkt/]
 ```
 Cross-checks each ticket's status against git reality — the `<prefix>*` work branches and `git worktree list` — and reports where the board has drifted (ticket status lives in markdown with no link to whether a branch/worktree actually exists). Findings:
-- `in-progress-no-branch` — a ticket marked in-progress with no work branch (abandoned or never-started dispatch; **stale-busy**).
+- `in-progress-no-branch` — a ticket in an open state with no work branch **and no live claim lease** (abandoned dispatch, or a manual `set --status`; **stale-busy**). A ticket freshly claimed but not yet branched holds a live lease, so it is treated as legitimately mid-dispatch and **suppressed** — until the lease expires (default 1h), when a genuinely abandoned dispatch resurfaces. This keeps `reconcile` clean during normal claim-then-branch orchestration.
 - `branch-without-active-ticket` — a `<prefix><id>` branch exists but the ticket is still todo/ready (untracked in-flight work; **stale-idle**).
 - `orphan-branch` — a `<prefix>*` branch with no matching ticket.
 
@@ -241,19 +243,23 @@ release JSON: `{ "schema_version", "id", "released": bool }`.
 ## guard
 
 ```
-ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--direct-only] [--ignore-transitive] [--config-ref <ref>] [--prefix tkt/]
+ticketsplease guard <branch> [--base <ref>] [--ticket <id>] [--strict | --warn-collisions] [--explain] [--direct-only] [--ignore-transitive] [--config-ref <ref>] [--prefix tkt/]
 ```
-Diffs the branch vs `--base` and makes two decoupled judgements. **Exit 6** when the branch under-declares a scope or collides with another open ticket. Requires a git repo (clean error otherwise).
+Diffs the branch vs `--base` and makes two decoupled judgements, at **different severities**. An **under-declaration** (the branch touched a scope its ticket did not declare) is a **CONFLICT** — the file-authoritative, actionable signal — and fails with **exit 6**. A **declared-area overlap with an open sibling** is a **WARN** by default (reported, but **exit 0**): under parallel dispatch an overlap is the expected state, not a proven merge conflict, so it must not train agents to skim past the real signal. The verdict line is `CONFLICT | WARN | ok`. Requires a git repo (clean error otherwise).
 
-It reads the `[scopes]` contract from `--config-ref` (default: the base), **not** the possibly stale/empty config on the checked-out branch — so an emptied branch config can't give a false all-clear. Sibling tickets' in-flight status is read from `<prefix>*` branch tips, so a collision fires in the branch-per-ticket flow even when the current checkout shows the sibling as `todo`.
+It reads the `[scopes]` contract (and the `[guard]` section) from `--config-ref` (default: the base), **not** the possibly stale/empty config on the checked-out branch — so an emptied branch config can't give a false all-clear or silently downgrade the guard. Sibling tickets' in-flight status is read from `<prefix>*` branch tips, so a collision fires in the branch-per-ticket flow even when the current checkout shows the sibling as `todo`.
 
 **Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it; a `shared_scopes` claim counts as declared). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap), `transitive` (reverse-dep only — safe for additive work), or `shared` (both tickets claim the scope additively — reported but **non-gating**, like `--ignore-transitive` for transitive). `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
 
-Two ways to handle transitive noise, with different trade-offs:
-- `--ignore-transitive` — **still computes and reports** transitive collisions (keeping `cause` visible for triage), but the *exit code* ignores them: the gate fails only on a direct overlap or an under-declaration. `transitive_only` in the JSON is `true` when a conflict exists but every part of it is transitive (so a gate would otherwise have been a false 6). Use this for additive work where you want the report but not the block.
+**Make overlaps gate.** To restore hard-fail-on-overlap (the pre-`WARN`-default behaviour), pass `--strict` or set `[guard] gate_collisions = true` in `ticketsplease.toml` — the config is the default, the flags override per-invocation (`--strict` gates, `--warn-collisions` forces warn; the two are mutually exclusive). Under-declaration always gates regardless. When collisions gate, `--ignore-transitive` still waves through a transitive-only overlap.
+
+`--explain` prints, under each affected / under-declared / colliding scope, the changed files that hit it (path-glob attribution; crate-graph and external-pin scopes are labelled by cause rather than per-file, and `unattributed` lists changed files no scope covers). The under-declaration note also spells out the exact `tkt set <id> --add-scope <scopes>` that fixes it.
+
+Two ways to handle transitive noise, with different trade-offs (they matter when collisions gate — i.e. under `--strict` / `gate_collisions`):
+- `--ignore-transitive` — **still computes and reports** transitive collisions (keeping `cause` visible for triage), but the gate ignores them: it fails only on a direct overlap or an under-declaration. `transitive_only` in the JSON is `true` when every gating collision is transitive. Use this for additive work where you want the report but not the block.
 - `--direct-only` (alias `--no-reverse-deps`) — **skips the reverse-dep walk entirely**, so transitive collisions never appear in the report at all (faster, but no visibility). `[language] reverse_dep_expansion = false` makes that the repo default.
 
-JSON: `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "conflict": bool, "transitive_only": bool, "warnings": [...] }`. (`conflict` stays strict — any conflict; gate on the exit code, or on `transitive_only` to auto-allow transitive-only.)
+JSON (**schema_version 2**): `{ "schema_version", "ticket", "base", "branch", "changed_files", "affected_scopes", "affected_causes": { "<scope>": "direct"|"transitive" }, "declared_scopes", "under_declared", "collisions": [ {ticket, scopes, cause} ], "severity": "ok"|"warn"|"conflict", "conflict": bool, "transitive_only": bool, "warnings": [...], "explanation"?: { "scopes": { "<scope>": [files] }, "unattributed": [files] } }`. Read **`severity`** for the tier; `conflict` now means a *gating* conflict (`severity == "conflict"`) and excludes a warn-only overlap. `explanation` is present only with `--explain`.
 
 ## delete / rename
 
@@ -295,11 +301,11 @@ JSON: `{ "schema_version", "ok": bool, "diagnostics": [ {file, id, code, message
 ## skill install / sync / self-update
 
 ```
-ticketsplease skill install [--dir .claude/skills] [--copy]
+ticketsplease skill install [--harness claude|codex|opencode|pi-agent] [--global] [--dir <path>] [--copy]
 ticketsplease skill sync
 ticketsplease self-update [--version vX.Y.Z]
 ```
-The skill content lives once at a canonical per-user path (`$XDG_DATA_HOME/ticketsplease/skill`, version-stamped); each project's `.claude/skills/ticketsplease` is a **symlink** to it, so refreshing the canonical copy updates every linked project. `skill install` creates that symlink (and gitignores it, since it points at an absolute path); `--copy` writes a committable real copy instead. `skill sync` re-extracts the canonical copy from the running binary — the installer runs it after install/`self-update`, so upgraders get the new skill automatically; `doctor` warns (non-gating) if the canonical copy or a project link has drifted, and `migrate` repairs a stale project link. `self-update` replaces the binary in place from GitHub Releases.
+The skill content lives once at a canonical per-user path (`$XDG_DATA_HOME/ticketsplease/skill`, version-stamped); each install is a **symlink** to it, so refreshing the canonical copy updates every linked project at once. `skill install` creates that symlink for the chosen **`--harness`** — every harness reads the identical `SKILL.md` + `references/` layout, only the directory differs: `claude` → `.claude/skills`, `codex` → `.agents/skills` (the cross-tool Agent Skills standard dir, also read by opencode and Pi), `opencode` → `.opencode/skills`, `pi-agent` → `.pi/skills`. Project installs are gitignored (they point at an absolute path); `--global` installs into the harness's user-global dir instead (`~/.claude/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, `~/.pi/agent/skills`), available in every project. `--dir <path>` overrides the project directory (not valid with `--global`); `--copy` writes a committable real copy instead of a symlink. `skill sync` re-extracts the canonical copy from the running binary — the installer runs it after install/`self-update`, so upgraders get the new skill automatically; `doctor` warns (non-gating) if the canonical copy or a project link has drifted, and `migrate` repairs a stale project link. `self-update` replaces the binary in place from GitHub Releases.
 
 ---
 

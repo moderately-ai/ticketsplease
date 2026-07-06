@@ -87,12 +87,11 @@ pub fn project_path(repo: &Path, base_dir: &str) -> PathBuf {
     repo.join(base_dir).join("ticketsplease")
 }
 
-/// Link a project to the canonical skill: `<repo>/<base_dir>/ticketsplease` becomes a
-/// symlink to the canonical dir (replacing any stale real dir or wrong link). Ensures
-/// the canonical copy exists first. Returns the link path.
-pub fn link_into(repo: &Path, base_dir: &str) -> Result<PathBuf> {
+/// Symlink `link` -> the canonical skill: ensures the canonical copy exists first,
+/// creates the parent, and replaces any stale real dir or wrong link at `link`. Shared
+/// by the project and user-global installs.
+fn link_to_canonical(link: PathBuf) -> Result<PathBuf> {
     let canonical = ensure_canonical()?;
-    let link = project_path(repo, base_dir);
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent).map_err(Error::Io)?;
     }
@@ -101,13 +100,39 @@ pub fn link_into(repo: &Path, base_dir: &str) -> Result<PathBuf> {
     Ok(link)
 }
 
-/// Write a committable real copy of the skill into the project (the `--copy` path).
-pub fn copy_into(repo: &Path, base_dir: &str) -> Result<PathBuf> {
-    let target = project_path(repo, base_dir);
+/// Extract a committable real copy of the skill to `target` (replacing anything there).
+fn copy_to(target: PathBuf) -> Result<PathBuf> {
     remove_path(&target)?;
     fs::create_dir_all(&target).map_err(Error::Io)?;
     SKILL_DIR.extract(&target).map_err(Error::Io)?;
     Ok(target)
+}
+
+/// Link a project to the canonical skill: `<repo>/<base_dir>/ticketsplease` becomes a
+/// symlink to the canonical dir. Returns the link path.
+pub fn link_into(repo: &Path, base_dir: &str) -> Result<PathBuf> {
+    link_to_canonical(project_path(repo, base_dir))
+}
+
+/// Write a committable real copy of the skill into the project (the `--copy` path).
+pub fn copy_into(repo: &Path, base_dir: &str) -> Result<PathBuf> {
+    copy_to(project_path(repo, base_dir))
+}
+
+/// The user-global skill path: `$HOME/<global_base_dir>/ticketsplease`
+/// (e.g. `~/.agents/skills/ticketsplease`).
+pub fn global_path(global_base_dir: &str) -> Result<PathBuf> {
+    Ok(home()?.join(global_base_dir).join("ticketsplease"))
+}
+
+/// Link the harness's user-global skills directory to the canonical skill.
+pub fn link_global(global_base_dir: &str) -> Result<PathBuf> {
+    link_to_canonical(global_path(global_base_dir)?)
+}
+
+/// Write a committable real copy into the harness's user-global skills directory.
+pub fn copy_global(global_base_dir: &str) -> Result<PathBuf> {
+    copy_to(global_path(global_base_dir)?)
 }
 
 /// Whether a project path is a symlink that resolves to the canonical skill dir.

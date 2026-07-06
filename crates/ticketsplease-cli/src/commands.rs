@@ -41,11 +41,13 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
     let dir = outcome.tickets_dir.display().to_string();
     // Link the project to the canonical skill copy (a self-update refreshes it for
     // every linked project). The symlink is local, so gitignore it rather than commit.
+    // `--harness` selects the directory convention (Claude Code by default).
     let skill_path = if args.no_skill {
         None
     } else {
-        let link = skill::link_into(repo, ".claude/skills")?;
-        ensure_gitignored(repo, ".claude/skills/ticketsplease")?;
+        let base = args.harness.project_base_dir();
+        let link = skill::link_into(repo, base)?;
+        ensure_gitignored(repo, &format!("{base}/ticketsplease"))?;
         Some(link.display().to_string())
     };
     // Seed the example body templates so `create --template` has something to use and
@@ -67,7 +69,10 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
                 println!("(config already present; left unchanged)");
             }
             if let Some(path) = &skill_path {
-                println!("Linked Claude skill at {path} (-> canonical copy)");
+                println!(
+                    "Linked {} skill at {path} (-> canonical copy)",
+                    args.harness.label()
+                );
             }
             println!("Seeded body templates to {templates_path}");
             println!("\nNext steps:");
@@ -85,27 +90,57 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
     }
 }
 
-/// `skill install` — link this project to the canonical skill (default) or, with
-/// `--copy`, write a committable real copy.
+/// `skill install` — install the skill for a chosen harness (`--harness`), into this
+/// project (default) or the harness's user-global dir (`--global`), as a symlink to the
+/// canonical copy or, with `--copy`, a committable real copy.
 pub fn skill_install(repo: &Path, fmt: Format, args: &SkillInstallArgs) -> Result<()> {
-    let (target, linked) = if args.copy {
-        (skill::copy_into(repo, &args.dir)?, false)
+    if args.global && args.dir.is_some() {
+        return Err(Error::Invalid(
+            "--dir is project-scoped and cannot be combined with --global".into(),
+        ));
+    }
+    let (target, linked) = if args.global {
+        let gdir = args.harness.global_base_dir();
+        if args.copy {
+            (skill::copy_global(gdir)?, false)
+        } else {
+            (skill::link_global(gdir)?, true)
+        }
     } else {
-        let link = skill::link_into(repo, &args.dir)?;
-        ensure_gitignored(repo, &format!("{}/ticketsplease", args.dir))?;
-        (link, true)
+        let base = args
+            .dir
+            .clone()
+            .unwrap_or_else(|| args.harness.project_base_dir().to_string());
+        if args.copy {
+            (skill::copy_into(repo, &base)?, false)
+        } else {
+            let link = skill::link_into(repo, &base)?;
+            // The project symlink points at an absolute path, so gitignore it.
+            ensure_gitignored(repo, &format!("{base}/ticketsplease"))?;
+            (link, true)
+        }
     };
     let path = target.display().to_string();
+    let scope = if args.global {
+        "user-global"
+    } else {
+        "project"
+    };
     match fmt {
-        Format::Json => {
-            print_json(&json!({ "schema_version": 1, "installed": path, "linked": linked }))
-        }
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "installed": path,
+            "linked": linked,
+            "harness": args.harness.as_str(),
+            "global": args.global,
+        })),
         Format::Human => {
-            if linked {
-                println!("Linked skill at {path} (-> canonical copy)");
-            } else {
-                println!("Copied skill to {path}");
-            }
+            let verb = if linked { "Linked" } else { "Copied" };
+            let arrow = if linked { " (-> canonical copy)" } else { "" };
+            println!(
+                "{verb} {} skill ({scope}) at {path}{arrow}",
+                args.harness.label()
+            );
             Ok(())
         }
     }
@@ -162,11 +197,80 @@ pub fn self_update(fmt: Format, args: &SelfUpdateArgs) -> Result<()> {
     }
 }
 
+/// The scope and link fields to validate for a create/set/link write.
+struct WriteFields<'a> {
+    scopes: &'a [String],
+    shared_scopes: &'a [String],
+    related: &'a [String],
+    dependencies: &'a [String],
+}
+
+/// Validate a new or edited ticket's scopes and links at write time — the same
+/// vocabulary `lint` enforces, so a bad batch fails at filing instead of surfacing
+/// later at the next gate. `known` maps every id considered to exist (on-disk plus any
+/// same-batch peers) to its ticket. Every problem is aggregated into one error. The
+/// scope check is a no-op when the repo defines no scopes (not using the system).
+fn validate_write(
+    config: &Config,
+    id: &str,
+    fields: &WriteFields,
+    known: &BTreeMap<&str, &Ticket>,
+) -> Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+    let defined = config.defined_scopes();
+    if !defined.is_empty() {
+        for scope in fields.scopes.iter().chain(fields.shared_scopes) {
+            if !defined.contains(scope.as_str()) {
+                problems.push(format!(
+                    "declares scope `{scope}` not defined in {CONFIG_FILE} \
+                     ([scopes], [scope_crates], or [external_scopes])"
+                ));
+            }
+        }
+    }
+    for r in fields.related {
+        if r == id {
+            problems.push(format!("related link `{r}` points at itself"));
+        } else if !known.contains_key(r.as_str()) {
+            problems.push(format!("related link points at missing ticket `{r}`"));
+        }
+    }
+    for d in fields.dependencies {
+        if d == id {
+            problems.push(format!("dependency `{d}` points at itself"));
+        } else if let Some(dep) = known.get(d.as_str()) {
+            // A live dependency on a ticket closed without completing is a dead end
+            // (mirrors lint's `orphaned-by-closed-dep`).
+            if dep.is_terminal() && !dep.completes_dependencies() {
+                problems.push(format!(
+                    "depends on `{d}` which was closed without completing \
+                     (re-point, waive, or drop it)"
+                ));
+            }
+        } else {
+            problems.push(format!("depends on missing ticket `{d}`"));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        let subject = if id.is_empty() {
+            "edit".to_string()
+        } else {
+            format!("ticket `{id}`")
+        };
+        Err(Error::Invalid(format!(
+            "{subject}: {} (pass --no-validate to skip)",
+            problems.join("; ")
+        )))
+    }
+}
+
 /// `create` — write a new ticket (idempotent with an explicit `--id`).
 pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let store = Store::open(repo)?;
     if let Some(from) = &args.from {
-        return create_batch(&store, fmt, from, args.dry_run);
+        return create_batch(&store, fmt, from, args.dry_run, args.no_validate);
     }
     let title = args
         .title
@@ -186,6 +290,26 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let shared_scopes = norm_list(&args.shared_scopes);
     let paths = norm_list(&args.paths);
     let tags = norm_list(&args.tags);
+
+    // Reject undefined scopes and dangling related/dependency ids at filing time. A
+    // single new ticket cannot close a dependency cycle (nothing references its id yet),
+    // so no cycle check is needed here — only the batch path checks that.
+    if !args.no_validate {
+        let validate_id = args.id.clone().unwrap_or_else(|| store::slugify(title));
+        let all = store.load_all_lenient()?.0;
+        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+        validate_write(
+            &store.config,
+            &validate_id,
+            &WriteFields {
+                scopes: &scopes,
+                shared_scopes: &shared_scopes,
+                related: &related,
+                dependencies: &depends_on,
+            },
+            &known,
+        )?;
+    }
 
     let build = |id: &str| -> Result<String> {
         let body = resolve_create_body(repo, &args.body, args.template.as_deref(), id, title)?;
@@ -410,7 +534,13 @@ impl ParsedSpec {
 /// is validated in full before any write (a bad element aborts before partial state),
 /// auto-ids are content-addressed-idempotent (re-running is a no-op, not a clone),
 /// and the result reports created vs unchanged per element.
-fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result<()> {
+fn create_batch(
+    store: &Store,
+    fmt: Format,
+    from: &str,
+    dry_run: bool,
+    no_validate: bool,
+) -> Result<()> {
     let raw = read_text(from)?;
     let raw_specs = parse_manifest(from, &raw)?;
 
@@ -460,6 +590,49 @@ fn create_batch(store: &Store, fmt: Format, from: &str, dry_run: bool) -> Result
             // Render at the base id just to surface any render error before writing.
             spec.render(&store.repo_root, &store::slugify(&spec.title))?;
         }
+    }
+
+    // Scope + link validation (unless bypassed): undefined scopes and dangling
+    // related/dependency ids fail the whole batch here, before any write. Intra-batch
+    // cross-references resolve (the batch's own ids count as existing) and the combined
+    // graph is cycle-checked. Runs before the dry-run preview so it is caught either way.
+    if !no_validate {
+        let mut graph = store.load_all_lenient()?.0;
+        let base = graph.len();
+        for spec in &specs {
+            let id = spec
+                .id
+                .clone()
+                .unwrap_or_else(|| store::slugify(&spec.title));
+            graph.push(Ticket::new(
+                &id,
+                &spec.title,
+                &spec.status,
+                spec.priority,
+                &spec.depends_on,
+                &spec.related,
+                &spec.scopes,
+                &spec.shared_scopes,
+                &spec.paths,
+                &spec.tags,
+                "",
+            )?);
+        }
+        let known: BTreeMap<&str, &Ticket> = graph.iter().map(|t| (t.id.as_str(), t)).collect();
+        for (spec, t) in specs.iter().zip(&graph[base..]) {
+            validate_write(
+                &store.config,
+                &t.id,
+                &WriteFields {
+                    scopes: &spec.scopes,
+                    shared_scopes: &spec.shared_scopes,
+                    related: &spec.related,
+                    dependencies: &spec.depends_on,
+                },
+                &known,
+            )?;
+        }
+        schedule::ensure_acyclic(&graph)?;
     }
 
     // Preview without writing: report the would-be outcome per element.
@@ -657,6 +830,28 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
         None => false,
     };
     let deps_added = apply_set_field_mutations(&mut ticket, args, &registry)?;
+    // Validate what this edit *adds* (undefined scopes, dangling related/dependency ids).
+    // Only additions are checked — an unrelated edit must not fail on a ticket's
+    // pre-existing dangling link; removals need no check.
+    let added_anything = !args.add_scope.is_empty()
+        || !args.add_shared_scope.is_empty()
+        || !args.add_related.is_empty()
+        || !args.add_dependency.is_empty();
+    if !args.no_validate && added_anything {
+        let all = store.load_all_lenient()?.0;
+        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+        validate_write(
+            &store.config,
+            &ticket.id,
+            &WriteFields {
+                scopes: &args.add_scope,
+                shared_scopes: &args.add_shared_scope,
+                related: &args.add_related,
+                dependencies: &args.add_dependency,
+            },
+            &known,
+        )?;
+    }
     // Reject a dependency edit that would close a cycle, exactly like `link`. Related
     // links carry no ordering, so they need no cycle check.
     if deps_added {
@@ -738,6 +933,23 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
 
     let registry = store.config.state_registry();
     let mut all = store.load_all()?;
+    // Validate the added scopes/links once (identical across every match) before any
+    // mutation, so a bad scope or dangling id aborts the whole bulk up front rather than
+    // partway through. Self-references stay a per-ticket concern of the mutation step.
+    if !args.no_validate {
+        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+        validate_write(
+            &store.config,
+            "",
+            &WriteFields {
+                scopes: &args.add_scope,
+                shared_scopes: &args.add_shared_scope,
+                related: &args.add_related,
+                dependencies: &args.add_dependency,
+            },
+            &known,
+        )?;
+    }
     let mut any_deps_added = false;
     let mut to_save: Vec<usize> = Vec::new();
     let mut events: Vec<(String, Value)> = Vec::new();
@@ -972,11 +1184,29 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
         (true, true) => ticket.remove_related(target)?,
     };
 
+    // Reject a dangling target at write time (unless bypassed), mirroring `create` and
+    // `set --add-dependency`/`--add-related`. `--no-validate` allows a forward reference.
+    if changed && !args.remove && !args.no_validate {
+        let all = store.load_all_lenient()?.0;
+        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+        let one = [target.to_string()];
+        let (rel, dep): (&[String], &[String]) = if related { (&one, &[]) } else { (&[], &one) };
+        validate_write(
+            &store.config,
+            &ticket.id,
+            &WriteFields {
+                scopes: &[],
+                shared_scopes: &[],
+                related: rel,
+                dependencies: dep,
+            },
+            &known,
+        )?;
+    }
+
     // Adding a dependency edge that closes a cycle is rejected here (exit 5) rather
-    // than left to corrupt the graph until `ready`/`tracks`/`next` trips over it. A
-    // dangling target is permitted, mirroring `create --depends-on` — `lint` reports
-    // both dangling deps and cycles on the parseable set. Related links carry no
-    // ordering, so they are never cycle-checked.
+    // than left to corrupt the graph until `ready`/`tracks`/`next` trips over it.
+    // Related links carry no ordering, so they are never cycle-checked.
     if changed && !related && !args.remove {
         let mut all = store.load_all()?;
         if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
@@ -2450,24 +2680,68 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
         ));
     }
 
+    // Collision-gating policy: --strict / --warn-collisions override the config default
+    // (`[guard] gate_collisions`, read from the base like [scopes] so a branch can't
+    // silently downgrade its own guard). Under-declaration gates regardless.
+    let gate_collisions = if args.strict {
+        true
+    } else if args.warn_collisions {
+        false
+    } else {
+        config.guard.gate_collisions
+    };
+    let severity = report.severity(gate_collisions, args.ignore_transitive);
+
+    // --explain: attribute each affected scope to the changed files that hit its path
+    // globs; `unattributed` are changed files no scope glob covers. Crate-graph and
+    // external-pin scopes have no per-file attribution (labelled by cause in the output).
+    let explanation = args.explain.then(|| {
+        let scopes = path_mapper.attribute(&report.changed_files);
+        let unattributed: Vec<&str> = report
+            .changed_files
+            .iter()
+            .filter(|f| !covered.is_match(f.as_str()))
+            .map(String::as_str)
+            .collect();
+        (scopes, unattributed)
+    });
+
     match fmt {
         Format::Json => {
             let mut value = serde_json::to_value(&report)
                 .map_err(|e| Error::Internal(format!("serializing guard report: {e}")))?;
             if let Value::Object(ref mut map) = value {
-                map.insert("schema_version".to_string(), json!(1));
+                // schema_version 2: `conflict` now means a *gating* conflict (severity ==
+                // conflict) and excludes a warn-only collision — read `severity` for the tier.
+                map.insert("schema_version".to_string(), json!(2));
+                map.insert("severity".to_string(), json!(severity));
+                map.insert(
+                    "conflict".to_string(),
+                    json!(severity == guard::Severity::Conflict),
+                );
                 map.insert("warnings".to_string(), json!(warnings));
                 map.insert(
                     "transitive_only".to_string(),
                     json!(report.transitive_only()),
                 );
+                if let Some((scopes, unattributed)) = &explanation {
+                    map.insert(
+                        "explanation".to_string(),
+                        json!({ "scopes": scopes, "unattributed": unattributed }),
+                    );
+                }
             }
             print_json(&value)?;
         }
         Format::Human => {
-            print_guard_human(&report);
-            if report.transitive_only() && !args.ignore_transitive {
+            print_guard_human(&report, severity);
+            // The hint only helps when collisions actually gate — under the warn default
+            // a transitive collision already passes.
+            if gate_collisions && report.transitive_only() && !args.ignore_transitive {
                 println!("  (every collision is transitive — `--ignore-transitive` would pass)");
+            }
+            if let Some((scopes, unattributed)) = &explanation {
+                print_guard_explain(&report, scopes, unattributed);
             }
             for w in &warnings {
                 eprintln!("warning: {w}");
@@ -2475,17 +2749,17 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
         }
     }
 
-    // `--ignore-transitive` gates on a real conflict only (a direct overlap or an
-    // under-declaration); transitive-only collisions stay in the report but pass.
-    let gated = if args.ignore_transitive {
-        report.has_direct_conflict()
-    } else {
-        report.conflict
-    };
-    if gated {
+    if severity == guard::Severity::Conflict {
+        // Name the actionable signal: a scope escape (the common Conflict) vs a gated
+        // overlap (only under --strict / gate_collisions).
+        let reason = if report.under_declared.is_empty() {
+            "collides with an open ticket".to_string()
+        } else {
+            format!("escapes ticket `{}`'s declared scopes", report.ticket)
+        };
         Err(Error::Conflict(format!(
-            "branch `{}` escapes ticket `{}`'s declared scopes or collides with an open ticket",
-            report.branch, report.ticket
+            "branch `{}` {reason}",
+            report.branch
         )))
     } else {
         Ok(())
@@ -2516,7 +2790,7 @@ fn resolve_ticket(args: &GuardArgs, all: &[Ticket]) -> Result<String> {
     })
 }
 
-fn print_guard_human(report: &guard::GuardReport) {
+fn print_guard_human(report: &guard::GuardReport, severity: guard::Severity) {
     println!(
         "ticket {}  ({}...{})",
         report.ticket, report.base, report.branch
@@ -2554,14 +2828,56 @@ fn print_guard_human(report: &guard::GuardReport) {
             c.scopes.join(", ")
         );
     }
-    println!(
-        "  verdict: {}",
-        if report.conflict { "CONFLICT" } else { "ok" }
-    );
-    if report.conflict {
+    let verdict = match severity {
+        guard::Severity::Conflict => "CONFLICT",
+        guard::Severity::Warn => "WARN",
+        guard::Severity::Ok => "ok",
+    };
+    println!("  verdict: {verdict}");
+    if severity != guard::Severity::Ok {
+        if report.under_declared.is_empty() {
+            // A gated overlap (only reachable under --strict / gate_collisions), or a
+            // warn-level overlap under the default.
+            println!(
+                "  note: a declared-area overlap, not a proven merge conflict — coordinate \
+                 with the listed ticket(s) or build+test the merged result before merging."
+            );
+        } else {
+            // The actionable signal: tell the agent exactly how to fix it.
+            println!(
+                "  note: branch touched scope(s) it did not declare — add them with \
+                 `tkt set {} --add-scope {}` (or narrow the change).",
+                report.ticket,
+                report.under_declared.join(",")
+            );
+        }
+    }
+}
+
+/// `--explain`: show which changed files hit each affected scope (path-glob attribution),
+/// so a reader can trace any under-declaration or collision back to its files. Crate-graph
+/// / external-pin scopes carry no per-file attribution and are labelled by cause instead.
+fn print_guard_explain(
+    report: &guard::GuardReport,
+    scopes: &BTreeMap<String, Vec<String>>,
+    unattributed: &[&str],
+) {
+    println!("  explain:");
+    for scope in &report.affected_scopes {
+        if let Some(files) = scopes.get(scope) {
+            println!("    {scope} <- {}", files.join(", "));
+        } else {
+            let label = match report.affected_causes.get(scope).map(|c| c.as_str()) {
+                Some("transitive") => "transitive via reverse-deps",
+                _ => "external pin or crate graph — no direct file",
+            };
+            println!("    {scope} ({label})");
+        }
+    }
+    if !unattributed.is_empty() {
         println!(
-            "  note: a declared-area overlap, not a proven merge conflict — declare/narrow scope, \
-             coordinate with the listed ticket(s), or build+test the merged result before merging."
+            "    unattributed (covered by no scope): {}",
+            unattributed.join(", ")
         );
     }
 }
@@ -2855,18 +3171,26 @@ pub fn reconcile(repo: &Path, fmt: Format, args: &ReconcileArgs) -> Result<()> {
     let worktrees = worktree_branches(repo)?;
     let has_worktree = |id: &str| worktrees.contains(&format!("{}{id}", args.prefix));
 
+    // A ticket is flipped to an open state (in-progress) at claim time, *before* its
+    // agent creates the work branch — so an open-but-branchless ticket holding a live
+    // claim lease is legitimately mid-dispatch, not drift. Suppress it while the lease
+    // is live; once the lease expires (default 1h TTL) a genuinely abandoned dispatch
+    // surfaces on the next reconcile. A manual `set --status in-progress` writes no
+    // lease, so that (non-race-safe) path is still flagged.
+    let now = now_epoch();
     let mut findings: Vec<Value> = Vec::new();
     for t in &tickets {
         let has_branch = branch_ids.contains(&t.id);
-        if t.is_open() && !has_branch {
-            // Marked busy (an open state), but nothing is actually running.
+        if t.is_open() && !has_branch && !t.lease_live(now) {
+            // Marked busy (an open state), but nothing is running and no live claim
+            // explains it.
             findings.push(json!({
                 "id": t.id,
                 "issue": "in-progress-no-branch",
                 "status": t.status,
                 "branch": false,
                 "worktree": false,
-                "detail": "in an open state but no work branch exists (abandoned or never-started dispatch)",
+                "detail": "in an open state but no work branch and no live claim lease (abandoned dispatch, or a manual status set)",
             }));
         } else if t.is_dispatchable() && has_branch {
             // Live branch, but the board says the work hasn't started.

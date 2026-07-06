@@ -59,21 +59,23 @@ A worker must pass the guard before its branch merges:
 ```
 ticketsplease guard tkt/<id> --base main --format json
 case exit:
-  0 -> merge
-  6 -> read the JSON (commands.md has the full guard schema and the --ignore-transitive/--direct-only flags):
+  0 -> pass — but read `severity`. "ok" is clean; "warn" means a declared-area overlap with an
+       open sibling was reported but does NOT gate. An overlap is the expected state under parallel
+       dispatch, not a proven merge conflict — glance at `collisions` and coordinate if a sibling
+       truly rewrites the same area, but it does not block this merge.
+  6 -> CONFLICT — read the JSON (commands.md has the full guard schema):
          under_declared -> a genuine scope escape. Narrow the diff back, or if the area truly
              belongs to this ticket `ticketsplease set <id> --add-scope <scope>` (or add the file
              to `paths`) and re-guard. The cargo reverse-dep expansion never lands here, so editing
              a foundational crate within your declared globs will not trip it.
-         collisions -> another open ticket's declared area overlaps yours. `cause: direct` = a real
-             overlap, coordinate (merge the other first, or split the work); `cause: transitive` =
-             reverse-dep-only, usually a false alarm for additive work — `guard --ignore-transitive`
-             auto-allows transitive-only while still reporting it. Don't let transitive noise train
-             you to ignore a genuine exit 6.
+         collisions (only when you opted in with `--strict` or `[guard] gate_collisions`) -> a
+             declared-area overlap you chose to gate. `cause: direct` = a real overlap, coordinate
+             (merge the other first, or split the work); `cause: transitive` = reverse-dep-only —
+             `guard --ignore-transitive` waves it through while still reporting it.
   other -> a setup problem (4 = no ticket resolved, 3 = bad input); fix and retry.
 ```
 
-The guard is the safety net that lets you dispatch aggressively: if two branches would collide, at least one fails the gate instead of producing a silent merge conflict. It is built for this flow: it reads the `[scopes]` contract from `--base` (not the checked-out branch, which may carry a stale/empty config), and it reads sibling tickets' in-flight status from their `tkt/*` branch tips — so a collision against a worker who is `in-progress` on its own branch fires even when your checkout still shows that sibling as `todo`. Override the config source with `--config-ref` and the branch namespace with `--prefix`.
+The guard's hard gate is **under-declaration** (a scope escape) — exit 6, always. A **declared-area overlap** with an open sibling is a non-failing **WARN** by default: under parallel dispatch it is the normal state, so it is reported (glance at it, coordinate if needed) but does not block the merge — keeping the exit-6 signal meaningful for the escape it is meant to catch. Opt an overlap into gating with `--strict` or `[guard] gate_collisions = true` when you want the stricter net. The guard reads the `[scopes]`/`[guard]` config from `--base` (not the checked-out branch, which may carry a stale/empty config), and reads sibling tickets' in-flight status from their `tkt/*` branch tips — so an overlap against a worker who is `in-progress` on its own branch is reported even when your checkout still shows that sibling as `todo`. Override the config source with `--config-ref` and the branch namespace with `--prefix`.
 
 ## Observing workers mid-flight
 
@@ -82,7 +84,7 @@ Workers advance status on their own `tkt/<id>` branches, so an orchestrator on `
 - `ticketsplease events --watch --since <cursor>` — the **multiplexed** wake-on-event across *all* tickets at once: returns the moment any worker changes status, claims, releases, or comments. Events live in `.git` refs, so you see them **without waiting for a commit** (unlike `status`/`show --ref`, which read committed branch state). Loop it, advancing `--since` to the last id you saw, to consume the stream without missing a transition. Prefer this to spawning N single-ticket watchers.
 - `ticketsplease comment add <id> --as <w> --body -` / `comment list <id> --ref tkt/<id>` — leave durable notes on a ticket (blocked-reasons, decisions, questions) and read a worker's notes from `main`. Each `comment add` also rings the event doorbell above.
 - `ticketsplease status --all-branches` — every `tkt/*` branch's ticket status at its committed tip; a simple snapshot when you don't need the live stream.
-- `ticketsplease reconcile` — diff the board against git: in-progress tickets with no branch (a dispatch that never started), live `tkt/*` branches whose ticket still reads todo/ready (work the board doesn't reflect), and orphan branches. The board and git drift independently; run this before each dispatch round (exit 3 on drift) so you can trust `tracks`/`ready` before fanning out.
+- `ticketsplease reconcile` — diff the board against git: in-progress tickets with no branch **and no live claim lease** (a dispatch that never started or was abandoned — a freshly-claimed ticket still holds its lease and is *not* flagged, so this stays clean during normal claim-then-branch until a lease actually expires), live `tkt/*` branches whose ticket still reads todo/ready (work the board doesn't reflect), and orphan branches. The board and git drift independently; run this before each dispatch round (exit 3 on drift) so you can trust `tracks`/`ready` before fanning out.
 - `ticketsplease watch <id> --until review --timeout <secs>` — block until one worker reaches a status (exit 0) or give up (exit 7). It auto-resolves the `tkt/<id>` branch.
 - `ticketsplease show <id> --ref tkt/<id>` — read one ticket (and its comments) as committed on its branch.
 

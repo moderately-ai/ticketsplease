@@ -1,6 +1,6 @@
 //! Repository configuration: `ticketsplease.toml` at the repository root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,9 @@ pub struct Config {
     /// Workflow: custom lifecycle states (+ categories) and optional transition rules.
     #[serde(default)]
     pub workflow: Workflow,
+    /// Guard behaviour: whether a declared-area overlap with an open sibling gates.
+    #[serde(default)]
+    pub guard: Guard,
 }
 
 /// Per-scope scheduling policy (see [`Config::scope_policy`]).
@@ -72,6 +75,20 @@ impl Config {
         self.scope_policy
             .iter()
             .map(|(k, v)| (k.clone(), v.weight))
+            .collect()
+    }
+
+    /// Every scope name the config defines: a scope is "defined" if it has a glob
+    /// mapping, an owning crate, or an external descriptor. This is the vocabulary a
+    /// ticket's declared scopes are validated against (an undeclared scope is a typo).
+    /// Empty means the repo is not using the scope system, so callers must not enforce.
+    #[must_use]
+    pub fn defined_scopes(&self) -> BTreeSet<&str> {
+        self.scopes
+            .keys()
+            .chain(self.scope_crates.keys())
+            .chain(self.external_scopes.keys())
+            .map(String::as_str)
             .collect()
     }
 
@@ -122,6 +139,18 @@ impl Config {
         out.dedup();
         out
     }
+}
+
+/// Guard configuration (`[guard]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Guard {
+    /// Whether a declared-area overlap with an open sibling ticket gates the guard
+    /// (exit 6). Default `false`: an overlap is a non-failing `WARN`, since under a
+    /// parallel-dispatch workflow it is the expected state, not a proven merge conflict.
+    /// Under-declaration (a scope escape) always gates regardless of this. Set `true`
+    /// (or pass `--strict` per-invocation) to restore hard-fail-on-overlap.
+    #[serde(default)]
+    pub gate_collisions: bool,
 }
 
 /// Workflow configuration (`[workflow]`): custom lifecycle states and optional
@@ -200,6 +229,7 @@ impl Default for Config {
             external_scopes: BTreeMap::new(),
             scope_policy: BTreeMap::new(),
             workflow: Workflow::default(),
+            guard: Guard::default(),
         }
     }
 }

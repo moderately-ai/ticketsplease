@@ -524,22 +524,42 @@ fn guard_cargo_reverse_dep_is_tagged_transitive() {
         ],
     );
 
-    // Default: crate-b is reached only via reverse-deps -> transitive collision, exit 6.
+    // Default: crate-b is reached only via reverse-deps -> transitive collision. Under
+    // the warn-default a collision is a non-gating WARN (exit 0); the cause tag still holds.
     let out = tkt(repo)
         .args(["guard", "feat", "--ticket", "t", "--format", "json"])
         .output()
         .unwrap();
     assert_eq!(
         out.status.code(),
-        Some(6),
+        Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["severity"], "warn");
     assert_eq!(v["affected_causes"]["a"], "direct");
     assert_eq!(v["affected_causes"]["b"], "transitive");
     assert_eq!(v["collisions"][0]["ticket"], "u");
     assert_eq!(v["collisions"][0]["cause"], "transitive");
+
+    // --strict gates the transitive collision (exit 6); --strict --ignore-transitive
+    // waves exactly that class back through.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--strict"])
+        .assert()
+        .code(6);
+    tkt(repo)
+        .args([
+            "guard",
+            "feat",
+            "--ticket",
+            "t",
+            "--strict",
+            "--ignore-transitive",
+        ])
+        .assert()
+        .success();
 
     // --direct-only drops the reverse-dep expansion: no collision, clean.
     tkt(repo)
@@ -1784,7 +1804,8 @@ fn guard_collision_fires_across_branch_tips() {
         .success();
     git_commit_all(repo, "a work");
 
-    // In this checkout b reads as todo, but its tip says review -> collision must fire.
+    // In this checkout b reads as todo, but its tip says review -> the collision must be
+    // reported. Under the warn-default it is a non-gating WARN (exit 0).
     let out = tkt(repo)
         .args([
             "guard", "tkt/a", "--ticket", "a", "--base", "main", "--format", "json",
@@ -1793,10 +1814,11 @@ fn guard_collision_fires_across_branch_tips() {
         .unwrap();
     assert_eq!(
         out.status.code(),
-        Some(6),
-        "cross-branch collision must fire"
+        Some(0),
+        "cross-branch collision warns by default"
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["severity"], "warn");
     assert!(
         v["collisions"]
             .as_array()
@@ -1805,6 +1827,13 @@ fn guard_collision_fires_across_branch_tips() {
             .any(|c| c["ticket"] == "b"),
         "should collide with b on `api`: {v}"
     );
+    // The direct overlap gates under --strict.
+    tkt(repo)
+        .args([
+            "guard", "tkt/a", "--ticket", "a", "--base", "main", "--strict",
+        ])
+        .assert()
+        .code(6);
 }
 
 /// guard reads the `[scopes]` contract from the base ref, so an emptied config on
@@ -2031,14 +2060,15 @@ fn link_remove_clears_a_dangling_dependency() {
     tkt(repo).args(["lint"]).assert().success();
 }
 
-/// create and link treat a dangling dependency the same way: both permit it, and
-/// lint reports it (one consistent model).
+/// create and link treat a dangling dependency the same way: both reject it at write
+/// time by default, both permit it with --no-validate, and lint reports the ones written
+/// that way (one consistent model).
 #[test]
 fn create_and_link_treat_dangling_deps_consistently() {
     let dir = TempDir::new().unwrap();
     let repo = dir.path();
     tkt(repo).args(["init", "--no-skill"]).assert().success();
-    // create with a forward/dangling dep: permitted.
+    // create with a dangling dep: rejected by default (exit 3)...
     tkt(repo)
         .args([
             "create",
@@ -2050,14 +2080,32 @@ fn create_and_link_treat_dangling_deps_consistently() {
             "ghost",
         ])
         .assert()
+        .code(3);
+    // ...permitted with --no-validate (a forward reference).
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--depends-on",
+            "ghost",
+            "--no-validate",
+        ])
+        .assert()
         .success();
-    // link with a dangling dep: also permitted (previously rejected with exit 4).
+    // link with a dangling dep: same model — rejected by default, allowed with --no-validate.
     tkt(repo)
         .args(["create", "--id", "b", "--title", "B"])
         .assert()
         .success();
     tkt(repo)
         .args(["link", "b", "--depends-on", "ghost"])
+        .assert()
+        .code(3);
+    tkt(repo)
+        .args(["link", "b", "--depends-on", "ghost", "--no-validate"])
         .assert()
         .success();
     // lint reports both dangling references.
@@ -2087,9 +2135,19 @@ fn lint_flags_unknown_scope_reference() {
     let repo = dir.path();
     tkt(repo).args(["init", "--no-skill"]).assert().success();
     write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
-    // `cre` is a typo for `core`.
+    // `cre` is a typo for `core`. --no-validate lets it through at create time so this
+    // test exercises `lint`'s detection (create's own rejection is covered elsewhere).
     tkt(repo)
-        .args(["create", "--id", "t", "--title", "T", "--scope", "cre"])
+        .args([
+            "create",
+            "--id",
+            "t",
+            "--title",
+            "T",
+            "--scope",
+            "cre",
+            "--no-validate",
+        ])
         .assert()
         .success();
     let out = tkt(repo)
@@ -2851,6 +2909,192 @@ fn reconcile_flags_board_git_drift() {
     assert_eq!(by_id("ghost").unwrap()["issue"], "orphan-branch");
 }
 
+/// A ticket claimed but not yet branched holds a live lease, so reconcile treats it as
+/// legitimately mid-dispatch (suppressed) rather than stale-busy drift — while a ticket
+/// manually set in-progress (no lease) is still flagged.
+#[test]
+fn reconcile_suppresses_live_claim_without_branch() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    // `a`: claimed (live lease) -> in-progress, no branch yet -> legitimately mid-dispatch.
+    tkt(repo)
+        .args(["claim", "a", "--as", "agent"])
+        .assert()
+        .success();
+    // `b`: manually set in-progress, no lease -> genuine stale-busy drift.
+    tkt(repo)
+        .args(["set", "b", "--status", "in-progress"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["reconcile", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "b is real drift");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = v["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().all(|f| f["id"] != "a"),
+        "a's live claim lease suppresses the finding: {v}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["id"] == "b" && f["issue"] == "in-progress-no-branch"),
+        "b (no lease) is still flagged: {v}"
+    );
+}
+
+/// create --from validates scopes and links at filing time: an undefined scope fails the
+/// whole batch (nothing written), while members that cross-reference each other resolve.
+#[test]
+fn create_batch_validates_scopes_and_resolves_intra_batch_refs() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    // A batch declaring an undefined scope `dx` -> rejected, nothing written.
+    let bad = repo.join("bad.toml");
+    std::fs::write(
+        &bad,
+        "[[ticket]]\ntitle = \"One\"\nid = \"one\"\nscopes = [\"dx\"]\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["create", "--from", bad.to_str().unwrap()])
+        .assert()
+        .code(3);
+    assert!(
+        !repo.join("tickets/one.md").exists(),
+        "a rejected batch is all-or-nothing"
+    );
+    // --no-validate lets the same batch through.
+    tkt(repo)
+        .args(["create", "--from", bad.to_str().unwrap(), "--no-validate"])
+        .assert()
+        .success();
+    // A batch whose members cross-reference each other by id resolves and succeeds.
+    let good = repo.join("good.toml");
+    std::fs::write(
+        &good,
+        "[[ticket]]\ntitle = \"X\"\nid = \"x\"\nscopes = [\"core\"]\nrelated = [\"y\"]\n\
+         [[ticket]]\ntitle = \"Y\"\nid = \"y\"\ndepends_on = [\"x\"]\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["create", "--from", good.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(repo.join("tickets/x.md").exists() && repo.join("tickets/y.md").exists());
+}
+
+/// guard --explain attributes each affected/under-declared scope to the changed files
+/// that hit it, in both human and JSON output.
+#[test]
+fn guard_explain_attributes_files_to_scopes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T", "--scope", "core"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(repo.join("core")).unwrap();
+    std::fs::create_dir_all(repo.join("io")).unwrap();
+    std::fs::write(repo.join("core/a.txt"), "a\n").unwrap();
+    std::fs::write(repo.join("io/b.txt"), "b\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git_commit_all(repo, "init");
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(repo.join("io/b.txt"), "changed\n").unwrap();
+    git_commit_all(repo, "edit io");
+    // Human --explain lists io/b.txt under the (under-declared) io scope. The report is
+    // printed to stdout even though the under-declaration exits 6.
+    let out = tkt(repo)
+        .args(["guard", "feat", "--ticket", "t", "--explain"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("explain:"), "explain section: {text}");
+    assert!(text.contains("io/b.txt"), "attributes io/b.txt: {text}");
+    // JSON --explain carries the attribution map.
+    let out = tkt(repo)
+        .args([
+            "guard",
+            "feat",
+            "--ticket",
+            "t",
+            "--explain",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["explanation"]["scopes"]["io"][0], "io/b.txt");
+}
+
+/// `[guard] gate_collisions = true` makes a declared-area overlap gate (exit 6) with no
+/// --strict; --warn-collisions overrides the config back to a non-gating WARN.
+#[test]
+fn guard_gate_collisions_config_knob() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+         [guard]\ngate_collisions = true\n[scopes]\n\"api\" = [\"src/api/**\"]\n",
+    )
+    .unwrap();
+    for id in ["a", "b"] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id, "--scope", "api"])
+            .assert()
+            .success();
+        tkt(repo)
+            .args(["set", id, "--status", "in-progress"])
+            .assert()
+            .success();
+    }
+    std::fs::create_dir_all(repo.join("src/api")).unwrap();
+    std::fs::write(repo.join("src/api/mod.rs"), "// base\n").unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    git_commit_all(repo, "init");
+    git(repo, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(repo.join("src/api/a.rs"), "// a\n").unwrap();
+    git_commit_all(repo, "a work");
+    // Config gates the overlap without --strict.
+    tkt(repo)
+        .args(["guard", "feat", "--ticket", "a", "--base", "main"])
+        .assert()
+        .code(6);
+    // --warn-collisions overrides the config back to exit 0.
+    tkt(repo)
+        .args([
+            "guard",
+            "feat",
+            "--ticket",
+            "a",
+            "--base",
+            "main",
+            "--warn-collisions",
+        ])
+        .assert()
+        .success();
+}
+
 /// reconcile is clean (exit 0) when the board matches git.
 #[test]
 fn reconcile_clean_when_consistent() {
@@ -2880,13 +3124,23 @@ fn related_links_are_non_blocking_and_queryable() {
     let repo = dir.path();
     tkt(repo).args(["init", "--no-skill"]).assert().success();
     // `a` is created relating to `b`; `b` is created later and depends on a never-done
-    // ticket, so it is NOT ready — but that must not hold `a` back.
+    // ticket, so it is NOT ready — but that must not hold `a` back. The forward related
+    // reference needs --no-validate (b does not exist yet at `a`'s creation).
     tkt(repo)
         .args(["create", "--id", "blocker", "--title", "Blocker"])
         .assert()
         .success();
     tkt(repo)
-        .args(["create", "--id", "a", "--title", "A", "--related", "b"])
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--related",
+            "b",
+            "--no-validate",
+        ])
         .assert()
         .success();
     tkt(repo)
@@ -2930,14 +3184,14 @@ fn related_links_are_non_blocking_and_queryable() {
     assert!(related.contains(&"b") && related.contains(&"blocker"));
     tkt(repo).args(["lint"]).assert().success();
 
-    // A self-relation is rejected, and a dangling related target is a lint finding
-    // (exit 3) — but not a cycle.
+    // A self-relation is rejected, and a dangling related target (written with
+    // --no-validate) is a lint finding (exit 3) — but not a cycle.
     tkt(repo)
         .args(["set", "a", "--add-related", "a"])
         .assert()
         .code(3);
     tkt(repo)
-        .args(["link", "a", "--related", "ghost"])
+        .args(["link", "a", "--related", "ghost", "--no-validate"])
         .assert()
         .success();
     tkt(repo).args(["lint"]).assert().code(3);
@@ -2949,6 +3203,11 @@ fn related_tickets_share_a_track_when_scopes_disjoint() {
     let repo = dir.path();
     tkt(repo).args(["init", "--no-skill"]).assert().success();
     write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    // Create `b` first so `a`'s related reference resolves at write time.
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "io"])
+        .assert()
+        .success();
     tkt(repo)
         .args([
             "create",
@@ -2961,10 +3220,6 @@ fn related_tickets_share_a_track_when_scopes_disjoint() {
             "--related",
             "b",
         ])
-        .assert()
-        .success();
-    tkt(repo)
-        .args(["create", "--id", "b", "--title", "B", "--scope", "io"])
         .assert()
         .success();
     let out = tkt(repo)
@@ -4158,6 +4413,58 @@ fn skill_links_to_canonical_and_sync_refreshes() {
     assert!(!skill_check("skill_canonical"), "stale sentinel is flagged");
     assert!(tkt_x(&["skill", "sync"]).status.success());
     assert!(skill_check("skill_canonical"), "sync clears the drift");
+}
+
+/// `skill install --harness` installs the (format-identical) skill into each harness's
+/// directory convention, symlinked to the same canonical copy, and gitignores the link.
+#[test]
+fn skill_install_targets_each_harness() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let xdg = TempDir::new().unwrap(); // sandbox the canonical skill dir
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    for (harness, subdir) in [
+        ("codex", ".agents/skills"),
+        ("opencode", ".opencode/skills"),
+        ("pi-agent", ".pi/skills"),
+        ("claude", ".claude/skills"),
+    ] {
+        let out = tkt(repo)
+            .env("XDG_DATA_HOME", xdg.path())
+            .args(["skill", "install", "--harness", harness, "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "install for {harness} failed");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["harness"], harness);
+        assert_eq!(v["global"], false);
+        let link = repo.join(subdir).join("ticketsplease");
+        assert!(
+            link.join("SKILL.md").exists(),
+            "{harness}: SKILL.md not reachable through {subdir}"
+        );
+        assert!(
+            std::fs::read_to_string(repo.join(".gitignore"))
+                .unwrap()
+                .lines()
+                .any(|l| l == format!("{subdir}/ticketsplease")),
+            "{harness} link should be gitignored"
+        );
+    }
+    // The `pi` alias resolves to pi-agent.
+    let out = tkt(repo)
+        .env("XDG_DATA_HOME", xdg.path())
+        .args(["skill", "install", "--harness", "pi", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["harness"], "pi-agent", "`pi` is an alias for pi-agent");
+    // --global with --dir is rejected.
+    tkt(repo)
+        .env("XDG_DATA_HOME", xdg.path())
+        .args(["skill", "install", "--global", "--dir", "x"])
+        .assert()
+        .code(3);
 }
 
 #[test]

@@ -11,7 +11,8 @@ It's driven from the command line and built to be scripted: every command speaks
 ```sh
 tkt tracks --format json          # conflict-free parallel batches of ready tickets
 tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes its
-                                  # ticket's declared scope or collides with another
+                                  # ticket's declared scope (an overlap with an open
+                                  # ticket is a non-failing WARN by default)
 ```
 
 `init` / `create` / `set` / `link` / `show` / `list` / `ready` / `next` / `lint` / `delete` / `rename` are the convenience surface around those two; `list --where` filters with boolean expressions and `view` saves them as named views; `rollup` aggregates an initiative (counts, % done, ready frontier, blocked set) and `graph` / `path` export the dependency DAG (Graphviz DOT, critical path); `tracks --max-overlap` / `lanes` tune how parallel you go (tolerate benign overlap, or sequence conflicts onto per-worker lanes instead of idling); `claim` / `release` / `claims` / `next --claim` provide race-safe pull-based dispatch; `status --all-branches`, `reconcile`, `watch`, `comment`, and `events --watch` give an orchestrator a live view of — and an append-only, conflict-free annotation channel for — workers running on their own branches (`reconcile` flags where the board has drifted from the actual branches/worktrees). New to the model? `tkt guide` prints it in one screen, and `tkt doctor` verifies setup.
@@ -142,11 +143,13 @@ Saved views (and bundled body templates) live under `.ticketsplease/` at the rep
 - **Exit codes are the API:** `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` dependency cycle · `6` conflict · `7` watch timeout.
 - Every command takes `--repo <path>`; everything is offline and atomic.
 
-## The Claude skill
+## The agent skill
 
-`tkt init` (and `tkt skill install`) wire a Claude skill into `.claude/skills/ticketsplease/`. It teaches an agent the orchestration loop — `tracks` to fan out disjoint work, `guard` to gate each branch before merge.
+`tkt init` (and `tkt skill install`) wire the bundled skill into your agent harness's skills directory — Claude Code by default (`.claude/skills/ticketsplease/`). It teaches an agent the orchestration loop — `tracks` to fan out disjoint work, `guard` to gate each branch before merge.
 
-The skill is embedded in the binary, but instead of a frozen per-repo copy it lives once at a canonical per-user path (`~/.local/share/ticketsplease/skill`) and each project's `.claude/skills/ticketsplease` is a **symlink** to it. The installer runs `tkt skill sync` after every install/`self-update`, so the canonical copy — and therefore every linked project — always matches your binary; `tkt doctor` warns if it drifts and `tkt migrate` repairs a stale link. The link is local, so `init` gitignores it; use `tkt skill install --copy` if you'd rather commit a real copy.
+The skill is a single `SKILL.md` + `references/` layout that the major coding agents all consume, so `--harness` selects where it installs: `claude` → `.claude/skills`, `codex` → `.agents/skills` (the cross-tool Agent Skills standard directory, also read by opencode and Pi), `opencode` → `.opencode/skills`, `pi-agent` → `.pi/skills`. `--global` installs into the harness's user-global dir (available in every project) instead of the repo.
+
+The skill is embedded in the binary, but instead of a frozen per-repo copy it lives once at a canonical per-user path (`~/.local/share/ticketsplease/skill`) and each install is a **symlink** to it. The installer runs `tkt skill sync` after every install/`self-update`, so the canonical copy — and therefore every linked project — always matches your binary; `tkt doctor` warns if it drifts and `tkt migrate` repairs a stale link. A project link is local, so `init` gitignores it; use `tkt skill install --copy` if you'd rather commit a real copy.
 
 ## Dogfooding
 

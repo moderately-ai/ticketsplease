@@ -110,6 +110,26 @@ impl PathGlobMapper {
         }
         Ok(Self { scopes })
     }
+
+    /// For `--explain`: which changed files matched each scope's globs (scope -> files,
+    /// only scopes with at least one match). `map` collapses this to a bool; this keeps
+    /// the per-file attribution so guard can show *why* a scope is affected. Crate-graph
+    /// and external-pin scopes have no path-glob file and so never appear here.
+    #[must_use]
+    pub fn attribute(&self, changed_files: &[String]) -> BTreeMap<String, Vec<String>> {
+        let mut out = BTreeMap::new();
+        for (scope, set) in &self.scopes {
+            let files: Vec<String> = changed_files
+                .iter()
+                .filter(|f| set.is_match(f.as_str()))
+                .cloned()
+                .collect();
+            if !files.is_empty() {
+                out.insert(scope.clone(), files);
+            }
+        }
+        out
+    }
 }
 
 impl AffectedSetMapper for PathGlobMapper {
@@ -307,6 +327,27 @@ pub struct Collision {
     pub cause: ScopeCause,
 }
 
+/// The guard verdict, ordered by loudness. Separating the two signals stops the
+/// common, expected case (a declared-area overlap with an open sibling) from
+/// wearing the same CONFLICT badge as the rare, actionable one (a scope escape),
+/// which trains agents to skim past the badge entirely.
+///
+/// - `Ok` — nothing to report (or only a purely-shared, co-editable overlap).
+/// - `Warn` — a declared-area overlap with an open sibling: reported, exit 0. Not a
+///   proven merge conflict; the parallel-dispatch model expects these.
+/// - `Conflict` — a scope escape (under-declaration), or a sibling overlap when
+///   collision-gating is on (`--strict` / `[guard] gate_collisions`). Exit 6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// No gating issue.
+    Ok,
+    /// A non-gating declared-area overlap.
+    Warn,
+    /// A gating conflict (exit 6).
+    Conflict,
+}
+
 /// The result of guarding a branch.
 #[derive(Debug, Clone, Serialize)]
 pub struct GuardReport {
@@ -329,8 +370,6 @@ pub struct GuardReport {
     pub under_declared: Vec<String>,
     /// Overlaps with other open tickets.
     pub collisions: Vec<Collision>,
-    /// True if the guard found any conflict.
-    pub conflict: bool,
 }
 
 impl GuardReport {
@@ -347,11 +386,58 @@ impl GuardReport {
                 .any(|c| c.cause == ScopeCause::Direct)
     }
 
-    /// Whether the only conflicts are transitive collisions (a conflict exists, but no
-    /// under-declaration and no direct collision). Lets `--ignore-transitive` pass.
+    /// Whether there is at least one *gating* collision and every gating collision is
+    /// transitive (no under-declaration, no direct collision). Structural — independent
+    /// of the gating policy — so it stays a stable triage hint whether or not collisions
+    /// gate. Under `--strict`, `--ignore-transitive` waves exactly these through.
     #[must_use]
     pub fn transitive_only(&self) -> bool {
-        self.conflict && !self.has_direct_conflict()
+        self.under_declared.is_empty()
+            && self
+                .collisions
+                .iter()
+                .any(|c| c.cause != ScopeCause::Shared)
+            && !self
+                .collisions
+                .iter()
+                .any(|c| c.cause == ScopeCause::Direct)
+    }
+
+    /// The verdict. Two signals, deliberately different loudness:
+    ///
+    /// - An under-declaration (scope escape) is always [`Severity::Conflict`] — it is
+    ///   file-authoritative and the one signal agents must act on.
+    /// - A declared-area overlap with an open sibling is [`Severity::Warn`] by default
+    ///   (reported, exit 0). It gates (becomes `Conflict`) only when `gate_collisions`
+    ///   is on — a real `direct` overlap always, a `transitive`-only overlap unless
+    ///   `ignore_transitive` waves it through.
+    /// - A purely-`shared` (additive) overlap never raises the verdict.
+    #[must_use]
+    pub fn severity(&self, gate_collisions: bool, ignore_transitive: bool) -> Severity {
+        if !self.under_declared.is_empty() {
+            return Severity::Conflict;
+        }
+        let gating = self
+            .collisions
+            .iter()
+            .any(|c| c.cause != ScopeCause::Shared);
+        if !gating {
+            return Severity::Ok;
+        }
+        if !gate_collisions {
+            return Severity::Warn;
+        }
+        if self
+            .collisions
+            .iter()
+            .any(|c| c.cause == ScopeCause::Direct)
+        {
+            Severity::Conflict
+        } else if ignore_transitive {
+            Severity::Warn
+        } else {
+            Severity::Conflict
+        }
     }
 }
 
@@ -500,10 +586,11 @@ pub fn evaluate(
         }
     }
 
-    // A purely-shared (additive) collision does not gate — both sides declared additive
-    // intent, mirroring how `--ignore-transitive` waves through reverse-dep-only ones.
-    let gating_collision = collisions.iter().any(|c| c.cause != ScopeCause::Shared);
-    let conflict = !under_declared.is_empty() || gating_collision;
+    // The gating decision is policy (does a collision gate?), so it is deferred to
+    // `GuardReport::severity` at the call site rather than baked in here. `evaluate`
+    // reports only the raw signals: which scopes were escaped, and which siblings
+    // overlap (tagged by cause). A purely-shared collision is still reported but its
+    // `Shared` cause keeps it non-gating in every policy.
     Ok(GuardReport {
         ticket: target.id.clone(),
         base: diff.base,
@@ -514,7 +601,6 @@ pub fn evaluate(
         declared_scopes: declared.into_iter().collect(),
         under_declared,
         collisions,
-        conflict,
     })
 }
 
@@ -595,7 +681,9 @@ mod tests {
             &cov,
         )
         .unwrap();
-        assert!(report.conflict);
+        // A scope escape is Conflict under every policy — the knob only affects collisions.
+        assert_eq!(report.severity(false, false), Severity::Conflict);
+        assert_eq!(report.severity(true, false), Severity::Conflict);
         assert_eq!(report.under_declared, vec!["io"]);
     }
 
@@ -618,7 +706,10 @@ mod tests {
             &cov,
         )
         .unwrap();
-        assert!(report.conflict);
+        // A direct overlap with an open sibling: WARN by default (exit 0), CONFLICT under
+        // --strict / gate_collisions.
+        assert_eq!(report.severity(false, false), Severity::Warn);
+        assert_eq!(report.severity(true, false), Severity::Conflict);
         assert_eq!(report.collisions.len(), 1);
         assert_eq!(report.collisions[0].ticket, "u");
     }
@@ -648,7 +739,13 @@ mod tests {
         assert_eq!(report.collisions.len(), 1);
         assert_eq!(report.collisions[0].cause, ScopeCause::Shared);
         assert!(report.under_declared.is_empty());
-        assert!(!report.conflict, "shared x shared co-edit is non-gating");
+        // A purely-shared overlap never gates — not even under --strict.
+        assert_eq!(
+            report.severity(false, false),
+            Severity::Ok,
+            "shared x shared co-edit is non-gating"
+        );
+        assert_eq!(report.severity(true, false), Severity::Ok);
 
         // But an exclusive rewrite of the same scope still conflicts with the appender.
         let rewriter = ticket("t", "in-progress", &["core"]);
@@ -668,9 +765,13 @@ mod tests {
             &cov2,
         )
         .unwrap();
-        assert!(
-            r2.conflict,
-            "exclusive rewrite vs shared appender still gates"
+        // An exclusive rewrite vs a shared appender is a real (direct) overlap: WARN by
+        // default, and gates under --strict.
+        assert_eq!(r2.severity(false, false), Severity::Warn);
+        assert_eq!(
+            r2.severity(true, false),
+            Severity::Conflict,
+            "exclusive rewrite vs shared appender gates under --strict"
         );
     }
 
@@ -692,7 +793,38 @@ mod tests {
             &cov,
         )
         .unwrap();
-        assert!(!report.conflict);
+        assert_eq!(report.severity(false, false), Severity::Ok);
+    }
+
+    #[test]
+    fn severity_gates_transitive_collision_only_under_strict() {
+        // A transitive-only collision: `u` owns `dep`, reached from the change only via
+        // reverse-deps. No under-declaration, no direct overlap.
+        let target = ticket("t", "in-progress", &["core"]);
+        let other = ticket("u", "in-progress", &["dep"]);
+        let all = vec![target.clone(), other];
+        let mapper = stub(&[
+            ("core", ScopeCause::Direct),
+            ("dep", ScopeCause::Transitive),
+        ]);
+        let cov = cover(&Config::default(), &target);
+        let report = evaluate(
+            &target,
+            &all,
+            diff(&["core/a.rs"]),
+            &Mappers {
+                direct: &[],
+                impact: &[&mapper],
+            },
+            &cov,
+        )
+        .unwrap();
+        assert!(report.transitive_only());
+        assert_eq!(report.collisions[0].cause, ScopeCause::Transitive);
+        // Default: warns (exit 0). --strict gates it. --strict + --ignore-transitive passes.
+        assert_eq!(report.severity(false, false), Severity::Warn);
+        assert_eq!(report.severity(true, false), Severity::Conflict);
+        assert_eq!(report.severity(true, true), Severity::Warn);
     }
 
     /// A mapper with a fixed, cause-tagged output — exercises the cause logic in

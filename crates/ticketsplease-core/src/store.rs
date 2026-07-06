@@ -583,6 +583,12 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          tickets_dir = \"{tickets_dir}\"\n\
          default_base = \"main\"\n\
          \n\
+         [guard]\n\
+         # A declared-area overlap with an open sibling is a non-failing WARN by default\n\
+         # (exit 0); an under-declaration (scope escape) always fails (exit 6). Set true\n\
+         # (or pass `guard --strict`) to make an overlap gate too.\n\
+         # gate_collisions = false\n\
+         \n\
          [language]\n\
          # \"none\" = path-glob scopes only; \"rust\" = also expand via the cargo crate graph.\n\
          backend = \"none\"\n\

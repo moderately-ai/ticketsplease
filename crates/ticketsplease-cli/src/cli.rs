@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ticketsplease_core::Result;
 
 use crate::commands;
@@ -122,9 +122,13 @@ pub struct InitArgs {
     /// Overwrite an existing config file.
     #[arg(long)]
     pub force: bool,
-    /// Do not install the bundled Claude skill.
+    /// Do not install the bundled skill.
     #[arg(long)]
     pub no_skill: bool,
+    /// Which agent harness to install the skill for (selects the directory convention):
+    /// claude | codex | opencode | pi-agent.
+    #[arg(long, value_enum, default_value = "claude")]
+    pub harness: Harness,
 }
 
 /// `create` arguments.
@@ -181,6 +185,10 @@ pub struct CreateArgs {
     /// Preview what would be created without writing anything.
     #[arg(long)]
     pub dry_run: bool,
+    /// Skip write-time validation (undefined scopes, dangling related/dependency ids).
+    /// Use for a forward reference to a ticket or scope you will add next.
+    #[arg(long)]
+    pub no_validate: bool,
 }
 
 /// `set` arguments.
@@ -274,6 +282,9 @@ pub struct SetArgs {
     /// Preview the change without writing anything.
     #[arg(long)]
     pub dry_run: bool,
+    /// Skip write-time validation of added scopes/related/dependency ids.
+    #[arg(long)]
+    pub no_validate: bool,
 }
 
 /// `close` arguments.
@@ -327,6 +338,9 @@ pub struct LinkArgs {
     /// Remove the link instead of adding it.
     #[arg(long)]
     pub remove: bool,
+    /// Skip write-time validation that the link target exists (for a forward reference).
+    #[arg(long)]
+    pub no_validate: bool,
 }
 
 /// `show` arguments.
@@ -702,6 +716,18 @@ pub struct GuardArgs {
     /// collision detection (the branch-per-ticket flow).
     #[arg(long, default_value = "tkt/")]
     pub prefix: String,
+    /// Gate on a declared-area overlap with an open sibling too (exit 6), not just an
+    /// under-declaration — restoring the pre-warn-default behaviour. Overrides
+    /// `[guard] gate_collisions`.
+    #[arg(long)]
+    pub strict: bool,
+    /// Downgrade a declared-area overlap to a non-failing WARN (exit 0) even when
+    /// `[guard] gate_collisions` is on. Overrides the config.
+    #[arg(long, conflicts_with = "strict")]
+    pub warn_collisions: bool,
+    /// Show which changed files hit each affected, under-declared, and colliding scope.
+    #[arg(long)]
+    pub explain: bool,
 }
 
 /// `self-update` arguments.
@@ -797,12 +823,85 @@ pub enum SkillCommand {
     Sync,
 }
 
+/// The agent harness to install the skill for. Every harness consumes the identical
+/// `SKILL.md` + `references/` layout — only the discovery directory differs — so this
+/// selects the install path, reusing the same canonical-copy + symlink machinery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Harness {
+    /// Claude Code — `.claude/skills` (project), `~/.claude/skills` (global).
+    Claude,
+    /// OpenAI Codex — `.agents/skills`, the cross-tool Agent Skills standard directory
+    /// (also read by opencode and Pi); `~/.agents/skills` (global).
+    Codex,
+    /// opencode — `.opencode/skills` (project), `~/.config/opencode/skills` (global).
+    Opencode,
+    /// Pi coding agent — `.pi/skills` (project), `~/.pi/agent/skills` (global).
+    #[value(name = "pi-agent", alias = "pi")]
+    PiAgent,
+}
+
+impl Harness {
+    /// Project-scoped skills base directory, relative to the repo root.
+    #[must_use]
+    pub fn project_base_dir(self) -> &'static str {
+        match self {
+            Harness::Claude => ".claude/skills",
+            Harness::Codex => ".agents/skills",
+            Harness::Opencode => ".opencode/skills",
+            Harness::PiAgent => ".pi/skills",
+        }
+    }
+
+    /// User-global skills directory, relative to `$HOME`, where the harness
+    /// auto-discovers skills across every project.
+    #[must_use]
+    pub fn global_base_dir(self) -> &'static str {
+        match self {
+            Harness::Claude => ".claude/skills",
+            Harness::Codex => ".agents/skills",
+            Harness::Opencode => ".config/opencode/skills",
+            Harness::PiAgent => ".pi/agent/skills",
+        }
+    }
+
+    /// Human label for install output.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Harness::Claude => "Claude Code",
+            Harness::Codex => "OpenAI Codex",
+            Harness::Opencode => "opencode",
+            Harness::PiAgent => "Pi",
+        }
+    }
+
+    /// Canonical machine name (matches the `--harness` value), for JSON output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+            Harness::Codex => "codex",
+            Harness::Opencode => "opencode",
+            Harness::PiAgent => "pi-agent",
+        }
+    }
+}
+
 /// `skill install` arguments.
 #[derive(Args)]
 pub struct SkillInstallArgs {
-    /// Base directory to install the skill under (default `.claude/skills`).
-    #[arg(long, default_value = ".claude/skills")]
-    pub dir: String,
+    /// Which agent harness to install the skill for (selects the directory convention):
+    /// claude | codex | opencode | pi-agent.
+    #[arg(long, value_enum, default_value = "claude")]
+    pub harness: Harness,
+    /// Install into the harness's user-global skills directory (available in every
+    /// project) instead of this repo. Not valid with --dir.
+    #[arg(long)]
+    pub global: bool,
+    /// Explicit project base-directory override (advanced); defaults to the harness's
+    /// convention. Ignored with --global.
+    #[arg(long)]
+    pub dir: Option<String>,
     /// Write a committable real copy instead of a symlink to the canonical copy.
     #[arg(long)]
     pub copy: bool,
