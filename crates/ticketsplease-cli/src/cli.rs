@@ -101,6 +101,8 @@ pub enum Command {
     Guide,
     /// Explain why two tickets can or cannot run in parallel.
     Why(WhyArgs),
+    /// Run a named recipe: a typed, parameterized procedure over these commands.
+    Run(RunArgs),
     /// Guard a branch against scope under-declaration and collisions.
     Guard(GuardArgs),
     /// Lint and validate all tickets.
@@ -907,6 +909,30 @@ pub struct SkillInstallArgs {
     pub copy: bool,
 }
 
+/// `run` arguments.
+#[derive(Args)]
+#[command(after_help = "Examples:\n  \
+    tkt run supersede --arg id=auth --arg with=auth-api,auth-ui,auth-db\n  \
+    tkt run --list            # list recipes\n  \
+    tkt run supersede --describe   # show a recipe's typed inputs/outputs\n  \
+    tkt run supersede --arg id=auth --arg with=... --dry-run")]
+pub struct RunArgs {
+    /// Recipe name to run (omit with --list).
+    pub name: Option<String>,
+    /// An input value as `key=value` (repeatable).
+    #[arg(long = "arg", value_name = "K=V")]
+    pub arg: Vec<String>,
+    /// Preview the resolved steps without executing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// List the available recipes and exit.
+    #[arg(long)]
+    pub list: bool,
+    /// Print the recipe's typed input/output contract and exit.
+    #[arg(long)]
+    pub describe: bool,
+}
+
 /// Dispatch a parsed CLI invocation.
 pub fn run(cli: Cli) -> Result<()> {
     let repo = cli.repo.as_path();
@@ -951,6 +977,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::States => commands::states(repo, fmt),
         Command::Guide => commands::guide(fmt),
         Command::Why(a) => commands::why(repo, fmt, a),
+        Command::Run(a) => commands::run(repo, fmt, a),
         Command::Guard(a) => commands::guard(repo, fmt, a),
         Command::Migrate(a) => commands::migrate(repo, fmt, a),
         Command::Skill(a) => match &a.command {

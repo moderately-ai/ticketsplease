@@ -3,6 +3,7 @@
 mod cli;
 mod commands;
 mod format;
+mod recipe;
 mod skill;
 mod templates;
 mod update;

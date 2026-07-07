@@ -57,6 +57,13 @@ pub struct Config {
     /// Guard behaviour: whether a declared-area overlap with an open sibling gates.
     #[serde(default)]
     pub guard: Guard,
+    /// Named recipes: typed, parameterized procedures over the tool's own subcommands,
+    /// registered inline as `[recipe.<name>]` (also discoverable as
+    /// `.ticketsplease/recipes/<name>.toml`). Run with `tkt run <name>`. Distinct from
+    /// `[workflow]`, which is the lifecycle state machine. The TOML table is the singular
+    /// `[recipe.<name>]`; the field stays plural for readable Rust.
+    #[serde(default, rename = "recipe")]
+    pub recipes: BTreeMap<String, Recipe>,
 }
 
 /// Per-scope scheduling policy (see [`Config::scope_policy`]).
@@ -153,6 +160,68 @@ pub struct Guard {
     pub gate_collisions: bool,
 }
 
+/// A recipe: a named, typed, parameterized procedure over the tool's own subcommands
+/// (`[recipe.<name>]`, or a discovered `.ticketsplease/recipes/<name>.toml`). Run with
+/// `tkt run <name>`. Distinct from `[workflow]` (the lifecycle state machine).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Recipe {
+    /// One-line description, shown by `tkt run --list` / `--describe`.
+    #[serde(default)]
+    pub description: String,
+    /// Declared, typed inputs (`--arg <name>=<value>`), validated before any step runs.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, RecipeInput>,
+    /// Ordered steps. Each is a raw table: a `command` (the subcommand), an optional
+    /// `args` list (positionals), an optional `id` (so a later step can read its output),
+    /// and any other key as a `--flag`. Kept untyped here and interpreted — and
+    /// clap-validated — at run time, so a recipe can use any current subcommand.
+    #[serde(default)]
+    pub steps: Vec<toml::Table>,
+    /// Declared outputs: `name -> template`, resolved and projected into the JSON result.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, String>,
+}
+
+/// A recipe's typed input parameter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecipeInput {
+    /// Value type, validated before any step runs.
+    #[serde(default, rename = "type")]
+    pub input_type: InputType,
+    /// Whether the input must be supplied (unless it has a `default`).
+    #[serde(default)]
+    pub required: bool,
+    /// Default value (as a string; coerced to `input_type`) used when not supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Allowed values for `type = "enum"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    /// Accept a comma-separated list (e.g. several ticket ids).
+    #[serde(default)]
+    pub multiple: bool,
+    /// One-line description, for `--describe`.
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A recipe input's value type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputType {
+    /// Any string (the default).
+    #[default]
+    String,
+    /// An integer.
+    Int,
+    /// A boolean (`true`/`false`).
+    Bool,
+    /// One of the declared `options`.
+    Enum,
+    /// An existing ticket id — validated to resolve, else exit 4.
+    Ticket,
+}
+
 /// Workflow configuration (`[workflow]`): custom lifecycle states and optional
 /// transition enforcement.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -230,6 +299,7 @@ impl Default for Config {
             scope_policy: BTreeMap::new(),
             workflow: Workflow::default(),
             guard: Guard::default(),
+            recipes: BTreeMap::new(),
         }
     }
 }

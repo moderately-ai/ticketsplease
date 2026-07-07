@@ -92,6 +92,7 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 - `ticketsplease states` — the workflow's states and their engine **category** (dispatchable/open/parked/terminal). A repo keeps the built-in states unless it declares `[workflow.states]`; custom states are named freely but pin to a category the scheduler/guard/rollup reason about (see `references/commands.md`).
 - `ticketsplease graph [--tag <t>] [--dot]` and `ticketsplease path <id>` — export the dependency DAG (JSON, or Graphviz with `--dot`) and the critical prerequisite path (longest dependency chain) to a ticket.
 - `ticketsplease reconcile` — cross-check the board against git (tkt/* branches + worktrees): flags in-progress tickets with no branch (stale-busy) and live branches whose ticket is still todo/ready (stale-idle), plus orphan branches. Exit 3 on drift. Run it before a dispatch round so the board can be trusted.
+- `ticketsplease run <name> [--arg k=v]` — run a **recipe**: a named, typed, parameterized procedure over these same subcommands (e.g. `run supersede --arg id=X --arg with=A,B` re-points X's dependents onto A,B and closes X). Recipes live in `[recipe.<name>]` or `.ticketsplease/recipes/*.toml` (seeded by `init`); `run --list` shows them, `--describe` prints a recipe's typed inputs, `--dry-run` previews the steps. Distinct from `[workflow]` (the state machine); invoked, never triggered. Details: `references/commands.md`.
 
 ## Access intent & overlap (tuning parallelism)
 

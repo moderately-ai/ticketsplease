@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::comment::Comment;
-use crate::config::{Config, CONFIG_FILE};
+use crate::config::{Config, Recipe, CONFIG_FILE};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::ids;
@@ -41,6 +41,41 @@ impl Store {
             repo_root: repo_root.to_path_buf(),
             config,
         })
+    }
+
+    /// Every recipe available in this repo: the inline `[recipe.<name>]` tables merged
+    /// with discovered `.ticketsplease/recipes/<name>.toml` files (filename = name,
+    /// read in sorted order). A name defined in both places is a loud error.
+    pub fn load_recipes(&self) -> Result<BTreeMap<String, Recipe>> {
+        let mut out = self.config.recipes.clone();
+        let dir = self.repo_root.join(".ticketsplease").join("recipes");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .map_err(Error::Io)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        files.sort();
+        for path in files {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let raw = fs::read_to_string(&path).map_err(Error::Io)?;
+            let recipe: Recipe = toml::from_str(&raw)
+                .map_err(|e| Error::Invalid(format!("invalid recipe {}: {e}", path.display())))?;
+            if out.contains_key(&name) {
+                return Err(Error::Invalid(format!(
+                    "recipe `{name}` is defined both inline in {CONFIG_FILE} and in {}",
+                    path.display()
+                )));
+            }
+            out.insert(name, recipe);
+        }
+        Ok(out)
     }
 
     /// Absolute path to the tickets directory.

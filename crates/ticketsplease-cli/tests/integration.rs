@@ -4467,6 +4467,212 @@ fn skill_install_targets_each_harness() {
         .code(3);
 }
 
+fn show_json(repo: &Path, id: &str) -> serde_json::Value {
+    let out = tkt(repo)
+        .args(["show", id, "--format", "json"])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn append(repo: &Path, file: &str, text: &str) {
+    let path = repo.join(file);
+    let mut s = std::fs::read_to_string(&path).unwrap();
+    s.push_str(text);
+    std::fs::write(&path, s).unwrap();
+}
+
+/// The bundled `supersede` recipe (a discovered `.ticketsplease/recipes/` file seeded by
+/// init) re-points every dependent onto the successors and closes the original superseded;
+/// `--dry-run` previews the steps and mutates nothing.
+#[test]
+fn run_supersede_repoints_dependents_and_closes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success(); // seeds recipes
+    for t in ["auth", "auth-api", "auth-ui"] {
+        tkt(repo)
+            .args(["create", "--id", t, "--title", t])
+            .assert()
+            .success();
+    }
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "dash",
+            "--title",
+            "Dash",
+            "--depends-on",
+            "auth",
+        ])
+        .assert()
+        .success();
+
+    // dry-run previews 3 steps and changes nothing.
+    let out = tkt(repo)
+        .args([
+            "run",
+            "supersede",
+            "--arg",
+            "id=auth",
+            "--arg",
+            "with=auth-api,auth-ui",
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["steps"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        show_json(repo, "dash")["dependencies"],
+        serde_json::json!(["auth"]),
+        "dry-run must not mutate"
+    );
+
+    // execute: dependents re-point onto the successors, original closes superseded.
+    tkt(repo)
+        .args([
+            "run",
+            "supersede",
+            "--arg",
+            "id=auth",
+            "--arg",
+            "with=auth-api,auth-ui",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        show_json(repo, "dash")["dependencies"],
+        serde_json::json!(["auth-api", "auth-ui"])
+    );
+    let auth = show_json(repo, "auth");
+    assert_eq!(auth["status"], "closed");
+    assert_eq!(auth["closed_reason"], "superseded");
+    assert_eq!(auth["related"], serde_json::json!(["auth-api", "auth-ui"]));
+}
+
+/// The bundled `split` recipe threads a created ticket's id from one step's JSON into the
+/// next step (the single `{{steps.<id>.<path>}}` data-flow primitive) and returns it as a
+/// declared output.
+#[test]
+fn run_split_threads_created_id_via_data_flow() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "dash", "--title", "Dash"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args([
+            "run",
+            "split",
+            "--arg",
+            "id=dash",
+            "--arg",
+            "title=Piece",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["outputs"]["new_id"], "piece");
+    assert_eq!(
+        show_json(repo, "dash")["dependencies"],
+        serde_json::json!(["piece"]),
+        "dash now depends on the freshly-created piece"
+    );
+    tkt(repo).args(["show", "piece"]).assert().success();
+}
+
+/// Recipe input validation runs before any step, mapped onto the exit-code contract:
+/// missing/unknown/bad-enum input -> 3, unresolved ticket input or unknown recipe -> 4.
+#[test]
+fn run_validates_inputs_and_recipes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "auth", "--title", "Auth"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "auth-api", "--title", "API"])
+        .assert()
+        .success();
+    // missing required input `with`
+    tkt(repo)
+        .args(["run", "supersede", "--arg", "id=auth"])
+        .assert()
+        .code(3);
+    // ticket input that doesn't resolve
+    tkt(repo)
+        .args([
+            "run",
+            "supersede",
+            "--arg",
+            "id=ghost",
+            "--arg",
+            "with=auth-api",
+        ])
+        .assert()
+        .code(4);
+    // unknown recipe name
+    tkt(repo).args(["run", "nope"]).assert().code(4);
+    // an --arg not declared by the recipe
+    tkt(repo)
+        .args([
+            "run",
+            "supersede",
+            "--arg",
+            "id=auth",
+            "--arg",
+            "with=auth-api",
+            "--arg",
+            "bogus=x",
+        ])
+        .assert()
+        .code(3);
+
+    // enum validation, via an inline recipe with an enum input.
+    append(
+        repo,
+        "ticketsplease.toml",
+        "\n[recipe.retag]\ninputs.level = { type = \"enum\", options = [\"p0\", \"p1\"], required = true }\n\
+         [[recipe.retag.steps]]\ncommand = \"set\"\nargs = [\"auth\"]\npriority = \"{{inputs.level}}\"\n",
+    );
+    tkt(repo)
+        .args(["run", "retag", "--arg", "level=p9"])
+        .assert()
+        .code(3); // not in options
+    tkt(repo)
+        .args(["run", "retag", "--arg", "level=p0"])
+        .assert()
+        .success();
+    assert_eq!(show_json(repo, "auth")["priority"], "p0");
+}
+
+/// A recipe name defined both inline and as a discovered file is a loud error.
+#[test]
+fn run_dup_recipe_name_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success(); // seeds supersede.toml as a file
+    append(
+        repo,
+        "ticketsplease.toml",
+        "\n[recipe.supersede]\ndescription = \"dup\"\n",
+    );
+    tkt(repo).args(["run", "--list"]).assert().code(3);
+}
+
 #[test]
 fn close_reopen_and_orphaned_dependents() {
     let dir = TempDir::new().unwrap();

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::claim as claim_core;
 use ticketsplease_core::comment::Comment;
-use ticketsplease_core::config::{Backend, Config, CONFIG_FILE};
+use ticketsplease_core::config::{Backend, Config, Recipe, CONFIG_FILE};
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
@@ -25,11 +25,12 @@ use ticketsplease_core::{
 use crate::cli::{
     ClaimArgs, ClaimsArgs, CloseArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs,
     EventsArgs, GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, MigrateArgs,
-    NextArgs, PathArgs, ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs, RollupArgs,
+    NextArgs, PathArgs, ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs, RollupArgs, RunArgs,
     SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs,
     ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format};
+use crate::recipe;
 use crate::skill;
 use crate::templates;
 use crate::update;
@@ -53,6 +54,9 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
     // Seed the example body templates so `create --template` has something to use and
     // the house convention is discoverable.
     let templates_path = templates::install(repo)?.display().to_string();
+    // Seed the example recipes (`tkt run supersede`/`split`) so the feature is usable
+    // and discoverable out of the box.
+    let recipes_path = recipe::install(repo)?.display().to_string();
     let has_git = git_ref_exists(repo, "HEAD");
     match fmt {
         Format::Json => print_json(&json!({
@@ -61,6 +65,7 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
             "wrote_config": outcome.wrote_config,
             "skill_installed": skill_path,
             "templates_installed": templates_path,
+            "recipes_installed": recipes_path,
             "git": has_git,
         })),
         Format::Human => {
@@ -75,6 +80,7 @@ pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
                 );
             }
             println!("Seeded body templates to {templates_path}");
+            println!("Seeded example recipes to {recipes_path} (see `tkt run --list`)");
             println!("\nNext steps:");
             println!("  1. Define your [scopes] in {CONFIG_FILE} (scope name -> path globs).");
             println!("  2. Create a ticket:  tkt create --title \"...\" --scope <scope>");
@@ -2888,6 +2894,219 @@ fn join_or_none(items: &[String]) -> String {
     } else {
         items.join(", ")
     }
+}
+
+/// `run` — execute a named recipe: a typed, parameterized procedure over these same
+/// subcommands. Inputs are validated before any step runs; each step re-invokes this
+/// binary so it inherits that command's validation/JSON/exit-code; the failing step's
+/// code propagates. `--dry-run` prints the resolved plan without touching git.
+pub fn run(repo: &Path, fmt: Format, args: &RunArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let recipes = store.load_recipes()?;
+
+    if args.list {
+        return emit_recipe_list(fmt, &recipes);
+    }
+    let name = args
+        .name
+        .as_deref()
+        .ok_or_else(|| Error::Invalid("provide a recipe name (or --list)".into()))?;
+    let recipe = recipes
+        .get(name)
+        .ok_or_else(|| Error::NotFound(format!("recipe `{name}` (see `tkt run --list`)")))?;
+    if args.describe {
+        return emit_recipe_describe(fmt, name, recipe);
+    }
+
+    // Validate every input up front — a bad input aborts with nothing mutated.
+    let provided = recipe::parse_args(&args.arg)?;
+    let ticket_ids: BTreeSet<String> = store
+        .load_all_lenient()?
+        .0
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    let inputs = recipe::validate_inputs(&recipe.inputs, &provided, &ticket_ids)?;
+    let mut ctx = recipe::RunContext::new(inputs);
+
+    // --dry-run: resolve the plan (step references stay symbolic) and print it.
+    if args.dry_run {
+        let plan = recipe
+            .steps
+            .iter()
+            .map(|s| recipe::build_argv(s, &ctx, true))
+            .collect::<Result<Vec<_>>>()?;
+        return emit_recipe_plan(fmt, name, &plan);
+    }
+
+    // Execute steps in order; capture the JSON of any step that declares an `id` so a
+    // later step can reference `{{steps.<id>.<path>}}`.
+    let mut ran: Vec<Value> = Vec::new();
+    for (i, step) in recipe.steps.iter().enumerate() {
+        let argv = recipe::build_argv(step, &ctx, false)?;
+        let verb = argv.first().map(String::as_str).unwrap_or("?");
+        let label = format!("{} (`{verb}`)", i + 1);
+        if matches!(fmt, Format::Human) {
+            eprintln!("-> step {label}: {}", display_argv(&argv));
+        }
+        let out = recipe::exec_step(repo, &argv, &label)?;
+        if let Some(id) = step.get("id").and_then(toml::Value::as_str) {
+            ctx.steps.insert(id.to_string(), out.clone());
+        }
+        ran.push(out);
+    }
+
+    // Resolve declared outputs against the final context.
+    let mut outputs = serde_json::Map::new();
+    for (key, tpl) in &recipe.outputs {
+        outputs.insert(
+            key.clone(),
+            Value::String(recipe::resolve_template(tpl, &ctx, false)?),
+        );
+    }
+
+    match fmt {
+        Format::Json => print_json(&json!({
+            "schema_version": 1,
+            "recipe": name,
+            "steps": ran.len(),
+            "outputs": outputs,
+        })),
+        Format::Human => {
+            println!("Ran recipe `{name}` ({} step(s))", ran.len());
+            for (key, value) in &outputs {
+                if let Value::String(s) = value {
+                    println!("  {key}: {s}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn emit_recipe_list(fmt: Format, recipes: &BTreeMap<String, Recipe>) -> Result<()> {
+    match fmt {
+        Format::Json => {
+            let rows: Vec<Value> = recipes
+                .iter()
+                .map(|(name, r)| {
+                    json!({
+                        "name": name,
+                        "description": r.description,
+                        "inputs": r.inputs.keys().collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            print_json(&json!({ "schema_version": 1, "recipes": rows }))
+        }
+        Format::Human => {
+            if recipes.is_empty() {
+                println!(
+                    "(no recipes; define `[recipe.<name>]` in {CONFIG_FILE} or a file under \
+                     .ticketsplease/recipes/)"
+                );
+            }
+            for (name, r) in recipes {
+                if r.description.is_empty() {
+                    println!("{name}");
+                } else {
+                    println!("{name:<20} {}", r.description);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn emit_recipe_describe(fmt: Format, name: &str, recipe: &Recipe) -> Result<()> {
+    match fmt {
+        Format::Json => {
+            let inputs: Vec<Value> = recipe
+                .inputs
+                .iter()
+                .map(|(n, i)| {
+                    json!({
+                        "name": n,
+                        "type": i.input_type,
+                        "required": i.required,
+                        "default": i.default,
+                        "options": i.options,
+                        "multiple": i.multiple,
+                        "description": i.description,
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "schema_version": 1,
+                "recipe": name,
+                "description": recipe.description,
+                "inputs": inputs,
+                "outputs": recipe.outputs.keys().collect::<Vec<_>>(),
+                "steps": recipe.steps.len(),
+            }))
+        }
+        Format::Human => {
+            println!("recipe {name}");
+            if !recipe.description.is_empty() {
+                println!("  {}", recipe.description);
+            }
+            println!("  inputs:");
+            for (n, i) in &recipe.inputs {
+                let ty = format!("{:?}", i.input_type).to_lowercase();
+                let opts = if i.options.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}] ", i.options.join(","))
+                };
+                let req = if i.required { "required" } else { "optional" };
+                let def = i
+                    .default
+                    .as_ref()
+                    .map_or_else(String::new, |d| format!(", default {d}"));
+                let mult = if i.multiple { ", list" } else { "" };
+                println!("    {n}: {ty} {opts}({req}{def}{mult})");
+            }
+            if !recipe.outputs.is_empty() {
+                let keys: Vec<&str> = recipe.outputs.keys().map(String::as_str).collect();
+                println!("  outputs: {}", keys.join(", "));
+            }
+            println!("  steps: {}", recipe.steps.len());
+            Ok(())
+        }
+    }
+}
+
+fn emit_recipe_plan(fmt: Format, name: &str, plan: &[Vec<String>]) -> Result<()> {
+    match fmt {
+        Format::Json => {
+            let steps: Vec<Value> = plan.iter().map(|argv| json!(argv)).collect();
+            print_json(
+                &json!({ "schema_version": 1, "recipe": name, "dry_run": true, "steps": steps }),
+            )
+        }
+        Format::Human => {
+            println!("recipe `{name}` would run {} step(s):", plan.len());
+            for (i, argv) in plan.iter().enumerate() {
+                println!("  {}. tkt {}", i + 1, display_argv(argv));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Render a step's argv for display, single-quoting any element containing a space so a
+/// multi-word value reads as one argument (it is passed as one — steps are not shelled).
+fn display_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.contains(' ') {
+                format!("'{a}'")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Build the config body for `init`: a Rust-seeded config when a cargo workspace

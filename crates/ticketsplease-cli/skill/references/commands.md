@@ -9,11 +9,11 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 
 ## Contents
 
-`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
+`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `run` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
 
 ## Conventions
 
-- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `close`/`reopen`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `close`/`reopen`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `run`→`outputs` (or `steps` with `--dry-run`) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 - **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
@@ -24,9 +24,9 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 ```
 ticketsplease init [--dir tickets] [--force] [--no-skill] [--harness claude|codex|opencode|pi-agent]
 ```
-Scaffolds `<dir>/` and `ticketsplease.toml`, links the bundled skill into the chosen harness's skills directory (default `--harness claude` → `.claude/skills/ticketsplease`; a gitignored symlink to the canonical copy — see `skill`), and seeds example body templates into `.ticketsplease/templates/` (for `create --template`). `--no-skill` skips the skill link. Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
+Scaffolds `<dir>/` and `ticketsplease.toml`, links the bundled skill into the chosen harness's skills directory (default `--harness claude` → `.claude/skills/ticketsplease`; a gitignored symlink to the canonical copy — see `skill`), and seeds example body templates into `.ticketsplease/templates/` (for `create --template`) and example recipes into `.ticketsplease/recipes/` (for `tkt run` — see `run`). `--no-skill` skips the skill link. Idempotent: an existing config is left untouched unless `--force`. Prints a next-steps block, and warns if the directory is not a git repo (claim/guard/status/events/watch need `git init` + a commit).
 
-JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "templates_installed", "git": bool }`.
+JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "templates_installed", "recipes_installed", "git": bool }`.
 
 ## create
 
@@ -226,6 +226,29 @@ JSON: `{ "schema_version", "picks": [ {id,...,score, "conflicts_with": [ {ticket
 ticketsplease why <a> <b>
 ```
 Explains whether two *different* tickets can run in parallel (passing the same id twice is a usage error, exit 3). They cannot if they share a scope **or** one transitively depends on the other. JSON: `{ "schema_version", "a", "b", "conflict": bool, "shared_scopes": [...], "dependency_ordered": bool }`. Exits 6 on conflict (so `why a b && …` gates).
+
+## run
+
+```
+ticketsplease run <name> [--arg key=value …] [--dry-run] [--list] [--describe]
+```
+Runs a **recipe**: a named, typed, parameterized procedure over these same subcommands. Recipes are registered as `[recipe.<name>]` in `ticketsplease.toml` **or** as a discovered `.ticketsplease/recipes/<name>.toml` file (filename = name; a name defined in both is a loud error, exit 3). A recipe is **not** a `[workflow]` (that is the lifecycle state machine) — it is a macro over commands, invoked explicitly. There are deliberately no event or scheduled triggers: a daemonless tool has no watcher, so invocation *is* the trigger. `init` seeds `supersede` and `split` as examples; `tkt run --list` shows what's available and `tkt run <name> --describe` prints one recipe's typed contract.
+
+**Typed inputs, validated before any step runs** (so a bad input mutates nothing). Supply them with `--arg <name>=<value>`. Types: `string` (default), `int`, `bool`, `enum` (with `options`), `ticket`; each input may be `required`, carry a `default`, or be `multiple` (a comma-separated list). A missing-required / wrong-type / bad-enum / undeclared input is **exit 3**; a `ticket` input that does not resolve is **exit 4**.
+
+**Steps are structured invocations, not shell.** Each `[[recipe.<name>.steps]]` table has a `command` (the subcommand), an optional `args` list (positionals), an optional `id` (so a later step can read its output), and any other key as a `--flag` — `add-dependency = "x"` → `--add-dependency x`, `force = true` → `--force`. Each step re-invokes this binary with `--format json`, so it inherits that command's validation, JSON, and exit code; a failing step **stops the recipe and propagates its exit code**. `{{inputs.<name>}}` substitutes an input; `{{steps.<id>.<dotted.path>}}` pulls a **scalar from a prior step's JSON** — the single cross-step data-flow primitive — and hard-fails (exit 3) if the path is absent (never a silent blank). There are intentionally **no conditionals or loops**: model divergence as separate recipes, and `--where` is the loop. For real logic, write a shell script that calls `tkt` and reads its JSON/exit codes.
+
+`--dry-run` prints the resolved ordered plan (step references stay symbolic) and touches nothing — Read it before running a destructive recipe. There is no cross-step rollback: a recipe fails fast, and git is the undo.
+
+`[recipe.<name>]` fields: `description`; `[recipe.<name>.inputs.<param>]` (`type` / `required` / `default` / `options` / `multiple` / `description`); `[[recipe.<name>.steps]]`; and `[recipe.<name>.outputs]` (`name = "<template>"`, resolved and projected into the result). JSON: `{ "schema_version", "recipe", "steps": N, "outputs": {…} }`; with `--dry-run`: `{ …, "dry_run": true, "steps": [ [argv…], … ] }`; `--list` → `{ "recipes": [ {name, description, inputs} ] }`.
+
+Example (`supersede`, seeded by `init` — replace a ticket with N successors):
+```
+tkt run supersede --arg id=auth --arg with=auth-api,auth-ui,auth-db
+  # 1. set --where 'dep:auth' --add-dependency auth-api,… --remove-dependency auth   (re-point every dependent)
+  # 2. set auth --add-related auth-api,…                                             (keep a trail)
+  # 3. close auth --reason superseded                                               (retire the original)
+```
 
 ## claim / release
 
