@@ -1,7 +1,7 @@
 ---
 id: docs-maintenance-advisories
 title: "docs: advisories, [maintenance] config, opt-outs, migrate --dry-run"
-status: todo
+status: done
 priority: p2
 dependencies: [update-check-advisory, drift-migrate-advisory, lint-summary-advisory, auto-migrate-apply]
 related: []

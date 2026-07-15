@@ -9,7 +9,7 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 
 ## Contents
 
-`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `run` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` (each is a `##` section below; the conventions that follow apply to all).
+`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `run` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` · `maintenance advisories` (each is a `##` section below; the conventions that follow apply to all).
 
 ## Conventions
 
@@ -306,8 +306,10 @@ ticketsplease guide
 
 ```
 ticketsplease states                       # list the effective workflow states + categories
+ticketsplease migrate [--dry-run]          # backfill managed frontmatter to the current schema
 ticketsplease migrate --remap old=new      # move tickets stranded in a renamed/removed state
 ```
+`migrate` (no args) backfills any managed frontmatter keys a hand-authored or older ticket is missing, bringing the board to the current schema, and repairs a stale project skill link. `--dry-run` reports what *would* change — the tickets that would migrate and whether the skill link would be repaired (`dry_run: true`, `skill_relink_needed`) — and writes nothing. JSON: `{ "schema_version", "dry_run", "migrated": [ids], "remapped": [ids], "unchanged", "skill_relinked", "skill_relink_needed" }`.
 By default a repo uses the built-in states (`todo`, `ready`, `in-progress`, `blocked`, `review`, `done`, `closed`). Define `[workflow.states]` in `ticketsplease.toml` to declare your own: each state's **name** is free, but it must pin to one engine **category** — `dispatchable` (pickable), `open` (occupies its scopes for the guard, blocks conflicting parallel work), `parked` (held, like `blocked`), or `terminal` (finished). A terminal state's `satisfies_dependents` bit *is* the done-vs-closed distinction (`true` unblocks dependents; `false` orphans them). The engine reasons on the category, never the name, so custom states schedule/guard/roll-up correctly and renaming a state (same category) never breaks anything. `set`/`create`/`reopen`/`watch --until` validate the status against this registry (an undefined state is exit 3). `states` JSON: `{ states: [{name, category, terminal, satisfies_dependents}], default, primary_open, primary_dropped, custom }`. When a config change removes/renames a state that live tickets still occupy, `lint` flags them `unknown-state` and `migrate --remap old=new` (repeatable) rewrites them.
 
 **Enforced transitions (opt-in).** With `[workflow] enforce_transitions = true` and a `[workflow.transitions]` adjacency map (`from = [to, …]`), `set`/`close`/`reopen` reject any move that is not a listed edge (a `Conflict`, exit 6). Off by default (any-to-any) — the engine's invariants ride on categories, not edges, so add a graph only when you need a gate. Escape hatches: a `"*"` source (e.g. `"*" = ["closed"]` to close from anywhere) and `--force` on `set`/`close`/`reopen` (records `forced` on the event). `claim`/`release` are engine transitions, never gated. Bulk `set --where … --status X` advances the legal matches and reports each illegal one as `{id, changed: false, skipped: "illegal-transition"}` rather than aborting. `lint` flags `unknown-transition-state` (an edge naming an undefined state) and, under enforcement, `dead-end-nonterminal` (a non-terminal state with no way out).
@@ -331,6 +333,16 @@ ticketsplease skill sync
 ticketsplease self-update [--version vX.Y.Z]
 ```
 The skill content lives once at a canonical per-user path (`$XDG_DATA_HOME/ticketsplease/skill`, version-stamped); each install is a **symlink** to it, so refreshing the canonical copy updates every linked project at once. `skill install` creates that symlink for the chosen **`--harness`** — every harness reads the identical `SKILL.md` + `references/` layout, only the directory differs: `claude` → `.claude/skills`, `codex` → `.agents/skills` (the cross-tool Agent Skills standard dir, also read by opencode and Pi), `opencode` → `.opencode/skills`, `pi-agent` → `.pi/skills`. Project installs are gitignored (they point at an absolute path); `--global` installs into the harness's user-global dir instead (`~/.claude/skills`, `~/.agents/skills`, `~/.config/opencode/skills`, `~/.pi/agent/skills`), available in every project. `--dir <path>` overrides the project directory (not valid with `--global`); `--copy` writes a committable real copy instead of a symlink. `skill sync` re-extracts the canonical copy from the running binary — the installer runs it after install/`self-update`, so upgraders get the new skill automatically; `doctor` warns (non-gating) if the canonical copy or a project link has drifted, and `migrate` repairs a stale project link. `self-update` replaces the binary in place from GitHub Releases.
+
+## maintenance advisories
+
+Interactive, stderr-only hints emitted **after** a command completes — an update is available, the repo has drifted, or the board has lint findings. They surface silent staleness and are **invisible to non-interactive use by construction**: shown only when stdout *and* stdin are a TTY, the format is human (never `--format json`), `CI` is unset, and `TICKETSPLEASE_NO_ADVISORIES` is unset. Nothing is ever written to stdout, and no advisory blocks or fails a command — so agents, CI, and JSON consumers never see one.
+
+- **update-available** — probes the latest GitHub release by following the `releases/latest` redirect with `curl` (no HTTP dependency, no API rate limit), cached at `$XDG_DATA_HOME/ticketsplease/update-check.json` and re-probed at most once per `check_interval_hours` (default 24), so the network is touched at most daily. When a newer version exists it names the delta and points to `tkt self-update`.
+- **drift → migrate** — offline: tickets whose managed frontmatter is behind the schema (a dry-run `migrate` count) and/or a stale project skill link. Nudges `run tkt migrate` — or, when opted in, auto-applies the repair.
+- **lint findings** — a count only, never the list and never a gate: `board has N lint finding(s) — run tkt lint`. This is the signal `doctor` (which does not lint) and `migrate` (which does not fix findings) miss.
+
+Configure under `[maintenance]` in `ticketsplease.toml`: `update_check` (bool, default true), `auto_migrate` (bool, default false), `check_interval_hours` (int, default 24). With `auto_migrate = true` — or the per-invocation `--auto-doctor` global flag — an interactive session **applies** the drift repair (frontmatter backfill + skill relink) instead of only nudging; it still never auto-writes in a JSON / CI / non-TTY run. Opt out of every advisory with `TICKETSPLEASE_NO_ADVISORIES=1`.
 
 ---
 

@@ -42,6 +42,8 @@ ticketsplease doctor      # verify setup: config, git repo + commit, scope globs
 
 After upgrading the binary, the installer refreshes the canonical skill; if `doctor` flags it as stale, run `ticketsplease skill sync` (and `ticketsplease migrate` to repair a project link). See `references/commands.md` → `skill`.
 
+**Maintenance advisories are human-only — you will never see them.** In an interactive human session the CLI may print a stderr hint after a command (an update is available, the repo drifted → `migrate`, the board has lint findings). They are gated off for every non-interactive caller — `--format json`, no TTY, or `CI` set — so they never touch your stdout or the JSON contract, and `TICKETSPLEASE_NO_ADVISORIES=1` disables them entirely. Config + opt-in auto-repair (`[maintenance]`, `--auto-doctor`): `references/commands.md` → `maintenance advisories`.
+
 Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents (collisions from that expansion are tagged `transitive` so you can triage them; `guard --direct-only`, or `[language] reverse_dep_expansion = false` for a repo default, skips it). Under-declaration is always file-based, so this expansion never causes a false "out of scope" on a shared foundational crate. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
 
 ## The orchestration loop (dispatching parallel work)
