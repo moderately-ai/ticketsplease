@@ -1,7 +1,7 @@
 ---
 id: lint-summary-advisory
 title: lint summary in the health nudge (the signal doctor/migrate miss)
-status: todo
+status: done
 priority: p2
 dependencies: [advisory-output-channel]
 related: [drift-migrate-advisory]

@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use ticketsplease_core::config::Maintenance;
-use ticketsplease_core::{migrate, Store};
+use ticketsplease_core::{lint, migrate, Store};
 
 use crate::format::Format;
 use crate::{skill, update_check};
@@ -80,8 +80,19 @@ fn collect(repo: &Path, store: Option<&Store>, maint: &Maintenance) -> Vec<Strin
         if let Some(line) = drift_advisory(repo, store) {
             lines.push(line);
         }
+        if let Some(line) = lint_summary(store) {
+            lines.push(line);
+        }
     }
     lines
+}
+
+/// Count the board's lint findings and, if any, point to `tkt lint`. A count only —
+/// never the list and never a gate. This is the signal `doctor`/`migrate` miss (a
+/// `paths-without-scopes` on an open ticket, a dangling link, an unknown scope).
+fn lint_summary(store: &Store) -> Option<String> {
+    let n = lint::lint(store).map(|d| d.len()).unwrap_or(0);
+    (n > 0).then(|| format!("board has {n} lint finding(s) — run `tkt lint`"))
 }
 
 /// Detect repo drift — cheaply and offline — and nudge to `migrate`: tickets whose

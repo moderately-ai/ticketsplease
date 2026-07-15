@@ -5438,3 +5438,53 @@ fn drift_advisory_nudges_to_migrate() {
         "a migrated board is silent"
     );
 }
+
+/// The lint-summary advisory reports a findings count (never the list) and points to
+/// `tkt lint`; silent on a clean board. (Update check pinned off to stay offline.)
+#[test]
+fn lint_summary_advisory_counts_findings() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    let stderr = || -> String {
+        let out = tkt(repo)
+            .args(["ready"])
+            .env_remove("CI")
+            .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+            .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+            .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    // A clean board -> no lint nudge.
+    assert!(
+        !stderr().contains("run `tkt lint`"),
+        "a clean board is silent"
+    );
+
+    // An open ticket declaring paths but no scopes is a lint finding.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "orphan",
+            "--title",
+            "O",
+            "--path",
+            "core/x.rs",
+        ])
+        .assert()
+        .success();
+    let err = stderr();
+    assert!(
+        err.contains("run `tkt lint`"),
+        "should nudge to lint: {err}"
+    );
+    assert!(
+        err.contains("1 lint finding"),
+        "should count findings: {err}"
+    );
+}
