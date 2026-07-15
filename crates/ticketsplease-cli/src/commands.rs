@@ -175,8 +175,8 @@ pub fn skill_sync(fmt: Format) -> Result<()> {
 
 /// Append `entry` to the repo's `.gitignore` if not already present (one line). Used
 /// for the local skill symlink, which points at an absolute path and must not be
-/// committed.
-fn ensure_gitignored(repo: &Path, entry: &str) -> Result<()> {
+/// committed. `pub(crate)` so the auto-migrate advisory can reuse the same relink hygiene.
+pub(crate) fn ensure_gitignored(repo: &Path, entry: &str) -> Result<()> {
     let path = repo.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == entry) {

@@ -29,7 +29,7 @@ const SMOKE: &str = "TICKETSPLEASE_ADVISORY_SMOKE";
 
 /// Run the advisory pass. Called once from `main`, after the command's output and
 /// exit code are settled. A no-op unless we are in an interactive human context.
-pub fn run(repo: &Path, fmt: Format) {
+pub fn run(repo: &Path, fmt: Format, auto_doctor: bool) {
     if !is_context(fmt) {
         return;
     }
@@ -41,7 +41,11 @@ pub fn run(repo: &Path, fmt: Format) {
         .as_ref()
         .map(|s| s.config.maintenance.clone())
         .unwrap_or_default();
-    emit(&collect(repo, store.as_ref(), &maint));
+    // Auto-apply drift repair when opted in — config knob or the per-invocation flag.
+    // Reachable only here, i.e. only in the interactive human context gated above; it
+    // can never fire in a JSON / CI / non-TTY / parallel run.
+    let apply = maint.auto_migrate || auto_doctor;
+    emit(&collect(repo, store.as_ref(), &maint, apply));
 }
 
 /// Whether advisories may be shown right now: an interactive human session only.
@@ -67,7 +71,7 @@ fn gates(fmt: Format, stdout_tty: bool, stdin_tty: bool, ci: bool, opted_out: bo
 
 /// Assemble the advisory lines from each source. Sources must be cheap and silent by
 /// default — they return nothing unless there is genuinely something to say.
-fn collect(repo: &Path, store: Option<&Store>, maint: &Maintenance) -> Vec<String> {
+fn collect(repo: &Path, store: Option<&Store>, maint: &Maintenance, apply: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if std::env::var_os(SMOKE).is_some() {
         lines.push("advisory-smoke: the advisory pipe is wired".to_string());
@@ -77,7 +81,7 @@ fn collect(repo: &Path, store: Option<&Store>, maint: &Maintenance) -> Vec<Strin
     }
     // Repo-scoped sources reuse the already-open store; skipped entirely outside a repo.
     if let Some(store) = store {
-        if let Some(line) = drift_advisory(repo, store) {
+        if let Some(line) = drift_advisory(repo, store, apply) {
             lines.push(line);
         }
         if let Some(line) = lint_summary(store) {
@@ -95,17 +99,46 @@ fn lint_summary(store: &Store) -> Option<String> {
     (n > 0).then(|| format!("board has {n} lint finding(s) — run `tkt lint`"))
 }
 
-/// Detect repo drift — cheaply and offline — and nudge to `migrate`: tickets whose
-/// managed frontmatter is behind the current schema (a dry-run migrate's would-change
-/// count) and/or a stale project skill link (a real copy or wrong link, not a symlink to
+/// Detect repo drift — cheaply and offline — and either nudge to `migrate` or, when
+/// `apply` is set (opted in via config/`--auto-doctor`), repair it in place and report
+/// what changed. Drift is: tickets whose managed frontmatter is behind the current
+/// schema, and/or a stale project skill link (a real copy or wrong link, not a symlink to
 /// the canonical copy). Silent when the board is current and the link is healthy.
-fn drift_advisory(repo: &Path, store: &Store) -> Option<String> {
-    let behind = migrate::migrate(store, true)
-        .map(|r| r.migrated.len())
-        .unwrap_or(0);
+///
+/// `apply` performs writes, so it is correct only because this function is reached solely
+/// from the interactive-human context gated in [`run`] — never in JSON / CI / non-TTY.
+fn drift_advisory(repo: &Path, store: &Store, apply: bool) -> Option<String> {
     let link_path = skill::project_path(repo, ".claude/skills");
     let link_stale =
         std::fs::symlink_metadata(&link_path).is_ok() && !skill::link_ok(repo, ".claude/skills");
+
+    if apply {
+        // Auto-repair: a real migrate (backfill) plus a relink if the link is stale.
+        let migrated = migrate::migrate(store, false)
+            .map(|r| r.migrated.len())
+            .unwrap_or(0);
+        let relinked = link_stale && {
+            skill::link_into(repo, ".claude/skills").is_ok() && {
+                let _ = crate::commands::ensure_gitignored(repo, ".claude/skills/ticketsplease");
+                true
+            }
+        };
+        if migrated == 0 && !relinked {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if migrated > 0 {
+            parts.push(format!("migrated {migrated} ticket(s)"));
+        }
+        if relinked {
+            parts.push("repaired the skill link".to_string());
+        }
+        return Some(format!("auto-migrate applied: {}", parts.join("; ")));
+    }
+
+    let behind = migrate::migrate(store, true)
+        .map(|r| r.migrated.len())
+        .unwrap_or(0);
     if behind == 0 && !link_stale {
         return None;
     }

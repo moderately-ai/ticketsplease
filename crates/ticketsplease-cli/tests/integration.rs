@@ -5488,3 +5488,80 @@ fn lint_summary_advisory_counts_findings() {
         "should count findings: {err}"
     );
 }
+
+/// auto-migrate (via `--auto-doctor` or `[maintenance] auto_migrate`) applies the drift
+/// repair in an interactive human session — and NEVER writes in a non-interactive / JSON
+/// run, even when the flag is set. The safety cases matter more than the happy path.
+#[test]
+fn auto_migrate_applies_only_in_interactive_context() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let legacy = repo.join("tickets/legacy.md");
+    let write_legacy = || {
+        std::fs::write(&legacy, "---\nid: legacy\ntitle: L\n---\nbody\n").unwrap();
+    };
+    let is_migrated = || {
+        std::fs::read_to_string(&legacy)
+            .unwrap()
+            .contains("status: todo")
+    };
+
+    // Safety: --auto-doctor in a non-interactive run (harness, no FORCE) must NOT write.
+    write_legacy();
+    tkt(repo)
+        .args(["ready", "--auto-doctor"])
+        .env_remove("CI")
+        .assert()
+        .success();
+    assert!(
+        !is_migrated(),
+        "must not auto-write outside an interactive context"
+    );
+
+    // Safety: JSON mode must NOT auto-write even when the TTY gates are forced.
+    tkt(repo)
+        .args(["ready", "--auto-doctor", "--format", "json"])
+        .env_remove("CI")
+        .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+        .assert()
+        .success();
+    assert!(!is_migrated(), "json mode must not auto-write");
+
+    // Forced interactive + --auto-doctor -> applies the backfill and reports it.
+    let out = tkt(repo)
+        .args(["ready", "--auto-doctor"])
+        .env_remove("CI")
+        .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+        .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+        .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("auto-migrate applied"),
+        "reports the apply: {err}"
+    );
+    assert!(
+        is_migrated(),
+        "forced interactive --auto-doctor applies the backfill"
+    );
+
+    // The `[maintenance] auto_migrate = true` config knob does the same, no flag needed.
+    write_legacy();
+    let cfg = repo.join("ticketsplease.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str("\n[maintenance]\nauto_migrate = true\n");
+    std::fs::write(&cfg, s).unwrap();
+    tkt(repo)
+        .args(["ready"])
+        .env_remove("CI")
+        .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+        .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0")
+        .assert()
+        .success();
+    assert!(
+        is_migrated(),
+        "[maintenance] auto_migrate = true applies the backfill"
+    );
+}

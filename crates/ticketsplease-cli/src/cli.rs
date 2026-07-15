@@ -24,6 +24,11 @@ pub struct Cli {
     /// Output format (human-readable by default; JSON is the stable contract).
     #[arg(long, global = true, value_enum, default_value = "human")]
     pub format: Format,
+    /// Auto-apply a detected drift repair (`migrate`) after this command instead of
+    /// only nudging — interactive human sessions only (never in JSON / CI / non-TTY).
+    /// A per-invocation form of `[maintenance] auto_migrate = true`.
+    #[arg(long = "auto-doctor", global = true)]
+    pub auto_doctor: bool,
     #[command(subcommand)]
     pub command: Command,
 }

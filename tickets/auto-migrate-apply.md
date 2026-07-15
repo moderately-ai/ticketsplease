@@ -1,7 +1,7 @@
 ---
 id: auto-migrate-apply
 title: "opt-in auto-migrate: apply drift repair in interactive sessions only"
-status: todo
+status: done
 priority: p2
 dependencies: [maintenance-config-table, drift-migrate-advisory]
 related: []
