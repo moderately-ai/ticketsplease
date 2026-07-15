@@ -1,7 +1,7 @@
 ---
 id: maintenance-advisories
 title: "EPIC: interactive maintenance advisories (update-check + drift/migrate nudge)"
-status: in-progress
+status: done
 priority: p1
 dependencies: []
 related: [advisory-output-channel, maintenance-config-table, migrate-dry-run, update-check-advisory, drift-migrate-advisory, lint-summary-advisory, auto-migrate-apply, docs-maintenance-advisories]
