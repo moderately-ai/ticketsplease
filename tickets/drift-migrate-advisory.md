@@ -1,7 +1,7 @@
 ---
 id: drift-migrate-advisory
 title: "drift advisory: detect schema/skill drift offline, nudge to migrate"
-status: todo
+status: done
 priority: p1
 dependencies: [advisory-output-channel, migrate-dry-run]
 related: []

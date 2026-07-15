@@ -11,10 +11,11 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use ticketsplease_core::config::{Config, Maintenance};
+use ticketsplease_core::config::Maintenance;
+use ticketsplease_core::{migrate, Store};
 
 use crate::format::Format;
-use crate::update_check;
+use crate::{skill, update_check};
 
 /// Suppress every advisory (honours the common "no update notifier" convention).
 const OPT_OUT: &str = "TICKETSPLEASE_NO_ADVISORIES";
@@ -32,12 +33,15 @@ pub fn run(repo: &Path, fmt: Format) {
     if !is_context(fmt) {
         return;
     }
-    // Load the repo's maintenance settings if we are in one; otherwise defaults (the
-    // update-check is about the binary, not any particular repo).
-    let maint = Config::load(repo)
-        .map(|c| c.maintenance)
+    // Open the repo once, if we are in one: repo-scoped sources (drift) reuse the store,
+    // and its config carries the maintenance settings. Outside a repo only the
+    // binary-level update-check runs, with default settings.
+    let store = Store::open(repo).ok();
+    let maint = store
+        .as_ref()
+        .map(|s| s.config.maintenance.clone())
         .unwrap_or_default();
-    emit(&collect(&maint));
+    emit(&collect(repo, store.as_ref(), &maint));
 }
 
 /// Whether advisories may be shown right now: an interactive human session only.
@@ -63,7 +67,7 @@ fn gates(fmt: Format, stdout_tty: bool, stdin_tty: bool, ci: bool, opted_out: bo
 
 /// Assemble the advisory lines from each source. Sources must be cheap and silent by
 /// default — they return nothing unless there is genuinely something to say.
-fn collect(maint: &Maintenance) -> Vec<String> {
+fn collect(repo: &Path, store: Option<&Store>, maint: &Maintenance) -> Vec<String> {
     let mut lines = Vec::new();
     if std::env::var_os(SMOKE).is_some() {
         lines.push("advisory-smoke: the advisory pipe is wired".to_string());
@@ -71,7 +75,40 @@ fn collect(maint: &Maintenance) -> Vec<String> {
     if let Some(line) = update_check::advisory(maint) {
         lines.push(line);
     }
+    // Repo-scoped sources reuse the already-open store; skipped entirely outside a repo.
+    if let Some(store) = store {
+        if let Some(line) = drift_advisory(repo, store) {
+            lines.push(line);
+        }
+    }
     lines
+}
+
+/// Detect repo drift — cheaply and offline — and nudge to `migrate`: tickets whose
+/// managed frontmatter is behind the current schema (a dry-run migrate's would-change
+/// count) and/or a stale project skill link (a real copy or wrong link, not a symlink to
+/// the canonical copy). Silent when the board is current and the link is healthy.
+fn drift_advisory(repo: &Path, store: &Store) -> Option<String> {
+    let behind = migrate::migrate(store, true)
+        .map(|r| r.migrated.len())
+        .unwrap_or(0);
+    let link_path = skill::project_path(repo, ".claude/skills");
+    let link_stale =
+        std::fs::symlink_metadata(&link_path).is_ok() && !skill::link_ok(repo, ".claude/skills");
+    if behind == 0 && !link_stale {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if behind > 0 {
+        parts.push(format!("{behind} ticket(s) need migration"));
+    }
+    if link_stale {
+        parts.push("the skill link is stale".to_string());
+    }
+    Some(format!(
+        "repo drifted: {} — run `tkt migrate`",
+        parts.join("; ")
+    ))
 }
 
 /// Emit advisory lines to stderr (never stdout). No-op when empty.

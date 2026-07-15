@@ -5237,7 +5237,9 @@ fn advisories_are_gated_to_interactive_human_context() {
         cmd.args(args)
             .env_remove("CI")
             .env_remove("TICKETSPLEASE_NO_ADVISORIES")
-            .env("TICKETSPLEASE_ADVISORY_SMOKE", "1");
+            .env("TICKETSPLEASE_ADVISORY_SMOKE", "1")
+            // Pin the update check to "nothing newer" so this test never probes the network.
+            .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0");
         for (k, v) in extra {
             cmd.env(k, v);
         }
@@ -5387,5 +5389,52 @@ fn update_check_advisory_notifies_when_newer() {
     assert!(
         !err.contains("self-update"),
         "update_check = false must suppress the notice: {err}"
+    );
+}
+
+/// The drift advisory nudges to `migrate` when a ticket is behind the schema, and goes
+/// silent once the board is current. (The update check is pinned off to stay offline.)
+#[test]
+fn drift_advisory_nudges_to_migrate() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    let stderr = || -> String {
+        let out = tkt(repo)
+            .args(["ready"])
+            .env_remove("CI")
+            .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+            .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+            .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    // A clean board -> no drift nudge.
+    assert!(
+        !stderr().contains("run `tkt migrate`"),
+        "a current board is silent"
+    );
+
+    // A hand-authored ticket missing managed keys -> a drift nudge on stderr.
+    std::fs::write(
+        repo.join("tickets/legacy.md"),
+        "---\nid: legacy\ntitle: L\n---\nbody\n",
+    )
+    .unwrap();
+    let err = stderr();
+    assert!(
+        err.contains("run `tkt migrate`"),
+        "should nudge to migrate: {err}"
+    );
+    assert!(err.contains("need migration"), "should count drift: {err}");
+
+    // After migrating, the drift is resolved and the nudge stops.
+    tkt(repo).args(["migrate"]).assert().success();
+    assert!(
+        !stderr().contains("run `tkt migrate`"),
+        "a migrated board is silent"
     );
 }
