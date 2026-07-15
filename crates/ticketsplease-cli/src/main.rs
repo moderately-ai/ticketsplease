@@ -1,5 +1,6 @@
 //! ticketsplease — git-native parallel-work ticketing CLI.
 
+mod advisory;
 mod cli;
 mod commands;
 mod format;
@@ -17,7 +18,7 @@ use crate::format::Format;
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     let fmt = cli.format;
-    match cli::run(cli) {
+    let code = match cli::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Errors go to stderr so stdout stays a clean result channel. In JSON
@@ -35,5 +36,9 @@ fn main() -> ExitCode {
             }
             ExitCode::from(err.exit_code() as u8)
         }
-    }
+    };
+    // Maintenance advisories run last, after the command's output and exit code are
+    // settled — stderr-only, and a no-op outside an interactive human session.
+    advisory::run(fmt);
+    code
 }

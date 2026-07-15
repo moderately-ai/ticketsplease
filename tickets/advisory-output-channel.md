@@ -1,7 +1,7 @@
 ---
 id: advisory-output-channel
 title: "advisory output channel: strictly-gated, stderr-only, agent-invisible"
-status: todo
+status: done
 priority: p1
 dependencies: []
 related: []

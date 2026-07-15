@@ -5220,3 +5220,63 @@ fn enforced_dead_end_state_is_linted() {
         .any(|d| d["code"] == "dead-end-nonterminal"
             && d["message"].as_str().unwrap().contains("review")));
 }
+
+/// Maintenance advisories are gated to an interactive human session: forced on they
+/// appear on stderr, but json / CI / opt-out / a non-TTY each suppress them — and an
+/// advisory never touches stdout (the parseable data channel).
+#[test]
+fn advisories_are_gated_to_interactive_human_context() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    // Run `ready` with the smoke source on and a clean advisory env, plus `extra`
+    // overrides; return (on_stderr, on_stdout) for the smoke marker.
+    let smoke = |extra: &[(&str, &str)], args: &[&str]| -> (bool, bool) {
+        let mut cmd = tkt(repo);
+        cmd.args(args)
+            .env_remove("CI")
+            .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+            .env("TICKETSPLEASE_ADVISORY_SMOKE", "1");
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            String::from_utf8_lossy(&out.stderr).contains("advisory-smoke"),
+            String::from_utf8_lossy(&out.stdout).contains("advisory-smoke"),
+        )
+    };
+
+    // Forced interactive + human -> shows on stderr, never on stdout.
+    let (err, out) = smoke(&[("TICKETSPLEASE_ADVISORY_FORCE", "1")], &["ready"]);
+    assert!(
+        err,
+        "forced human context should show the advisory on stderr"
+    );
+    assert!(!out, "advisories must never touch stdout");
+
+    // Each of json / CI / opt-out suppresses even when the TTY gates are forced.
+    let (err, _) = smoke(
+        &[("TICKETSPLEASE_ADVISORY_FORCE", "1")],
+        &["ready", "--format", "json"],
+    );
+    assert!(!err, "json mode must suppress advisories");
+    let (err, _) = smoke(
+        &[("TICKETSPLEASE_ADVISORY_FORCE", "1"), ("CI", "1")],
+        &["ready"],
+    );
+    assert!(!err, "CI must suppress advisories");
+    let (err, _) = smoke(
+        &[
+            ("TICKETSPLEASE_ADVISORY_FORCE", "1"),
+            ("TICKETSPLEASE_NO_ADVISORIES", "1"),
+        ],
+        &["ready"],
+    );
+    assert!(!err, "opt-out must suppress advisories");
+
+    // Not forced and not a TTY (the test harness) -> suppressed.
+    let (err, _) = smoke(&[], &["ready"]);
+    assert!(!err, "a non-TTY run must suppress advisories");
+}
