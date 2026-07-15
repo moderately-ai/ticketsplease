@@ -173,9 +173,14 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                 // conflict math and will be co-scheduled with work that rewrites the same
                 // files. A scope-less, path-less ticket (decision/epic) is legitimate and
                 // stays clean — only the "declared file intent, forgot scopes" shape trips.
+                // Terminal tickets (done/closed) are exempt: `tracks` partitions only the
+                // ready set, so a finished ticket can never be co-scheduled and the message
+                // would be untrue. An unknown status is *not* terminal (`UNKNOWN` is parked),
+                // so it keeps tripping — and is flagged `unknown-state` besides.
                 if !ticket.paths.is_empty()
                     && ticket.scopes.is_empty()
                     && ticket.shared_scopes.is_empty()
+                    && !registry.class(&ticket.status).is_terminal()
                 {
                     diags.push(Diagnostic {
                         file: file.clone(),

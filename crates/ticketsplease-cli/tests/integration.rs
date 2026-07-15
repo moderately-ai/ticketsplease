@@ -2216,6 +2216,85 @@ fn lint_flags_paths_without_scopes() {
     );
 }
 
+/// paths-without-scopes is exempt for terminal (done/closed) tickets — `tracks`
+/// partitions only the ready set, so a finished ticket can never be co-scheduled and
+/// the message would be untrue. A dispatchable ticket in the same shape still trips.
+#[test]
+fn lint_paths_without_scopes_exempts_terminal_tickets() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // done + closed, declaring paths and no scopes: must NOT be flagged.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "shipped",
+            "--title",
+            "S",
+            "--path",
+            "core/a.rs",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "shipped", "--status", "done"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "cancelled",
+            "--title",
+            "C",
+            "--path",
+            "core/b.rs",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["close", "cancelled", "--reason", "duplicate"])
+        .assert()
+        .success();
+    // A dispatchable (todo) ticket of the same shape is the control: it still trips.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "active",
+            "--title",
+            "A",
+            "--path",
+            "core/c.rs",
+        ])
+        .assert()
+        .success();
+
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the todo control still trips -> exit 3"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let flagged: Vec<&str> = v["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["code"] == "paths-without-scopes")
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        flagged,
+        vec!["active"],
+        "only the dispatchable ticket trips; done/closed are exempt: {v}"
+    );
+}
+
 /// `why x x` is a usage error, not a ticket trivially conflicting with itself.
 #[test]
 fn why_rejects_comparing_a_ticket_to_itself() {

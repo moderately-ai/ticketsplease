@@ -1,7 +1,7 @@
 ---
 id: paths-without-scopes-should-skip-terminal-tickets
 title: paths-without-scopes fires on done/closed tickets, where its own claim is false
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: [lint-a-ticket-that-declares-paths-but-no-scopes]
