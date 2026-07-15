@@ -16,9 +16,9 @@ Some users want drift auto-repaired rather than merely flagged.
 
 When `[maintenance] auto_migrate = true` **and** in advisory context, run a real `migrate` instead of only warning, then print what changed. This must **never** fire in JSON / CI / non-TTY / parallel contexts — `migrate` writes ticket files and the skill link, and would race concurrent workers or dirty a branch mid-dispatch.
 
-## Open question (pending owner decision)
+## Decision
 
-Config-gated only (recommended — a per-invocation flag is easy to forget), or also a per-command `--auto-doctor` / `--auto-migrate` override?
+**Both surfaces:** the `[maintenance] auto_migrate` config knob (durable) **and** a per-command `--auto-doctor` override flag. The flag wins for that one invocation. Both are still hard-gated to interactive human context — neither auto-writes in JSON/CI/non-TTY/parallel runs. (Naming: `--auto-doctor` is the requested name even though `migrate` is what applies; keep the familiar name, note internally that it runs migrate.)
 
 ## Done when
 

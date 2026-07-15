@@ -16,9 +16,9 @@ The actual hazard the 6-repo sweep found — 23 + 5 `paths-without-scopes` ticke
 
 In advisory context, run lint once and, if findings > 0, emit a **count only** (not the list, never a gate): `board has N lint finding(s) — run `tkt lint``. Reuse the existing lint pass; a single run is cheap enough.
 
-## Open question (pending owner decision)
+## Decision
 
-Include this at all, or keep the health nudge drift-only? Kept as a separate ticket so it can be dropped cleanly if drift-only is chosen.
+**Included.** The health nudge surfaces both drift and a lint-findings count — this is the signal `doctor`/`migrate` miss and the one the 6-repo sweep actually turned up.
 
 ## Done when
 
