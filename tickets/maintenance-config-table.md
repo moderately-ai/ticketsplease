@@ -1,7 +1,7 @@
 ---
 id: maintenance-config-table
 title: "config: [maintenance] table (update_check, auto_migrate, check_interval_hours)"
-status: todo
+status: done
 priority: p1
 dependencies: []
 related: []

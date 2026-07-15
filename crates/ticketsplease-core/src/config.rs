@@ -57,6 +57,9 @@ pub struct Config {
     /// Guard behaviour: whether a declared-area overlap with an open sibling gates.
     #[serde(default)]
     pub guard: Guard,
+    /// Maintenance-advisory behaviour (update-check, drift auto-migrate, cadence).
+    #[serde(default)]
+    pub maintenance: Maintenance,
     /// Named recipes: typed, parameterized procedures over the tool's own subcommands,
     /// registered inline as `[recipe.<name>]` (also discoverable as
     /// `.ticketsplease/recipes/<name>.toml`). Run with `tkt run <name>`. Distinct from
@@ -158,6 +161,37 @@ pub struct Guard {
     /// (or pass `--strict` per-invocation) to restore hard-fail-on-overlap.
     #[serde(default)]
     pub gate_collisions: bool,
+}
+
+/// Maintenance-advisory configuration (`[maintenance]`): the interactive, stderr-only
+/// hints emitted after a command (an update is available, the repo drifted → `migrate`,
+/// the board has lint findings). These knobs only tune *what* is offered to an
+/// interactive human; the strict gating elsewhere means agents / CI / JSON never see
+/// an advisory or auto-write regardless of these values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Maintenance {
+    /// Check for a newer release and passively notify. Default true. The probe is
+    /// cached (`check_interval_hours`) and only ever runs in an interactive session.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
+    /// Auto-apply a detected drift repair (`migrate`) in an interactive session
+    /// instead of only nudging. Default false. Never auto-writes in JSON / CI /
+    /// non-TTY / parallel contexts, whatever this is set to.
+    #[serde(default)]
+    pub auto_migrate: bool,
+    /// Minimum hours between update-check network probes. Default 24.
+    #[serde(default = "default_check_interval")]
+    pub check_interval_hours: u64,
+}
+
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            update_check: true,
+            auto_migrate: false,
+            check_interval_hours: 24,
+        }
+    }
 }
 
 /// A recipe: a named, typed, parameterized procedure over the tool's own subcommands
@@ -299,6 +333,7 @@ impl Default for Config {
             scope_policy: BTreeMap::new(),
             workflow: Workflow::default(),
             guard: Guard::default(),
+            maintenance: Maintenance::default(),
             recipes: BTreeMap::new(),
         }
     }
@@ -345,6 +380,10 @@ fn default_weight() -> i64 {
     1
 }
 
+fn default_check_interval() -> u64 {
+    24
+}
+
 fn default_tickets_dir() -> String {
     DEFAULT_TICKETS_DIR.to_string()
 }
@@ -368,6 +407,27 @@ mod tests {
         // An entry that omits `weight` defaults to 1.
         let c2: Config = toml::from_str("[scope_policy]\ncore = {}\n").unwrap();
         assert_eq!(c2.scope_weights().get("core"), Some(&1));
+    }
+
+    #[test]
+    fn maintenance_table_defaults_and_parses() {
+        // Guards the manual `Default` impl: a derived one would give false/false/0.
+        let d = Config::default().maintenance;
+        assert!(d.update_check);
+        assert!(!d.auto_migrate);
+        assert_eq!(d.check_interval_hours, 24);
+        // An absent table (empty config) still yields the defaults.
+        let omitted: Config = toml::from_str("").unwrap();
+        assert!(omitted.maintenance.update_check);
+        assert_eq!(omitted.maintenance.check_interval_hours, 24);
+        // Explicit overrides parse.
+        let c: Config = toml::from_str(
+            "[maintenance]\nupdate_check = false\nauto_migrate = true\ncheck_interval_hours = 6\n",
+        )
+        .unwrap();
+        assert!(!c.maintenance.update_check);
+        assert!(c.maintenance.auto_migrate);
+        assert_eq!(c.maintenance.check_interval_hours, 6);
     }
 
     #[test]
