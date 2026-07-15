@@ -2170,6 +2170,52 @@ fn lint_flags_unknown_scope_reference() {
     );
 }
 
+/// lint flags a ticket that declares `paths` but no scopes — it is invisible to the
+/// scheduler's conflict math — while a scope-less, path-less decision ticket stays clean.
+#[test]
+fn lint_flags_paths_without_scopes() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // Declares file intent via `paths` but no scope: `tracks`/`why` cannot see it.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "orphan-paths",
+            "--title",
+            "T",
+            "--path",
+            "crates/core/parser.rs",
+        ])
+        .assert()
+        .success();
+    // A scope-less *and* path-less ticket (decision/epic) declares no file intent.
+    tkt(repo)
+        .args(["create", "--id", "decision", "--title", "D"])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "paths-without-scopes is exit 3");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let diags = v["diagnostics"].as_array().unwrap();
+    assert!(
+        diags
+            .iter()
+            .any(|d| d["code"] == "paths-without-scopes" && d["id"] == "orphan-paths"),
+        "paths-without-scopes should be flagged: {v}"
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d["code"] == "paths-without-scopes" && d["id"] == "decision"),
+        "a path-less, scope-less ticket must stay clean: {v}"
+    );
+}
+
 /// `why x x` is a usage error, not a ticket trivially conflicting with itself.
 #[test]
 fn why_rejects_comparing_a_ticket_to_itself() {
@@ -2607,6 +2653,54 @@ fn rename_moves_file_and_repoints_dependents() {
     tkt(repo).args(["lint"]).assert().success();
     let dep = std::fs::read_to_string(repo.join("tickets/dependent.md")).unwrap();
     assert!(dep.contains("dependencies: [new]"));
+}
+
+/// rename repoints `related` edges too, not just dependencies — leaving a `related`
+/// pointing at the old id would manufacture the `missing-related` lint it then reports.
+/// A ticket holding *both* edge kinds to the renamed id is repointed once, reported once.
+#[test]
+fn rename_repoints_related_and_dependency_edges() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "alpha", "--title", "Alpha"])
+        .assert()
+        .success();
+    // beta both depends on and relates to alpha — the "both edges to one target" case.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "beta",
+            "--title",
+            "Beta",
+            "--depends-on",
+            "alpha",
+            "--related",
+            "alpha",
+        ])
+        .assert()
+        .success();
+    let out = tkt(repo)
+        .args(["rename", "alpha", "alpha-renamed", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Union semantics: beta holds both edges but is reported exactly once, not per-edge.
+    let repointed = v["repointed"].as_array().unwrap();
+    assert_eq!(repointed.len(), 1, "beta repointed once, not per edge: {v}");
+    assert_eq!(repointed[0], "beta");
+    // Both edges now point at the new id.
+    let beta = std::fs::read_to_string(repo.join("tickets/beta.md")).unwrap();
+    assert!(
+        beta.contains("dependencies: [alpha-renamed]"),
+        "dep: {beta}"
+    );
+    assert!(beta.contains("related: [alpha-renamed]"), "related: {beta}");
+    // No dangling `related`, so lint is clean immediately after the rename.
+    tkt(repo).args(["lint"]).assert().success();
 }
 
 /// doctor passes in a configured git repo and fails (cleanly) without git.

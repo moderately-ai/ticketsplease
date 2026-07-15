@@ -3512,15 +3512,27 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
     ticket.set_id(&args.new)?;
     store.create_exact(&args.new, &ticket.render())?;
 
-    // Repoint every ticket that depended on the old id.
+    // Repoint every ticket that referenced the old id — dependency *and* related
+    // edges (a dangling `related` is a `missing-related` lint, so leaving it behind
+    // manufactures the very violation lint then reports). A ticket holding both edge
+    // kinds to the old id is saved once and reported once (union semantics).
     let mut repointed = Vec::new();
     for mut t in store.load_all()? {
         if t.id == args.new {
             continue;
         }
+        let mut changed = false;
         if t.dependencies.iter().any(|d| d == &args.old) {
             t.remove_dependency(&args.old)?;
             t.add_dependency(&args.new)?;
+            changed = true;
+        }
+        if t.related.iter().any(|r| r == &args.old) {
+            t.remove_related(&args.old)?;
+            t.add_related(&args.new)?;
+            changed = true;
+        }
+        if changed {
             store.save(&t)?;
             repointed.push(t.id.clone());
         }
@@ -3543,7 +3555,9 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
         Format::Human => {
             println!("Renamed `{}` -> `{}`", args.old, args.new);
             if !repointed.is_empty() {
-                println!("  repointed dependents: {}", repointed.join(", "));
+                // "references", not "dependents": a ticket repointed only on its
+                // `related` edge is not a dependent.
+                println!("  repointed references: {}", repointed.join(", "));
             }
             Ok(())
         }

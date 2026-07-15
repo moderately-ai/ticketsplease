@@ -1,7 +1,7 @@
 ---
 id: lint-a-ticket-that-declares-paths-but-no-scopes
 title: lint should flag a ticket that declares paths but no scopes — the scheduler cannot see it
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: []

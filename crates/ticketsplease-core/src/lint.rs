@@ -19,10 +19,10 @@ pub struct Diagnostic {
     /// The ticket id, when parseable.
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
-    /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `duplicate-id`
-    /// | `unknown-state` | `state-coverage` | `unknown-transition-state` |
-    /// `dead-end-nonterminal` | `stale-resolution` | `missing-dep` | `missing-related` |
-    /// `cycle`.
+    /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` |
+    /// `paths-without-scopes` | `duplicate-id` | `unknown-state` | `state-coverage` |
+    /// `unknown-transition-state` | `dead-end-nonterminal` | `stale-resolution` |
+    /// `missing-dep` | `missing-related` | `orphaned-by-closed-dep` | `cycle`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -166,6 +166,26 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                             ),
                         });
                     }
+                }
+                // `paths` looks like a file-intent declaration but only `guard` reads it;
+                // the scheduler (`tracks`/`why`/`lanes`/`next`) gates purely on scope
+                // names. A ticket with paths and no scopes is therefore invisible to the
+                // conflict math and will be co-scheduled with work that rewrites the same
+                // files. A scope-less, path-less ticket (decision/epic) is legitimate and
+                // stays clean — only the "declared file intent, forgot scopes" shape trips.
+                if !ticket.paths.is_empty()
+                    && ticket.scopes.is_empty()
+                    && ticket.shared_scopes.is_empty()
+                {
+                    diags.push(Diagnostic {
+                        file: file.clone(),
+                        id: Some(ticket.id.clone()),
+                        code: "paths-without-scopes",
+                        message: "declares paths but no scopes: `tracks`/`why` cannot see this \
+                                  ticket and will co-schedule it with work that rewrites the same \
+                                  files (add a `scopes` entry, or `shared_scopes` for additive work)"
+                            .to_string(),
+                    });
                 }
                 // A state the registry doesn't define (a typo, or a state removed from
                 // config that a ticket still occupies). The engine treats it as inert.

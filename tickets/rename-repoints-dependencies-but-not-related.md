@@ -1,7 +1,7 @@
 ---
 id: rename-repoints-dependencies-but-not-related
 title: rename repoints dependencies but not related, so it creates the dangling link lint then reports
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: []

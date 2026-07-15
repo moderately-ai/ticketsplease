@@ -98,6 +98,8 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 
 Claim a scope in one of two modes so you needn't single-thread on benign clashes: `scopes` is an **exclusive** (rewrite) claim, `shared_scopes` is a **shared/additive** (append/extend) one. Two shared claims on a scope co-run; any exclusive claim blocks any other claim on that scope. On top of that, `--max-overlap K` on `tracks`/`next`/`lanes` tolerates clashes up to a per-pair cost budget so you fill N workers least-riskily instead of idling them.
 
+**Batching keys on scope names, never on `paths`.** The scheduler — `tracks`, `why`, `lanes`, `next` — reasons purely about `scopes`/`shared_scopes`. The `paths` field is read *only* by `guard` (as an under-declaration allowance); it looks like a file-intent declaration but does not feed the conflict math. A ticket that declares `paths` but no scopes is therefore **invisible to batching** and will be co-scheduled with work that rewrites the same files — so always give a ticket a `scope`, not just `paths`. `lint` flags the omission as `paths-without-scopes`.
+
 For the full tuning playbook — scope weights (`[scope_policy]`), the escape hatches, sequencing conflicts with `lanes`, and how the guard honours all of it — read `references/parallel-workflow.md`.
 
 ## Creating and editing tickets
@@ -109,7 +111,7 @@ ticketsplease create --from backlog.toml    # batch from a JSON array or TOML [[
 ticketsplease set <id> --status in-progress --add-scope core --add-dependency other
 ticketsplease set --where 'tag:epic' --add-tag ready-soon   # bulk-edit every match (field edits only, not title/body)
 ticketsplease link <id> (--depends-on <o> | --related <o>)  # depends-on cycle → exit 5; related is non-blocking, never cycle-checked
-ticketsplease rename <old> <new>            # moves the file, rewrites the id, repoints dependents
+ticketsplease rename <old> <new>            # moves the file, rewrites the id, repoints references (dependency + related edges)
 ticketsplease delete <id>                   # remove a ticket (git keeps history)
 ticketsplease lint        # validate schema, scope refs, links, and cycles (exit 3 / 5 on problems)
 ```
