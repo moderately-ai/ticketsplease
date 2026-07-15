@@ -21,9 +21,10 @@ pub struct MigrateReport {
     pub unchanged: usize,
 }
 
-/// Migrate every ticket in the store. Files are rewritten atomically, and only
-/// when a step actually changes them.
-pub fn migrate(store: &Store) -> Result<MigrateReport> {
+/// Migrate every ticket in the store. Files are rewritten atomically, and only when a
+/// step actually changes them. With `dry_run`, nothing is written — the report still
+/// lists the tickets that *would* be migrated, so callers can preview or detect drift.
+pub fn migrate(store: &Store, dry_run: bool) -> Result<MigrateReport> {
     let mut migrated = Vec::new();
     let mut unchanged = 0;
     for path in store.ticket_files()? {
@@ -33,7 +34,9 @@ pub fn migrate(store: &Store) -> Result<MigrateReport> {
         backfill_managed_keys(&mut doc)?;
         let after = doc.render();
         if after != before {
-            store::write_atomic(&path, &after)?;
+            if !dry_run {
+                store::write_atomic(&path, &after)?;
+            }
             let id = path
                 .file_stem()
                 .and_then(|s| s.to_str())

@@ -5280,3 +5280,52 @@ fn advisories_are_gated_to_interactive_human_context() {
     let (err, _) = smoke(&[], &["ready"]);
     assert!(!err, "a non-TTY run must suppress advisories");
 }
+
+/// migrate --dry-run reports what *would* change but writes nothing; a real migrate
+/// then applies the same set, and a follow-up dry run is a clean no-op.
+#[test]
+fn migrate_dry_run_previews_without_writing() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    // A hand-authored ticket missing the managed keys (status/priority/lists) -> would migrate.
+    let path = repo.join("tickets/legacy.md");
+    std::fs::write(&path, "---\nid: legacy\ntitle: Legacy\n---\nbody\n").unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    // Dry run: reports it as would-migrate with dry_run true, but leaves the file byte-identical.
+    let out = tkt(repo)
+        .args(["migrate", "--dry-run", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], serde_json::json!(true));
+    assert_eq!(v["migrated"], serde_json::json!(["legacy"]));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        before,
+        "a dry run must not write"
+    );
+
+    // Real migrate: writes the backfilled keys.
+    let out = tkt(repo)
+        .args(["migrate", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], serde_json::json!(false));
+    assert_eq!(v["migrated"], serde_json::json!(["legacy"]));
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_ne!(after, before, "a real migrate writes");
+    assert!(after.contains("status: todo"), "backfilled status: {after}");
+
+    // Idempotent: a second dry run now finds nothing to do.
+    let out = tkt(repo)
+        .args(["migrate", "--dry-run", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["migrated"], serde_json::json!([]));
+}

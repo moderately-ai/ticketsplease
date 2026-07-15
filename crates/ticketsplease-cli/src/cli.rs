@@ -761,6 +761,11 @@ pub struct MigrateArgs {
     /// config change renames or drops a state that live tickets still occupy.
     #[arg(long = "remap", value_name = "OLD=NEW")]
     pub remap: Vec<String>,
+    /// Preview the migration without writing: report what *would* change (tickets
+    /// backfilled/remapped, and whether the skill link would be repaired) and leave
+    /// every file untouched.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 /// `tracks` arguments.

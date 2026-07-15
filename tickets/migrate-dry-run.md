@@ -1,7 +1,7 @@
 ---
 id: migrate-dry-run
 title: "migrate --dry-run: preview without writing (fills a real gap)"
-status: todo
+status: done
 priority: p1
 dependencies: []
 related: []

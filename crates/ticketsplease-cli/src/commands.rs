@@ -2516,6 +2516,7 @@ pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
         }
         remaps.push((old.trim().to_ascii_lowercase(), new));
     }
+    let dry_run = args.dry_run;
     let mut remapped: Vec<String> = Vec::new();
     for mut ticket in store.load_all()? {
         if let Some((_, new)) = remaps
@@ -2523,17 +2524,21 @@ pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
             .find(|(old, _)| ticket.status.eq_ignore_ascii_case(old))
         {
             ticket.set_status(new, &registry)?;
-            store.save(&ticket)?;
+            if !dry_run {
+                store.save(&ticket)?;
+            }
             remapped.push(ticket.id.clone());
         }
     }
     remapped.sort();
-    let report = migrate_core::migrate(&store)?;
-    // Repair the project skill link if it exists but is stale, and refresh canonical.
+    let report = migrate_core::migrate(&store, dry_run)?;
+    // The project skill link is stale when it exists but is not a symlink to the
+    // canonical copy (a real copy, or a wrong link). Repair it — unless this is a
+    // dry run, in which case we only report that it would be repaired.
     let link_path = skill::project_path(repo, ".claude/skills");
-    let skill_relinked = if std::fs::symlink_metadata(&link_path).is_ok()
-        && !skill::link_ok(repo, ".claude/skills")
-    {
+    let skill_relink_needed =
+        std::fs::symlink_metadata(&link_path).is_ok() && !skill::link_ok(repo, ".claude/skills");
+    let skill_relinked = if skill_relink_needed && !dry_run {
         skill::link_into(repo, ".claude/skills")?;
         ensure_gitignored(repo, ".claude/skills/ticketsplease")?;
         true
@@ -2543,30 +2548,39 @@ pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
+            "dry_run": dry_run,
             "migrated": report.migrated,
             "remapped": remapped,
             "unchanged": report.unchanged,
             "skill_relinked": skill_relinked,
+            "skill_relink_needed": skill_relink_needed,
         })),
         Format::Human => {
+            if dry_run {
+                println!("DRY RUN — no files written");
+            }
             if report.migrated.is_empty() {
                 println!("All {} ticket(s) already current", report.unchanged);
             } else {
                 println!(
-                    "Migrated {} ticket(s): {}",
+                    "{} {} ticket(s): {}",
+                    if dry_run { "Would migrate" } else { "Migrated" },
                     report.migrated.len(),
                     report.migrated.join(", ")
                 );
             }
             if !remapped.is_empty() {
                 println!(
-                    "Remapped {} ticket(s): {}",
+                    "{} {} ticket(s): {}",
+                    if dry_run { "Would remap" } else { "Remapped" },
                     remapped.len(),
                     remapped.join(", ")
                 );
             }
             if skill_relinked {
                 println!("Repaired the project skill link to the canonical copy");
+            } else if skill_relink_needed {
+                println!("Would repair the project skill link to the canonical copy");
             }
             Ok(())
         }
