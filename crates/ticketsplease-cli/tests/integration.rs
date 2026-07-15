@@ -5329,3 +5329,63 @@ fn migrate_dry_run_previews_without_writing() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["migrated"], serde_json::json!([]));
 }
+
+/// The update-check advisory: with the latest-version override (no network), a forced
+/// interactive run notifies when the override is newer, and stays silent when it is not
+/// newer or when `[maintenance] update_check = false`. Never touches stdout.
+#[test]
+fn update_check_advisory_notifies_when_newer() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    // Run `ready` with the update-latest override (so no network) in a forced
+    // interactive human context; return (stderr, stdout).
+    let run = |latest: &str| -> (String, String) {
+        let out = tkt(repo)
+            .args(["ready"])
+            .env_remove("CI")
+            .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+            .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+            .env("TICKETSPLEASE_UPDATE_LATEST", latest)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stderr).to_string(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
+    };
+
+    // A newer version -> a self-update nudge naming the delta, on stderr only.
+    let (err, out) = run("999.0.0");
+    assert!(
+        err.contains("self-update"),
+        "should nudge to self-update: {err}"
+    );
+    assert!(
+        err.contains("999.0.0"),
+        "should name the newer version: {err}"
+    );
+    assert!(
+        !out.contains("self-update"),
+        "advisory must never touch stdout"
+    );
+
+    // Not newer -> silent.
+    let (err, _) = run("0.0.1");
+    assert!(
+        !err.contains("self-update"),
+        "an older/equal latest must not notify: {err}"
+    );
+
+    // update_check = false -> silent even when a newer version is on offer.
+    let cfg = repo.join("ticketsplease.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str("\n[maintenance]\nupdate_check = false\n");
+    std::fs::write(&cfg, s).unwrap();
+    let (err, _) = run("999.0.0");
+    assert!(
+        !err.contains("self-update"),
+        "update_check = false must suppress the notice: {err}"
+    );
+}

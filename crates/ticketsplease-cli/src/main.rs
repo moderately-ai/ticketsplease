@@ -8,6 +8,7 @@ mod recipe;
 mod skill;
 mod templates;
 mod update;
+mod update_check;
 
 use std::process::ExitCode;
 
@@ -18,6 +19,7 @@ use crate::format::Format;
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
     let fmt = cli.format;
+    let repo = cli.repo.clone();
     let code = match cli::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -39,6 +41,6 @@ fn main() -> ExitCode {
     };
     // Maintenance advisories run last, after the command's output and exit code are
     // settled — stderr-only, and a no-op outside an interactive human session.
-    advisory::run(fmt);
+    advisory::run(&repo, fmt);
     code
 }

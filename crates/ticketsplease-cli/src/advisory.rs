@@ -9,8 +9,12 @@
 //! human session.
 
 use std::io::IsTerminal;
+use std::path::Path;
+
+use ticketsplease_core::config::{Config, Maintenance};
 
 use crate::format::Format;
+use crate::update_check;
 
 /// Suppress every advisory (honours the common "no update notifier" convention).
 const OPT_OUT: &str = "TICKETSPLEASE_NO_ADVISORIES";
@@ -24,11 +28,16 @@ const SMOKE: &str = "TICKETSPLEASE_ADVISORY_SMOKE";
 
 /// Run the advisory pass. Called once from `main`, after the command's output and
 /// exit code are settled. A no-op unless we are in an interactive human context.
-pub fn run(fmt: Format) {
+pub fn run(repo: &Path, fmt: Format) {
     if !is_context(fmt) {
         return;
     }
-    emit(&collect());
+    // Load the repo's maintenance settings if we are in one; otherwise defaults (the
+    // update-check is about the binary, not any particular repo).
+    let maint = Config::load(repo)
+        .map(|c| c.maintenance)
+        .unwrap_or_default();
+    emit(&collect(&maint));
 }
 
 /// Whether advisories may be shown right now: an interactive human session only.
@@ -54,10 +63,13 @@ fn gates(fmt: Format, stdout_tty: bool, stdin_tty: bool, ci: bool, opted_out: bo
 
 /// Assemble the advisory lines from each source. Sources must be cheap and silent by
 /// default — they return nothing unless there is genuinely something to say.
-fn collect() -> Vec<String> {
+fn collect(maint: &Maintenance) -> Vec<String> {
     let mut lines = Vec::new();
     if std::env::var_os(SMOKE).is_some() {
         lines.push("advisory-smoke: the advisory pipe is wired".to_string());
+    }
+    if let Some(line) = update_check::advisory(maint) {
+        lines.push(line);
     }
     lines
 }

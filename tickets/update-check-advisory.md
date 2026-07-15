@@ -1,7 +1,7 @@
 ---
 id: update-check-advisory
 title: "update-check advisory: probe latest release (no HTTP dep), cache, notify"
-status: todo
+status: done
 priority: p1
 dependencies: [advisory-output-channel, maintenance-config-table]
 related: []
