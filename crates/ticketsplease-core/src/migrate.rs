@@ -12,6 +12,21 @@ use crate::error::{Error, Result};
 use crate::frontmatter::Document;
 use crate::store::{self, Store};
 
+/// Managed frontmatter keys the schema guarantees on every ticket. A ticket missing any
+/// of these is "behind" and [`backfill_managed_keys`] adds it. Kept as one list so the
+/// drift predicate ([`needs_backfill`]) and the backfill step can never disagree.
+///
+/// `status`/`priority` are scalars, the rest are lists; both back-fill idempotently
+/// (each writes only when its key is absent), so key presence alone decides drift.
+const MANAGED_KEYS: [&str; 6] = [
+    "status",
+    "priority",
+    "dependencies",
+    "scopes",
+    "paths",
+    "tags",
+];
+
 /// Summary of a migration run.
 #[derive(Debug, Clone, Serialize)]
 pub struct MigrateReport {
@@ -30,28 +45,38 @@ pub fn migrate(store: &Store, dry_run: bool) -> Result<MigrateReport> {
     for path in store.ticket_files()? {
         let raw = std::fs::read_to_string(&path).map_err(Error::Io)?;
         let mut doc = Document::parse(&raw)?;
-        let before = doc.render();
-        backfill_managed_keys(&mut doc)?;
-        let after = doc.render();
-        if after != before {
-            if !dry_run {
-                store::write_atomic(&path, &after)?;
-            }
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            migrated.push(id);
-        } else {
+        // Detect drift by managed-key presence — no rendering. The overwhelming common
+        // case is an already-current ticket, so skipping the two full-file `render()`s it
+        // would otherwise pay is the difference at 10k+ tickets.
+        if !needs_backfill(&doc) {
             unchanged += 1;
+            continue;
         }
+        backfill_managed_keys(&mut doc)?;
+        if !dry_run {
+            store::write_atomic(&path, &doc.render())?;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        migrated.push(id);
     }
     migrated.sort();
     Ok(MigrateReport {
         migrated,
         unchanged,
     })
+}
+
+/// Whether `doc` is behind the current schema — i.e. [`backfill_managed_keys`] would
+/// change it. A pure frontmatter-presence check ([`Document::has_key`]) over
+/// [`MANAGED_KEYS`], with no rendering, so it is cheap to run across a whole board (the
+/// advisory drift nudge and the migrate no-op fast path both rely on it).
+#[must_use]
+pub fn needs_backfill(doc: &Document) -> bool {
+    MANAGED_KEYS.iter().any(|k| !doc.has_key(k))
 }
 
 /// Step 1 → schema v1: ensure every managed key is present.

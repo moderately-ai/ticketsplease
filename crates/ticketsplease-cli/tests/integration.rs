@@ -5489,6 +5489,64 @@ fn lint_summary_advisory_counts_findings() {
     );
 }
 
+/// The advisory caches the board scan (keyed on a tickets-dir mtime + `.md`-count
+/// signature) so a read-only command does not re-parse an unchanged board. This guards
+/// the correctness half of that optimization: a `tkt` write to the board must invalidate
+/// the cache, so the nudge never sticks on a stale count. Fixing the sole finding must
+/// silence the nudge on the very next command.
+#[test]
+fn lint_summary_advisory_cache_refreshes_after_a_fix() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    // Isolate the per-repo advisory cache under the temp dir, not the real HOME.
+    let data_home = repo.join(".xdg");
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+
+    let stderr = || -> String {
+        let out = tkt(repo)
+            .args(["ready"])
+            .env_remove("CI")
+            .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+            .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+            .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0")
+            .env("XDG_DATA_HOME", &data_home)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    // A finding, and a cache entry, are established.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "orphan",
+            "--title",
+            "O",
+            "--path",
+            "core/x.rs",
+        ])
+        .assert()
+        .success();
+    assert!(stderr().contains("1 lint finding"), "finding is reported");
+    // Run again so the cache is warm on the *current* (dirty) board.
+    assert!(stderr().contains("1 lint finding"), "finding persists");
+
+    // Fix it with an in-place edit: a terminal (done) ticket is exempt from the
+    // `paths-without-scopes` finding. Status is unchanged in file *count* — only the
+    // tickets-dir mtime moves (the atomic rewrite renames into the dir) — so this
+    // specifically exercises the mtime half of the cache signature.
+    tkt(repo)
+        .args(["set", "orphan", "--status", "done"])
+        .assert()
+        .success();
+    let err = stderr();
+    assert!(
+        !err.contains("run `tkt lint`"),
+        "the cache must refresh after the fix, not report a stale finding: {err}"
+    );
+}
+
 /// auto-migrate (via `--auto-doctor` or `[maintenance] auto_migrate`) applies the drift
 /// repair in an interactive human session — and NEVER writes in a non-interactive / JSON
 /// run, even when the flag is set. The safety cases matter more than the happy path.

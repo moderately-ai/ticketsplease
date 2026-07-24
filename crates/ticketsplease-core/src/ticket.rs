@@ -245,6 +245,15 @@ impl Ticket {
         self.doc.body()
     }
 
+    /// The underlying byte-preserving [`Document`]. Exposed for read-only frontmatter
+    /// inspection that must not go through a re-parse — e.g. the migration engine's
+    /// drift check ([`migrate::needs_backfill`](crate::migrate::needs_backfill)) reading
+    /// managed-key presence off an already-loaded ticket.
+    #[must_use]
+    pub fn document(&self) -> &Document {
+        &self.doc
+    }
+
     /// Serialize the ticket back to its exact file representation.
     #[must_use]
     pub fn render(&self) -> String {

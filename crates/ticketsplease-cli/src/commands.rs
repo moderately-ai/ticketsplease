@@ -2129,10 +2129,10 @@ fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>> {
 /// `lint` — schema validation across all tickets. Exits non-zero on findings.
 pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
     let store = Store::open(repo)?;
-    let mut diagnostics = lint_core::lint(&store)?;
-    // One-shot: validate links (dangling deps, cycles) on the parseable subset even
-    // when some files fail to parse, so all problem classes surface in one run.
-    let (parseable, _) = store.load_all_lenient()?;
+    // One walk of the store yields both the schema diagnostics and the parseable
+    // ticket set; link validation (dangling deps, cycles) runs on that same set, so a
+    // malformed file still can't black out the link checks and we never re-read the board.
+    let (mut diagnostics, parseable) = lint_core::lint_with_tickets(&store)?;
     diagnostics.extend(schedule::link_diagnostics(&parseable));
     let problems = diagnostics.len();
 

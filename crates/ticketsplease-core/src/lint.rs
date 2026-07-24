@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::config::CONFIG_FILE;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::store::Store;
 use crate::ticket::Ticket;
 
@@ -31,7 +31,17 @@ pub struct Diagnostic {
 /// Run schema lint across all ticket files. Returns findings (possibly empty):
 /// parse failures, id/filename mismatches, and duplicate ids.
 pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
+    lint_with_tickets(store).map(|(diags, _)| diags)
+}
+
+/// Like [`lint`], but also returns the parseable tickets it loaded (class-resolved,
+/// with their source paths). Callers that need both the schema diagnostics *and* the
+/// loaded board — the `lint` command feeds the tickets straight into
+/// [`link_diagnostics`](crate::schedule::link_diagnostics); the advisory derives its
+/// migration-drift count from them — get one walk of the store instead of two.
+pub fn lint_with_tickets(store: &Store) -> Result<(Vec<Diagnostic>, Vec<Ticket>)> {
     let mut diags = Vec::new();
+    let mut tickets = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     let registry = store.config.state_registry();
     // A workflow with no dispatchable or no terminal state is unusable (nothing can be
@@ -103,15 +113,18 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        let raw = std::fs::read_to_string(&path).map_err(Error::Io)?;
-        match Ticket::parse(&raw) {
+        match Ticket::load(&path) {
             Err(e) => diags.push(Diagnostic {
                 file,
                 id: None,
                 code: "parse",
                 message: e.message(),
             }),
-            Ok(ticket) => {
+            Ok(mut ticket) => {
+                // Resolve the behavioural class against the repo's registry so the
+                // returned tickets are equivalent to a `load_all_lenient` set (the
+                // caller may hand them to the scheduler, which reads `class`).
+                ticket.resolve_class(&registry);
                 if ticket.id != stem {
                     diags.push(Diagnostic {
                         file: file.clone(),
@@ -230,6 +243,7 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
                         message: format!("duplicate id `{}` (also defined in {prev})", ticket.id),
                     });
                 }
+                tickets.push(ticket);
             }
         }
     }
@@ -246,7 +260,7 @@ pub fn lint(store: &Store) -> Result<Vec<Diagnostic>> {
             }
         }
     }
-    Ok(diags)
+    Ok((diags, tickets))
 }
 
 fn rel(root: &Path, path: &Path) -> String {
