@@ -6,13 +6,98 @@
 //! repo's `[scope_crates]` config. Requires `cargo` on `PATH` at runtime.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
-use guppy::graph::DependencyDirection;
-use guppy::{MetadataCommand, PackageId};
+use guppy::graph::{DependencyDirection, PackageGraph};
+use guppy::{CargoMetadata, MetadataCommand, PackageId};
 
 use ticketsplease_core::guard::{merge_cause, AffectedSetMapper, ScopeCause};
 use ticketsplease_core::{Error, Result};
+
+/// Build the workspace crate graph, caching the parsed `cargo metadata` on disk keyed by
+/// the mtimes of `Cargo.lock` and the workspace-root `Cargo.toml`.
+///
+/// On a large workspace `cargo metadata` is seconds of resolver + subprocess work, and a
+/// batch-dispatch run guards many branches in a row against an unchanged workspace — so
+/// after the first guard the lockfile is untouched and every subsequent one reuses the
+/// cached graph JSON instead of re-shelling out. Any cache problem (missing, stale,
+/// corrupt, unreadable dir) silently falls back to a fresh `cargo metadata`.
+fn build_graph_cached(repo: &Path) -> Result<PackageGraph> {
+    let sig = graph_signature(repo);
+    let cache = graph_cache_path(repo);
+    if let (Some(sig), Some(path)) = (sig, cache.as_ref()) {
+        if let Some(json) = read_fresh_cache(path, sig) {
+            if let Ok(graph) = CargoMetadata::parse_json(&json).and_then(CargoMetadata::build_graph)
+            {
+                return Ok(graph);
+            }
+        }
+    }
+    // Miss (or no cache dir / no lockfile): run `cargo metadata`, then cache its JSON.
+    let metadata = MetadataCommand::new()
+        .current_dir(repo)
+        .exec()
+        .map_err(|e| Error::Invalid(format!("cargo metadata failed: {e}")))?;
+    if let (Some(sig), Some(path)) = (graph_signature(repo), cache) {
+        let _ = write_cache(&path, sig, &metadata); // best-effort; never fail the guard
+    }
+    metadata
+        .build_graph()
+        .map_err(|e| Error::Invalid(format!("building crate graph: {e}")))
+}
+
+/// `(Cargo.lock mtime, workspace Cargo.toml mtime)` in epoch nanos — the cache key. `None`
+/// when there is no lockfile (an unlocked or virtual state we will not cache against).
+fn graph_signature(repo: &Path) -> Option<(u64, u64)> {
+    let lock = mtime_nanos(&repo.join("Cargo.lock"))?;
+    let manifest = mtime_nanos(&repo.join("Cargo.toml")).unwrap_or(0);
+    Some((lock, manifest))
+}
+
+fn mtime_nanos(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as u64)
+}
+
+/// `<tmp>/ticketsplease/cargo-graph/<repo-hash>.json`, keyed by the canonical repo path so
+/// multiple workspaces never collide. The system temp dir keeps this a pure cache (no home
+/// resolution, auto-cleaned) — a hash collision only forces a signature mismatch and a rebuild.
+fn graph_cache_path(repo: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    Some(
+        std::env::temp_dir()
+            .join("ticketsplease")
+            .join("cargo-graph")
+            .join(format!("{:016x}.json", hasher.finish())),
+    )
+}
+
+/// Read the cached metadata JSON when the leading `<lock>:<manifest>` signature line
+/// matches `sig`; otherwise `None` (stale or absent).
+fn read_fresh_cache(path: &Path, sig: (u64, u64)) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let (header, json) = raw.split_once('\n')?;
+    (header == format!("{}:{}", sig.0, sig.1)).then(|| json.to_string())
+}
+
+fn write_cache(path: &Path, sig: (u64, u64), metadata: &CargoMetadata) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut buf: Vec<u8> = format!("{}:{}\n", sig.0, sig.1).into_bytes();
+    metadata
+        .serialize(&mut buf)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(path, buf)
+}
 
 /// Maps changed files to scopes via the cargo crate graph and reverse-dependents.
 pub struct CargoMapper {
@@ -70,15 +155,13 @@ impl CargoMapper {
 
 impl AffectedSetMapper for CargoMapper {
     fn map(&self, changed_files: &[String]) -> Result<BTreeMap<String, ScopeCause>> {
-        // No crate→scope mapping configured ⇒ nothing this backend can add.
-        if self.crate_to_scopes.is_empty() {
+        // No crate→scope mapping configured, or nothing changed ⇒ no seeds are possible,
+        // so skip the (expensive) crate-graph build entirely.
+        if self.crate_to_scopes.is_empty() || changed_files.is_empty() {
             return Ok(BTreeMap::new());
         }
 
-        let graph = MetadataCommand::new()
-            .current_dir(&self.repo)
-            .build_graph()
-            .map_err(|e| Error::Invalid(format!("cargo metadata failed: {e}")))?;
+        let graph = build_graph_cached(&self.repo)?;
 
         let workspace = graph.workspace();
         let root = workspace.root();
@@ -170,10 +253,7 @@ pub struct WorkspaceMember {
 /// List the workspace members (name + relative dir), sorted by name. Runs
 /// `cargo metadata`, so it requires `cargo` on `PATH`.
 pub fn workspace_members(repo: &Path) -> Result<Vec<WorkspaceMember>> {
-    let graph = MetadataCommand::new()
-        .current_dir(repo)
-        .build_graph()
-        .map_err(|e| Error::Invalid(format!("cargo metadata failed: {e}")))?;
+    let graph = build_graph_cached(repo)?;
     let workspace = graph.workspace();
     let root = workspace.root();
     let mut out = Vec::new();

@@ -87,28 +87,36 @@ pub struct Mappers<'a> {
     pub impact: &'a [&'a dyn AffectedSetMapper],
 }
 
-/// The always-on, language-agnostic mapper: match files against each scope's globs.
+/// The always-on, language-agnostic mapper: match files against the scope path globs.
+///
+/// Every scope's globs are compiled into one combined [`GlobSet`], with a parallel
+/// `glob_scope` telling which scope owns each glob. Matching then takes a single pass per
+/// changed file (`GlobSet::matches_into` runs one Aho-Corasick automaton over all globs
+/// and returns every hit), instead of testing the file against a separate per-scope set —
+/// so cost is O(files) rather than O(scopes × files) with hundreds of scopes.
 pub struct PathGlobMapper {
-    scopes: Vec<(String, GlobSet)>,
+    set: GlobSet,
+    /// `glob_scope[i]` is the scope that contributed the i-th glob in `set`.
+    glob_scope: Vec<String>,
 }
 
 impl PathGlobMapper {
     /// Build from the config's `scope -> globs` map.
     pub fn new(config: &Config) -> Result<Self> {
-        let mut scopes = Vec::new();
+        let mut builder = GlobSetBuilder::new();
+        let mut glob_scope = Vec::new();
         for (scope, globs) in &config.scopes {
-            let mut builder = GlobSetBuilder::new();
             for g in globs {
                 builder.add(Glob::new(g).map_err(|e| {
                     Error::Invalid(format!("invalid glob `{g}` for scope `{scope}`: {e}"))
                 })?);
+                glob_scope.push(scope.clone());
             }
-            let set = builder
-                .build()
-                .map_err(|e| Error::Invalid(format!("building globset for `{scope}`: {e}")))?;
-            scopes.push((scope.clone(), set));
         }
-        Ok(Self { scopes })
+        let set = builder
+            .build()
+            .map_err(|e| Error::Invalid(format!("building path-glob set: {e}")))?;
+        Ok(Self { set, glob_scope })
     }
 
     /// For `--explain`: which changed files matched each scope's globs (scope -> files,
@@ -117,15 +125,17 @@ impl PathGlobMapper {
     /// and external-pin scopes have no path-glob file and so never appear here.
     #[must_use]
     pub fn attribute(&self, changed_files: &[String]) -> BTreeMap<String, Vec<String>> {
-        let mut out = BTreeMap::new();
-        for (scope, set) in &self.scopes {
-            let files: Vec<String> = changed_files
-                .iter()
-                .filter(|f| set.is_match(f.as_str()))
-                .cloned()
-                .collect();
-            if !files.is_empty() {
-                out.insert(scope.clone(), files);
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut hits: Vec<usize> = Vec::new();
+        for f in changed_files {
+            self.set.matches_into(f.as_str(), &mut hits);
+            for &gi in &hits {
+                let files = out.entry(self.glob_scope[gi].clone()).or_default();
+                // A file can match several of a scope's globs; those hits are adjacent
+                // within one file's match list, so dedup after keeps each file once.
+                if files.last() != Some(f) {
+                    files.push(f.clone());
+                }
             }
         }
         out
@@ -134,11 +144,14 @@ impl PathGlobMapper {
 
 impl AffectedSetMapper for PathGlobMapper {
     fn map(&self, changed_files: &[String]) -> Result<BTreeMap<String, ScopeCause>> {
-        // A path-glob match is always a direct file overlap.
+        // A path-glob match is always a direct file overlap. One pass over the files
+        // attributes every scope via the combined globset.
         let mut out = BTreeMap::new();
-        for (scope, set) in &self.scopes {
-            if changed_files.iter().any(|f| set.is_match(f)) {
-                out.insert(scope.clone(), ScopeCause::Direct);
+        let mut hits: Vec<usize> = Vec::new();
+        for f in changed_files {
+            self.set.matches_into(f.as_str(), &mut hits);
+            for &gi in &hits {
+                out.insert(self.glob_scope[gi].clone(), ScopeCause::Direct);
             }
         }
         Ok(out)
@@ -199,15 +212,18 @@ impl ExternalScopeMapper {
         })
     }
 
-    /// The diff of just the changed manifests, or empty if none changed.
+    /// The diff of just the changed manifests, or empty if none changed. A two-dot
+    /// `<base> <branch>` range: `base` is the merge-base the caller already resolved
+    /// (see [`ExternalScopeMapper::new`]), so this does not re-walk history to find it.
     fn manifest_diff(&self, changed_files: &[String]) -> Result<String> {
         let manifests: Vec<&String> = changed_files.iter().filter(|f| is_manifest(f)).collect();
         if manifests.is_empty() {
             return Ok(String::new());
         }
-        let range = format!("{}...{}", self.base, self.branch);
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(&self.repo).args(["diff", &range, "--"]);
+        cmd.arg("-C")
+            .arg(&self.repo)
+            .args(["diff", &self.base, &self.branch, "--"]);
         for m in &manifests {
             cmd.arg(m);
         }
@@ -217,7 +233,9 @@ impl ExternalScopeMapper {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::Invalid(format!(
-                "`git diff {range}` (manifests) failed: {}",
+                "`git diff {} {}` (manifests) failed: {}",
+                self.base,
+                self.branch,
                 stderr.trim()
             )));
         }
@@ -282,36 +300,77 @@ pub struct BranchDiff {
 
 impl BranchDiff {
     /// Compute via a three-dot (merge-base) `git diff --name-only`. Fully offline;
-    /// shells out to the system `git`.
+    /// shells out to the system `git`. Standalone — resolves its own merge-base.
     pub fn compute(repo: &Path, base: &str, branch: &str) -> Result<Self> {
-        let range = format!("{base}...{branch}");
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["diff", "--name-only"])
-            .arg(&range)
-            .output()
-            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Invalid(format!(
-                "`git diff {range}` failed: {}",
-                stderr.trim()
-            )));
-        }
-        let mut changed_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect();
-        changed_files.sort();
-        changed_files.dedup();
+        let changed_files = diff_names(repo, &[&format!("{base}...{branch}")])?;
         Ok(Self {
             base: base.to_string(),
             branch: branch.to_string(),
             changed_files,
         })
     }
+
+    /// Two-dot `git diff --name-only <from> <branch>` from an already-resolved `from`
+    /// ref (a [`merge_base`] shared with the manifest diff), labelled with the human
+    /// `base` name for reporting. Equivalent to [`compute`](Self::compute) when
+    /// `from == merge_base(base, branch)`, but without re-walking history to that
+    /// merge-base — so a guard resolves the merge-base once, not once per diff.
+    pub fn from_merge_base(repo: &Path, base: &str, from: &str, branch: &str) -> Result<Self> {
+        let changed_files = diff_names(repo, &[from, branch])?;
+        Ok(Self {
+            base: base.to_string(),
+            branch: branch.to_string(),
+            changed_files,
+        })
+    }
+}
+
+/// The merge-base commit of `base` and `branch` (`git merge-base`). Resolved once so the
+/// name-only diff and the manifest diff can both take a two-dot range from it, instead of
+/// each running a three-dot diff that re-walks history to the same merge-base (the
+/// dominant git cost on a deep, many-commit history).
+pub fn merge_base(repo: &Path, base: &str, branch: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", base, branch])
+        .output()
+        .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Invalid(format!(
+            "`git merge-base {base} {branch}` failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run `git diff --name-only <range...>` and return the sorted, deduped changed paths.
+fn diff_names(repo: &Path, range: &[&str]) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--name-only"])
+        .args(range)
+        .output()
+        .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Invalid(format!(
+            "`git diff --name-only {}` failed: {}",
+            range.join(" "),
+            stderr.trim()
+        )));
+    }
+    let mut changed_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    changed_files.sort();
+    changed_files.dedup();
+    Ok(changed_files)
 }
 
 /// A collision with another concurrently-open ticket.

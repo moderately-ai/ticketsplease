@@ -2700,7 +2700,11 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
     // there is harmless).
     let target = store.load(&target_id)?;
 
-    let diff = guard::BranchDiff::compute(repo, &base, &args.branch)?;
+    // Resolve the merge-base of base and branch once; the name-only diff and the
+    // manifest diff both take a two-dot range from it, rather than each running a
+    // three-dot diff that re-walks history to the same merge-base.
+    let merge_base = guard::merge_base(repo, &base, &args.branch)?;
+    let diff = guard::BranchDiff::from_merge_base(repo, &base, &merge_base, &args.branch)?;
 
     let path_mapper = guard::PathGlobMapper::new(&config)?;
     let glob_scopes: BTreeSet<String> = config.scopes.keys().cloned().collect();
@@ -2724,7 +2728,7 @@ pub fn guard(repo: &Path, fmt: Format, args: &GuardArgs) -> Result<()> {
     } else {
         Some(guard::ExternalScopeMapper::new(
             repo,
-            &base,
+            &merge_base,
             &args.branch,
             &config.external_scopes,
         )?)
