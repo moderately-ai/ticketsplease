@@ -22,22 +22,39 @@ pub struct Document {
 
 impl Document {
     /// Split a raw ticket file into (opening fence, frontmatter, closing fence + body).
+    ///
+    /// Scans for the two fence-line boundaries by byte offset and slices `raw` directly,
+    /// rather than collecting every line into a `Vec<&str>` and `concat`-copying the
+    /// frontmatter and the whole body span. On a board of large-bodied tickets this
+    /// avoids an all-lines allocation and a redundant copy of every body on every parse.
     pub fn parse(raw: &str) -> Result<Self> {
-        let lines: Vec<&str> = raw.split_inclusive('\n').collect();
-        if lines.first().map(|l| l.trim_end()) != Some("---") {
+        // The opening fence: the first line, which must trim to exactly `---`.
+        let first_end = raw.find('\n').map_or(raw.len(), |i| i + 1);
+        if raw[..first_end].trim_end() != "---" {
             return Err(Error::Invalid(
                 "missing YAML frontmatter (file must start with `---`)".into(),
             ));
         }
-        let close = (1..lines.len())
-            .find(|&i| lines[i].trim_end() == "---")
-            .ok_or_else(|| {
-                Error::Invalid("unterminated YAML frontmatter (missing closing `---`)".into())
-            })?;
+        // The closing fence: the next line (after the first) that trims to `---`.
+        let mut cursor = first_end;
+        let close_start = loop {
+            if cursor >= raw.len() {
+                return Err(Error::Invalid(
+                    "unterminated YAML frontmatter (missing closing `---`)".into(),
+                ));
+            }
+            let line_end = raw[cursor..]
+                .find('\n')
+                .map_or(raw.len(), |i| cursor + i + 1);
+            if raw[cursor..line_end].trim_end() == "---" {
+                break cursor;
+            }
+            cursor = line_end;
+        };
         Ok(Self {
-            leading: lines[0].to_string(),
-            fm: lines[1..close].concat(),
-            trailing: lines[close..].concat(),
+            leading: raw[..first_end].to_string(),
+            fm: raw[first_end..close_start].to_string(),
+            trailing: raw[close_start..].to_string(),
         })
     }
 

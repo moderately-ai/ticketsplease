@@ -9,11 +9,14 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use rayon::prelude::*;
+
 use crate::comment::Comment;
 use crate::config::{Config, Recipe, CONFIG_FILE};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::ids;
+use crate::states::StateRegistry;
 use crate::ticket::Ticket;
 
 /// A repository handle: the root directory plus its loaded config.
@@ -110,14 +113,15 @@ impl Store {
     }
 
     /// Load and parse every ticket (sorted by id). Fails if any file is invalid.
+    ///
+    /// The per-file read + YAML parse is the dominant cost of every multi-ticket command,
+    /// so the files are parsed in parallel across the machine's cores (see [`load_paths`]).
     pub fn load_all(&self) -> Result<Vec<Ticket>> {
         let reg = self.config.state_registry();
-        let mut tickets = Vec::new();
-        for path in self.ticket_files()? {
-            let mut ticket = Ticket::load(&path)
-                .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
-            ticket.resolve_class(&reg);
-            tickets.push(ticket);
+        let paths = self.ticket_files()?;
+        let mut tickets = Vec::with_capacity(paths.len());
+        for (path, res) in load_paths(&paths, &reg) {
+            tickets.push(res.map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?);
         }
         tickets.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(tickets)
@@ -126,17 +130,15 @@ impl Store {
     /// Load every parseable ticket, returning warnings for files that failed to
     /// parse instead of aborting. Use for *display* commands (list/status) so one
     /// malformed file can't black out the whole board; scheduling commands keep
-    /// the strict [`load_all`](Self::load_all).
+    /// the strict [`load_all`](Self::load_all). Parsed in parallel, like [`load_all`].
     pub fn load_all_lenient(&self) -> Result<(Vec<Ticket>, Vec<String>)> {
         let reg = self.config.state_registry();
-        let mut tickets = Vec::new();
+        let paths = self.ticket_files()?;
+        let mut tickets = Vec::with_capacity(paths.len());
         let mut warnings = Vec::new();
-        for path in self.ticket_files()? {
-            match Ticket::load(&path) {
-                Ok(mut t) => {
-                    t.resolve_class(&reg);
-                    tickets.push(t);
-                }
+        for (path, res) in load_paths(&paths, &reg) {
+            match res {
+                Ok(t) => tickets.push(t),
                 Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
             }
         }
@@ -843,6 +845,23 @@ fn parse_cat_file_batch(data: &[u8], expected: usize) -> Vec<Option<Vec<u8>>> {
         results.push(None);
     }
     results
+}
+
+/// Load, parse, and class-resolve each ticket file in parallel across the machine's
+/// cores, preserving input order. Each result is paired with its path so a caller can
+/// attribute a strict error or a lenient warning. Rayon's work-stealing balances the
+/// uneven per-file cost (large bodies, long dependency lists) better than a fixed split.
+fn load_paths(paths: &[PathBuf], reg: &StateRegistry) -> Vec<(PathBuf, Result<Ticket>)> {
+    paths
+        .par_iter()
+        .map(|path| {
+            let ticket = Ticket::load(path).map(|mut t| {
+                t.resolve_class(reg);
+                t
+            });
+            (path.clone(), ticket)
+        })
+        .collect()
 }
 
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {

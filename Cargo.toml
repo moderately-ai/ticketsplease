@@ -28,6 +28,7 @@ yaml-rust2 = "0.10"
 globset = "0.4"
 guppy = "0.17"
 include_dir = "0.7"
+rayon = "1"
 
 # Disk hygiene: line-tables-only debug info + opt-level=1 deps for fast iteration.
 [profile.dev]
