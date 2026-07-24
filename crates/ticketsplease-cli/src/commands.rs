@@ -300,9 +300,18 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     // Reject undefined scopes and dangling related/dependency ids at filing time. A
     // single new ticket cannot close a dependency cycle (nothing references its id yet),
     // so no cycle check is needed here — only the batch path checks that.
+    //
+    // The board is loaded only to check that related/dependency targets exist; scope
+    // validation needs just the config. So a ticket that references no other ticket
+    // (the common case — a fresh ticket with only scopes/tags) files in O(1), never
+    // reading the board.
     if !args.no_validate {
         let validate_id = args.id.clone().unwrap_or_else(|| store::slugify(title));
-        let all = store.load_all_lenient()?.0;
+        let all = if related.is_empty() && depends_on.is_empty() {
+            Vec::new()
+        } else {
+            store.load_all_lenient()?.0
+        };
         let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
         validate_write(
             &store.config,
@@ -839,13 +848,28 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
     // Validate what this edit *adds* (undefined scopes, dangling related/dependency ids).
     // Only additions are checked — an unrelated edit must not fail on a ticket's
     // pre-existing dangling link; removals need no check.
+    //
+    // The board is loaded at most once and only when actually needed: scope validation
+    // consults just the config, while dangling-link validation and the dependency-cycle
+    // check both need the whole board. A scope-only or tag-only edit therefore stays O(1)
+    // in ticket count, and adding a dependency loads the board once, not twice.
+    let needs_board = !args.add_related.is_empty() || !args.add_dependency.is_empty();
+    let board = if needs_board {
+        Some(store.load_all_lenient()?.0)
+    } else {
+        None
+    };
     let added_anything = !args.add_scope.is_empty()
         || !args.add_shared_scope.is_empty()
         || !args.add_related.is_empty()
         || !args.add_dependency.is_empty();
     if !args.no_validate && added_anything {
-        let all = store.load_all_lenient()?.0;
-        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+        let known: BTreeMap<&str, &Ticket> = board
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|t| (t.id.as_str(), t))
+            .collect();
         validate_write(
             &store.config,
             &ticket.id,
@@ -859,9 +883,11 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
         )?;
     }
     // Reject a dependency edit that would close a cycle, exactly like `link`. Related
-    // links carry no ordering, so they need no cycle check.
+    // links carry no ordering, so they need no cycle check. `deps_added` implies a
+    // dependency was requested, so `board` was loaded above — reuse it (splice in the
+    // edited ticket, since its on-disk copy predates this edit).
     if deps_added {
-        let mut all = store.load_all()?;
+        let mut all = board.expect("a dependency add always loads the board");
         if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
             *slot = ticket.clone();
         }
@@ -1192,9 +1218,22 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
 
     // Reject a dangling target at write time (unless bypassed), mirroring `create` and
     // `set --add-dependency`/`--add-related`. `--no-validate` allows a forward reference.
+    // The board (needed for both the dangling-link check and the dependency-cycle check)
+    // is loaded at most once and shared between them — a removal or `--no-validate`
+    // related link touches it not at all.
+    let needs_board = changed && !args.remove && (!args.no_validate || !related);
+    let board = if needs_board {
+        Some(store.load_all_lenient()?.0)
+    } else {
+        None
+    };
     if changed && !args.remove && !args.no_validate {
-        let all = store.load_all_lenient()?.0;
-        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+        let known: BTreeMap<&str, &Ticket> = board
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|t| (t.id.as_str(), t))
+            .collect();
         let one = [target.to_string()];
         let (rel, dep): (&[String], &[String]) = if related { (&one, &[]) } else { (&[], &one) };
         validate_write(
@@ -1212,9 +1251,10 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
 
     // Adding a dependency edge that closes a cycle is rejected here (exit 5) rather
     // than left to corrupt the graph until `ready`/`tracks`/`next` trips over it.
-    // Related links carry no ordering, so they are never cycle-checked.
+    // Related links carry no ordering, so they are never cycle-checked. A dependency
+    // link always loads the board above, so reuse it.
     if changed && !related && !args.remove {
-        let mut all = store.load_all()?;
+        let mut all = board.expect("a dependency link always loads the board");
         if let Some(slot) = all.iter_mut().find(|t| t.id == ticket.id) {
             *slot = ticket.clone();
         }
@@ -2539,19 +2579,24 @@ pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
     }
     let dry_run = args.dry_run;
     let mut remapped: Vec<String> = Vec::new();
-    for mut ticket in store.load_all()? {
-        if let Some((_, new)) = remaps
-            .iter()
-            .find(|(old, _)| ticket.status.eq_ignore_ascii_case(old))
-        {
-            ticket.set_status(new, &registry)?;
-            if !dry_run {
-                store.save(&ticket)?;
+    // Only walk the board for the remap pass when a `--remap` was actually given; a plain
+    // `tkt migrate` skips it entirely rather than loading every ticket to match nothing,
+    // leaving just the one scan inside `migrate_core::migrate`.
+    if !remaps.is_empty() {
+        for mut ticket in store.load_all()? {
+            if let Some((_, new)) = remaps
+                .iter()
+                .find(|(old, _)| ticket.status.eq_ignore_ascii_case(old))
+            {
+                ticket.set_status(new, &registry)?;
+                if !dry_run {
+                    store.save(&ticket)?;
+                }
+                remapped.push(ticket.id.clone());
             }
-            remapped.push(ticket.id.clone());
         }
+        remapped.sort();
     }
-    remapped.sort();
     let report = migrate_core::migrate(&store, dry_run)?;
     // The project skill link is stale when it exists but is not a symlink to the
     // canonical copy (a real copy, or a wrong link). Repair it — unless this is a
