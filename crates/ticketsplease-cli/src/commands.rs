@@ -2,6 +2,7 @@
 //! versioned JSON payload under `--format json`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,20 @@ use crate::recipe;
 use crate::skill;
 use crate::templates;
 use crate::update;
+
+/// Write many rows to stdout under a single lock and one buffered flush, for the
+/// list-style commands. `println!` wraps a line-buffered `Stdout`, so it flushes on every
+/// row — thousands of syscalls when listing a large board. A `BufWriter` over the locked
+/// handle flushes once instead. `write` reports rows via `writeln!(out, …)`.
+fn buffered_stdout(
+    write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    write(&mut out)
+        .and_then(|()| out.flush())
+        .map_err(Error::Io)
+}
 
 /// `init` — scaffold the tickets directory and config.
 pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
@@ -1499,16 +1514,19 @@ fn print_events(fmt: Format, evs: &[Event]) -> Result<()> {
         }
         Format::Human => {
             let now = now_epoch();
-            for e in evs {
-                println!(
-                    "{:<10} {:<8} {}  {}",
-                    humanize_epoch(e.at, now),
-                    e.kind,
-                    e.ticket,
-                    e.by.as_deref().unwrap_or("")
-                );
-            }
-            Ok(())
+            buffered_stdout(|out| {
+                for e in evs {
+                    writeln!(
+                        out,
+                        "{:<10} {:<8} {}  {}",
+                        humanize_epoch(e.at, now),
+                        e.kind,
+                        e.ticket,
+                        e.by.as_deref().unwrap_or("")
+                    )?;
+                }
+                Ok(())
+            })
         }
     }
 }
@@ -1552,16 +1570,19 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
                 println!("(no matching tickets)");
             } else {
                 let w = tickets.iter().map(|t| t.id.len()).max().unwrap_or(0);
-                for t in &tickets {
-                    println!(
-                        "{:<3} {:<12} {:<w$}  {}",
-                        t.priority.as_str(),
-                        t.status.as_str(),
-                        t.id,
-                        t.title
-                    );
-                }
-                println!("({} ticket(s))", tickets.len());
+                buffered_stdout(|out| {
+                    for t in &tickets {
+                        writeln!(
+                            out,
+                            "{:<3} {:<12} {:<w$}  {}",
+                            t.priority.as_str(),
+                            t.status.as_str(),
+                            t.id,
+                            t.title
+                        )?;
+                    }
+                    writeln!(out, "({} ticket(s))", tickets.len())
+                })?;
             }
             for warn in &warnings {
                 eprintln!("warning: skipped {warn}");
@@ -1994,9 +2015,12 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
                 if tickets.is_empty() {
                     println!("(no tickets)");
                 }
-                for t in &tickets {
-                    println!("{:<12} {}", t.status.as_str(), t.id);
-                }
+                buffered_stdout(|out| {
+                    for t in &tickets {
+                        writeln!(out, "{:<12} {}", t.status.as_str(), t.id)?;
+                    }
+                    Ok(())
+                })?;
                 for warn in &warnings {
                     eprintln!("warning: skipped {warn}");
                 }
@@ -2039,15 +2063,18 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
             if rows.is_empty() {
                 println!("(no {}* branches)", args.prefix);
             }
-            for r in &rows {
-                println!(
-                    "{:<24} {:<12} {}",
-                    r["branch"].as_str().unwrap_or(""),
-                    r["status"].as_str().unwrap_or("(missing)"),
-                    r["id"].as_str().unwrap_or(""),
-                );
-            }
-            Ok(())
+            buffered_stdout(|out| {
+                for r in &rows {
+                    writeln!(
+                        out,
+                        "{:<24} {:<12} {}",
+                        r["branch"].as_str().unwrap_or(""),
+                        r["status"].as_str().unwrap_or("(missing)"),
+                        r["id"].as_str().unwrap_or(""),
+                    )?;
+                }
+                Ok(())
+            })
         }
     }
 }
@@ -2243,16 +2270,19 @@ pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
             if ready.is_empty() {
                 println!("(no ready tickets — none are todo/ready with all dependencies done)");
             }
-            for t in &ready {
-                println!(
-                    "{:<3} {:<12} {}  {}",
-                    t.priority.as_str(),
-                    t.status.as_str(),
-                    t.id,
-                    t.title
-                );
-            }
-            Ok(())
+            buffered_stdout(|out| {
+                for t in &ready {
+                    writeln!(
+                        out,
+                        "{:<3} {:<12} {}  {}",
+                        t.priority.as_str(),
+                        t.status.as_str(),
+                        t.id,
+                        t.title
+                    )?;
+                }
+                Ok(())
+            })
         }
     }
 }
@@ -3430,25 +3460,29 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
             if claimed.is_empty() {
                 println!("(no active claims)");
             }
-            for t in &claimed {
-                let lease = t.lease_expires_at.map_or_else(
-                    || "no lease".to_string(),
-                    |exp| {
-                        let rel = humanize_epoch(exp, now);
-                        if t.lease_live(now) {
-                            format!("live, expires {rel}")
-                        } else {
-                            format!("expired {rel}")
-                        }
-                    },
-                );
-                println!(
-                    "{:<16} {:<28} {}",
-                    t.assignee.as_deref().unwrap_or("?"),
-                    lease,
-                    t.id
-                );
-            }
+            buffered_stdout(|out| {
+                for t in &claimed {
+                    let lease = t.lease_expires_at.map_or_else(
+                        || "no lease".to_string(),
+                        |exp| {
+                            let rel = humanize_epoch(exp, now);
+                            if t.lease_live(now) {
+                                format!("live, expires {rel}")
+                            } else {
+                                format!("expired {rel}")
+                            }
+                        },
+                    );
+                    writeln!(
+                        out,
+                        "{:<16} {:<28} {}",
+                        t.assignee.as_deref().unwrap_or("?"),
+                        lease,
+                        t.id
+                    )?;
+                }
+                Ok(())
+            })?;
             for w in &warnings {
                 eprintln!("warning: skipped {w}");
             }

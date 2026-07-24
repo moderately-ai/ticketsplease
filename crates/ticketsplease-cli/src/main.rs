@@ -17,6 +17,12 @@ use clap::Parser;
 use crate::format::Format;
 
 fn main() -> ExitCode {
+    // A detached background process spawned by the update-check advisory to refresh its
+    // cache off the command's critical path: do only that, then exit.
+    if update_check::is_probe_process() {
+        update_check::run_probe();
+        return ExitCode::SUCCESS;
+    }
     let cli = cli::Cli::parse();
     let fmt = cli.format;
     let repo = cli.repo.clone();

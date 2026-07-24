@@ -302,9 +302,19 @@ impl Store {
         if !self.path_for(ticket_id).exists() {
             return Err(Error::NotFound(ticket_id.to_string()));
         }
-        // A reply must target an existing comment, so a typo doesn't orphan it.
+        // A reply must target an existing comment, so a typo doesn't orphan it. A comment
+        // id equals its file stem, so check that file's existence directly rather than
+        // reading and parsing the whole thread. Reject any id bearing a path separator so
+        // a crafted `--reply-to` cannot escape the comments directory.
         if let Some(rt) = &reply_to {
-            if !self.comments(ticket_id)?.iter().any(|c| &c.id == rt) {
+            let safe =
+                !rt.is_empty() && !rt.contains('/') && !rt.contains('\\') && !rt.contains("..");
+            if !safe
+                || !self
+                    .comments_dir(ticket_id)
+                    .join(format!("{rt}.md"))
+                    .exists()
+            {
                 return Err(Error::NotFound(format!(
                     "comment `{rt}` to reply to on ticket `{ticket_id}`"
                 )));
