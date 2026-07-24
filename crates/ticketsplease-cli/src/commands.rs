@@ -2264,14 +2264,18 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
-    // Safe parallel width: the largest set runnable at once within the budget.
-    let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
-    // `--overlap-matrix` hands back the raw conflict graph for self-service assignment.
+    // The `--overlap-matrix` and `--width` paths need only the width, so they compute it
+    // alone; the normal path needs both the width and the batches and gets them from a
+    // single conflict-graph build (`tracks_and_width`) instead of two independent O(n²)
+    // passes over the same dispatchable frontier.
     if args.overlap_matrix {
+        // `--overlap-matrix` hands back the raw conflict graph for self-service assignment.
+        let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
         return emit_overlap_matrix(fmt, &tickets, &weights, width);
     }
-    // `--width` is a terse one-number answer for "how many workers can I spin up".
     if args.width {
+        // `--width` is a terse one-number answer for "how many workers can I spin up".
+        let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
         return match fmt {
             Format::Json => print_json(&json!({ "schema_version": 1, "width": width })),
             Format::Human => {
@@ -2280,7 +2284,7 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
             }
         };
     }
-    let mut batches = schedule::tracks(&tickets, max_overlap, &weights)?;
+    let (mut batches, width) = schedule::tracks_and_width(&tickets, max_overlap, &weights)?;
     // --parallel caps each batch to N tickets, splitting larger ones so an orchestrator
     // with N workers gets worker-sized fronts. Chunking preserves the per-pair budget.
     if let Some(n) = args.parallel.filter(|&n| n > 0) {

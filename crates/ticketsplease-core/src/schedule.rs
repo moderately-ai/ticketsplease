@@ -106,54 +106,31 @@ pub fn tracks<'a>(
 ) -> Result<Vec<Vec<&'a Ticket>>> {
     let graph = Graph::build(tickets)?;
     let nodes = graph.dispatchable(tickets);
-    let n = nodes.len();
-    if n == 0 {
+    if nodes.is_empty() {
         return Ok(Vec::new());
     }
+    Ok(ConflictGraph::build(nodes, max_overlap, weights).batches())
+}
 
-    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            // An edge (must-separate) only when the pair's conflict cost exceeds the
-            // tolerated budget; pairs within budget may share a batch.
-            if conflict_cost(nodes[i], nodes[j], weights) > max_overlap {
-                adj[i].insert(j);
-                adj[j].insert(i);
-            }
-        }
+/// Both the parallel batches and the safe parallel width, from a *single* build of the
+/// conflict graph. The `tracks` command needs both numbers, and each is an independent
+/// O(n²) pass over the same dispatchable frontier; sharing the one adjacency build (and
+/// the one dispatchable filter and graph validation) halves that work versus calling
+/// [`tracks`] and [`parallel_width`] separately.
+pub fn tracks_and_width<'a>(
+    tickets: &'a [Ticket],
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> Result<(Vec<Vec<&'a Ticket>>, usize)> {
+    let graph = Graph::build(tickets)?;
+    let nodes = graph.dispatchable(tickets);
+    if nodes.is_empty() {
+        return Ok((Vec::new(), 0));
     }
-
-    // Welsh–Powell: colour by descending degree, tie-break (priority, id).
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&x, &y| {
-        adj[y]
-            .len()
-            .cmp(&adj[x].len())
-            .then_with(|| (nodes[x].priority, &nodes[x].id).cmp(&(nodes[y].priority, &nodes[y].id)))
-    });
-
-    let mut colour = vec![usize::MAX; n];
-    for &i in &order {
-        let used: BTreeSet<usize> = adj[i]
-            .iter()
-            .filter_map(|&j| (colour[j] != usize::MAX).then_some(colour[j]))
-            .collect();
-        let mut c = 0;
-        while used.contains(&c) {
-            c += 1;
-        }
-        colour[i] = c;
-    }
-
-    let batch_count = colour.iter().copied().max().map_or(0, |m| m + 1);
-    let mut batches: Vec<Vec<&Ticket>> = vec![Vec::new(); batch_count];
-    for (i, &c) in colour.iter().enumerate() {
-        batches[c].push(nodes[i]);
-    }
-    for batch in &mut batches {
-        batch.sort_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)));
-    }
-    Ok(batches)
+    let conflicts = ConflictGraph::build(nodes, max_overlap, weights);
+    let width = conflicts.max_compatible();
+    let batches = conflicts.batches();
+    Ok((batches, width))
 }
 
 /// A worker-lane plan: ≤ `parallel` lanes, each an ordered queue for one worker, plus
@@ -256,12 +233,13 @@ pub fn next<'a>(
     }
 
     let mut memo: BTreeMap<&str, i64> = BTreeMap::new();
+    let downstream = downstream_counts(&graph.dependents);
     let mut scores: BTreeMap<&str, i64> = BTreeMap::new();
     for &t in &nodes {
         let id = t.id.as_str();
         let s = 1000 * priority_value(t.priority)
             + 10 * critical_path(id, &graph.dependents, &mut memo)
-            + downstream_count(id, &graph.dependents);
+            + downstream.get(id).copied().unwrap_or(0);
         scores.insert(id, s);
     }
 
@@ -505,12 +483,13 @@ pub struct GraphExport {
 pub fn graph_export(tickets: &[Ticket]) -> Result<GraphExport> {
     let graph = Graph::build(tickets)?;
     let mut memo: BTreeMap<&str, i64> = BTreeMap::new();
+    let downstream = downstream_counts(&graph.dependents);
     let nodes = tickets
         .iter()
         .map(|t| {
             let id = t.id.as_str();
             let critical_path = critical_path(id, &graph.dependents, &mut memo);
-            let downstream_count = downstream_count(id, &graph.dependents);
+            let downstream_count = downstream.get(id).copied().unwrap_or(0);
             GraphNode {
                 id: t.id.clone(),
                 title: t.title.clone(),
@@ -583,7 +562,7 @@ pub fn parallel_width(
 ) -> Result<usize> {
     let graph = Graph::build(tickets)?;
     let nodes = graph.dispatchable(tickets);
-    Ok(max_compatible_among(&nodes, max_overlap, weights))
+    Ok(ConflictGraph::build(nodes, max_overlap, weights).max_compatible())
 }
 
 /// The largest mutually-compatible subset of `tickets` (every pair's conflict cost
@@ -596,24 +575,10 @@ pub fn max_compatible_among(
     max_overlap: i64,
     weights: &BTreeMap<String, i64>,
 ) -> usize {
-    let n = tickets.len();
-    if n == 0 {
+    if tickets.is_empty() {
         return 0;
     }
-    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if conflict_cost(tickets[i], tickets[j], weights) > max_overlap {
-                adj[i].insert(j);
-                adj[j].insert(i);
-            }
-        }
-    }
-    if n > 22 {
-        return greedy_independent_set(&adj);
-    }
-    let all: Vec<usize> = (0..n).collect();
-    max_independent_set(&adj, &all)
+    ConflictGraph::build(tickets.to_vec(), max_overlap, weights).max_compatible()
 }
 
 /// Exact maximum independent set over `remaining` (include/exclude branch-and-bound;
@@ -690,12 +655,192 @@ pub fn conflicting_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
 /// `0` means compatible — safe to run in parallel. `tracks` and `next` gate on this
 /// against a per-pair overlap budget; callers can use it to report a chosen set's
 /// residual overlap cost.
+///
+/// This is the O(1)-per-call *reporting* path (it materializes the conflicting scope
+/// names). The O(n²) matrix builds in `tracks`/`max_compatible_among` do **not** call
+/// it — they use [`ScopeConflicts`], which precomputes each ticket's scopes as a bitset
+/// once so a pairwise check is a few word-ops with no per-pair allocation.
 #[must_use]
 pub fn conflict_cost(a: &Ticket, b: &Ticket, weights: &BTreeMap<String, i64>) -> i64 {
     conflicting_scopes(a, b)
         .iter()
         .map(|s| weights.get(s).copied().unwrap_or(1))
         .sum()
+}
+
+/// Per-ticket scope bitsets over the local scope vocabulary, precomputed once so the
+/// pairwise conflict matrix is a bitwise kernel instead of rebuilding four `BTreeSet`s
+/// and a `Vec<String>` per pair.
+///
+/// A scope `s` conflicts between tickets `i` and `j` when both claim it and at least one
+/// claims it *exclusively* — equivalently `(claims_i & claims_j) & (excl_i | excl_j)`,
+/// since a claimed scope that is not exclusive is shared, and two shared claims are
+/// compatible. The weighted cost sums `weight(s)` over the set conflict bits.
+struct ScopeConflicts {
+    /// `u64` words per ticket bitset (≥ 1).
+    words: usize,
+    /// `n * words` flattened: scopes each ticket claims (exclusive ∪ shared).
+    claims: Vec<u64>,
+    /// `n * words` flattened: scopes each ticket claims *exclusively*.
+    excl: Vec<u64>,
+    /// Weight per scope index (defaults to 1).
+    weight: Vec<i64>,
+    /// All weights are 1 — take the popcount fast path instead of walking bits.
+    unit: bool,
+}
+
+impl ScopeConflicts {
+    fn new(nodes: &[&Ticket], weights: &BTreeMap<String, i64>) -> Self {
+        // Intern the scopes actually claimed by these nodes into dense indices.
+        let mut index: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in nodes {
+            for s in t.scopes.iter().chain(&t.shared_scopes) {
+                let next = index.len();
+                index.entry(s.as_str()).or_insert(next);
+            }
+        }
+        let words = index.len().div_ceil(64).max(1);
+        let mut claims = vec![0u64; nodes.len() * words];
+        let mut excl = vec![0u64; nodes.len() * words];
+        let set = |bits: &mut [u64], base: usize, idx: usize| {
+            bits[base + idx / 64] |= 1u64 << (idx % 64);
+        };
+        for (i, t) in nodes.iter().enumerate() {
+            let base = i * words;
+            for s in &t.scopes {
+                let idx = index[s.as_str()];
+                set(&mut claims, base, idx);
+                set(&mut excl, base, idx);
+            }
+            for s in &t.shared_scopes {
+                set(&mut claims, base, index[s.as_str()]);
+            }
+        }
+        let mut weight = vec![1i64; index.len()];
+        let mut unit = true;
+        for (name, &idx) in &index {
+            if let Some(&w) = weights.get(*name) {
+                weight[idx] = w;
+                unit &= w == 1;
+            }
+        }
+        Self {
+            words,
+            claims,
+            excl,
+            weight,
+            unit,
+        }
+    }
+
+    /// The conflict cost between nodes `i` and `j` — same value as
+    /// [`conflict_cost`], computed from the precomputed bitsets.
+    fn cost(&self, i: usize, j: usize) -> i64 {
+        let (bi, bj) = (i * self.words, j * self.words);
+        let mut total = 0i64;
+        for w in 0..self.words {
+            let both = self.claims[bi + w] & self.claims[bj + w];
+            if both == 0 {
+                continue;
+            }
+            let mut conflict = both & (self.excl[bi + w] | self.excl[bj + w]);
+            if conflict == 0 {
+                continue;
+            }
+            if self.unit {
+                total += i64::from(conflict.count_ones());
+            } else {
+                while conflict != 0 {
+                    let bit = conflict.trailing_zeros() as usize;
+                    total += self.weight[w * 64 + bit];
+                    conflict &= conflict - 1;
+                }
+            }
+        }
+        total
+    }
+}
+
+/// The "must not co-schedule" graph over a dispatchable frontier: the nodes plus an
+/// adjacency where an edge means the pair's conflict cost exceeds the tolerated budget.
+///
+/// Built once from the [`ScopeConflicts`] bitsets, then consumed by both the maximum
+/// mutually-compatible set ([`max_compatible`](Self::max_compatible), the parallel
+/// *width*) and the greedy colouring ([`batches`](Self::batches), the parallel *tracks*).
+/// A command that needs both — the `tracks` command reports the width alongside the
+/// batches — shares this one O(n²) build instead of paying for it twice.
+struct ConflictGraph<'a> {
+    nodes: Vec<&'a Ticket>,
+    /// `adj[i]` = indices that must not share a batch with `i` (symmetric).
+    adj: Vec<BTreeSet<usize>>,
+}
+
+impl<'a> ConflictGraph<'a> {
+    fn build(nodes: Vec<&'a Ticket>, max_overlap: i64, weights: &BTreeMap<String, i64>) -> Self {
+        let n = nodes.len();
+        let conflicts = ScopeConflicts::new(&nodes, weights);
+        let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                // An edge (must-separate) only when the pair's conflict cost exceeds the
+                // tolerated budget; pairs within budget may share a batch.
+                if conflicts.cost(i, j) > max_overlap {
+                    adj[i].insert(j);
+                    adj[j].insert(i);
+                }
+            }
+        }
+        Self { nodes, adj }
+    }
+
+    /// Deterministic Welsh–Powell colouring → conflict-free (within budget) batches,
+    /// each sorted by `(priority, id)`. Identical inputs yield identical batches (R13).
+    fn batches(&self) -> Vec<Vec<&'a Ticket>> {
+        let n = self.nodes.len();
+        // Colour by descending degree, tie-break (priority, id).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&x, &y| {
+            self.adj[y].len().cmp(&self.adj[x].len()).then_with(|| {
+                (self.nodes[x].priority, &self.nodes[x].id)
+                    .cmp(&(self.nodes[y].priority, &self.nodes[y].id))
+            })
+        });
+        let mut colour = vec![usize::MAX; n];
+        for &i in &order {
+            let used: BTreeSet<usize> = self.adj[i]
+                .iter()
+                .filter_map(|&j| (colour[j] != usize::MAX).then_some(colour[j]))
+                .collect();
+            let mut c = 0;
+            while used.contains(&c) {
+                c += 1;
+            }
+            colour[i] = c;
+        }
+        let batch_count = colour.iter().copied().max().map_or(0, |m| m + 1);
+        let mut batches: Vec<Vec<&Ticket>> = vec![Vec::new(); batch_count];
+        for (i, &c) in colour.iter().enumerate() {
+            batches[c].push(self.nodes[i]);
+        }
+        for batch in &mut batches {
+            batch.sort_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)));
+        }
+        batches
+    }
+
+    /// The largest mutually-compatible subset (maximum independent set in the conflict
+    /// graph): exact for a frontier of ≤ 22, a greedy lower bound above.
+    fn max_compatible(&self) -> usize {
+        let n = self.adj.len();
+        if n == 0 {
+            return 0;
+        }
+        if n > 22 {
+            return greedy_independent_set(&self.adj);
+        }
+        let all: Vec<usize> = (0..n).collect();
+        max_independent_set(&self.adj, &all)
+    }
 }
 
 /// Whether `from` transitively depends on `to` (directed reachability over dep
@@ -736,20 +881,78 @@ fn critical_path<'a>(
     best
 }
 
-/// Count of transitively-dependent tickets `node` would unblock.
-fn downstream_count(node: &str, dependents: &BTreeMap<&str, Vec<&str>>) -> i64 {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
-        if let Some(ds) = dependents.get(n) {
-            for &d in ds {
-                if seen.insert(d) {
-                    stack.push(d);
+/// The number of distinct transitive dependents each node would unblock, for *every*
+/// node, in one shared pass rather than an independent BFS per node.
+///
+/// Callers (`next` scoring, `graph` export) previously ran `downstream_count` once per
+/// node — O(V·(V+E)) with the overlapping descendant work redone every time. This walks
+/// the dependents DAG in reverse-topological order (descendants before ancestors) and
+/// unions each node's descendant *bitset* from its already-computed children, so the
+/// shared sub-DAGs are visited once: O(V·W + E·W) time with `W = ⌈V/64⌉` bitset words.
+///
+/// Transitive-descendant counts on a general DAG cannot be summed from child counts
+/// (descendant sets overlap), so a set representation is required; the bitset keeps the
+/// union and the final popcount cheap. `dependents` already excludes terminal dependents,
+/// so this counts only still-waiting work — the same semantics as before.
+fn downstream_counts<'a>(dependents: &BTreeMap<&'a str, Vec<&'a str>>) -> BTreeMap<&'a str, i64> {
+    let ids: Vec<&str> = dependents.keys().copied().collect();
+    let n = ids.len();
+    if n == 0 {
+        return BTreeMap::new();
+    }
+    let index: BTreeMap<&str, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let words = n.div_ceil(64);
+
+    // Reverse-topological order (each node after all its descendants) via iterative
+    // post-order DFS over the dependents edges. The graph is already proven acyclic.
+    let mut visited = vec![false; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        stack.push((start, false));
+        while let Some((u, emit)) = stack.pop() {
+            if emit {
+                order.push(u);
+                continue;
+            }
+            if visited[u] {
+                continue;
+            }
+            visited[u] = true;
+            stack.push((u, true));
+            for &d in &dependents[ids[u]] {
+                let di = index[d];
+                if !visited[di] {
+                    stack.push((di, false));
                 }
             }
         }
     }
-    seen.len() as i64
+
+    // desc[u] = bitset of every node reachable from u over dependents edges.
+    let mut desc = vec![0u64; n * words];
+    for &u in &order {
+        let base = u * words;
+        for &d in &dependents[ids[u]] {
+            let di = index[d];
+            desc[base + di / 64] |= 1u64 << (di % 64); // d itself
+            let dbase = di * words;
+            for w in 0..words {
+                desc[base + w] |= desc[dbase + w]; // and everything below d
+            }
+        }
+    }
+    ids.iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let base = i * words;
+            let count: u32 = (0..words).map(|w| desc[base + w].count_ones()).sum();
+            (id, i64::from(count))
+        })
+        .collect()
 }
 
 fn find_cycle<'a>(by_id: &BTreeMap<&'a str, &'a Ticket>) -> Option<Vec<String>> {
@@ -891,6 +1094,62 @@ mod tests {
         // why agrees: no conflict between two additive claims.
         let pair = vec![t_scoped("a", &[], &["core"]), t_scoped("b", &[], &["core"])];
         assert!(!why(&pair, "a", "b").unwrap().conflict);
+    }
+
+    #[test]
+    fn conflict_kernel_is_correct_past_the_first_bitset_word() {
+        // The bitset kernel packs the frontier's scope vocabulary 64 to a `u64` word.
+        // Scope indices are assigned in dispatchable (id-sorted) order, so 64 filler
+        // tickets with early ids (`f00`..`f63`), each claiming a distinct scope, consume
+        // word 0; the conflict/compat scopes then land in word 1 — exercising the
+        // multi-word path, not just the first word.
+        let mut set: Vec<Ticket> = Vec::new();
+        for i in 0..64 {
+            let scope = format!("sc{i:02}");
+            set.push(t_scoped(&format!("f{i:02}"), &[scope.as_str()], &[]));
+        }
+        // x1/x2 both claim the same exclusive scope (a conflict); y1/y2 share it additively.
+        set.push(t_scoped("x1", &["word1_excl"], &[]));
+        set.push(t_scoped("x2", &["word1_excl"], &[]));
+        set.push(t_scoped("y1", &[], &["word1_add"]));
+        set.push(t_scoped("y2", &[], &["word1_add"]));
+
+        let batches = tracks(&set, 0, &BTreeMap::new()).unwrap();
+        let batch_of = |id: &str| {
+            batches
+                .iter()
+                .position(|b| b.iter().any(|t| t.id == id))
+                .unwrap()
+        };
+        assert_ne!(
+            batch_of("x1"),
+            batch_of("x2"),
+            "an exclusive scope in the second bitset word still conflicts"
+        );
+        assert_eq!(
+            batch_of("y1"),
+            batch_of("y2"),
+            "an additive scope in the second bitset word still co-schedules"
+        );
+    }
+
+    #[test]
+    fn downstream_counts_dedup_shared_descendants() {
+        // Diamond: `d` depends on `b` and `c`, which each depend on `a`. From `a` the
+        // reachable dependents are {b, c, d} = 3 — `d` must be counted once, not twice
+        // (the property a naive additive roll-up of child counts would get wrong).
+        let tickets = [
+            t("a", "todo", "p2", &[], &[]),
+            t("b", "todo", "p2", &["a"], &[]),
+            t("c", "todo", "p2", &["a"], &[]),
+            t("d", "todo", "p2", &["b", "c"], &[]),
+        ];
+        let graph = Graph::build(&tickets).unwrap();
+        let counts = downstream_counts(&graph.dependents);
+        assert_eq!(counts["a"], 3, "a unblocks b, c, and d (d counted once)");
+        assert_eq!(counts["b"], 1, "b unblocks d");
+        assert_eq!(counts["c"], 1, "c unblocks d");
+        assert_eq!(counts["d"], 0, "d unblocks nothing");
     }
 
     #[test]
