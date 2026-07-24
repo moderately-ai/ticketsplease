@@ -217,14 +217,49 @@ impl Store {
         let (base, warnings) = self.load_all_lenient()?;
         let mut by_id: BTreeMap<String, Ticket> =
             base.into_iter().map(|t| (t.id.clone(), t)).collect();
-        for branch in self.branches_with_prefix(prefix)? {
-            let id = branch.strip_prefix(prefix).unwrap_or(&branch).to_string();
-            // A branch whose ticket file is absent on its tip is simply not overlaid.
-            if let Ok(t) = self.load_at_ref(&id, &branch) {
+        for (_branch, ticket) in self.load_branch_tickets(prefix)? {
+            // A branch whose ticket file is absent on its tip (or unparseable) is simply
+            // not overlaid; an overlaid ticket wins over its working-tree twin by id.
+            if let Some(t) = ticket {
                 by_id.insert(t.id.clone(), t);
             }
         }
         Ok((by_id.into_values().collect(), warnings))
+    }
+
+    /// Each `<prefix>*` branch paired with its ticket parsed from that branch's tip
+    /// (`None` when the ticket file is absent on the tip or fails to parse), preserving
+    /// the branch→ticket association the cross-branch overlay drops.
+    ///
+    /// Reads every branch's ticket file in a *single* `cat-file --batch` — 2 subprocesses
+    /// total, not 1 + one `git show` per branch. This is the shared batching path behind
+    /// both [`load_all_cross_branch`](Self::load_all_cross_branch) and the branch-source
+    /// `status` scan; at thousands of `tkt/*` branches it is the guard/status hot path.
+    pub fn load_branch_tickets(&self, prefix: &str) -> Result<Vec<(String, Option<Ticket>)>> {
+        let branches = self.branches_with_prefix(prefix)?;
+        let specs: Vec<String> = branches
+            .iter()
+            .map(|branch| {
+                let id = branch.strip_prefix(prefix).unwrap_or(branch);
+                format!("{branch}:{}/{id}.md", self.config.tickets_dir)
+            })
+            .collect();
+        let reg = self.config.state_registry();
+        let blobs = self.cat_file_batch(&specs)?;
+        Ok(branches
+            .into_iter()
+            .zip(blobs)
+            .map(|(branch, blob)| {
+                let ticket = blob.and_then(|bytes| {
+                    let raw = String::from_utf8_lossy(&bytes);
+                    Ticket::parse(&raw).ok().map(|mut t| {
+                        t.resolve_class(&reg);
+                        t
+                    })
+                });
+                (branch, ticket)
+            })
+            .collect())
     }
 
     /// Local branch names under `refs/heads/<prefix>*`. Empty (not an error) when
@@ -320,22 +355,17 @@ impl Store {
         if !ls.status.success() {
             return Ok(Vec::new());
         }
-        let mut out = Vec::new();
-        for name in String::from_utf8_lossy(&ls.stdout)
+        // One `cat-file --batch` for every comment blob rather than a `git show` each.
+        let listing = String::from_utf8_lossy(&ls.stdout);
+        let specs: Vec<String> = listing
             .lines()
             .filter(|l| l.ends_with(".md"))
-        {
-            let blob = format!("{git_ref}:{rel}/{name}");
-            let show = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_root)
-                .args(["show", &blob])
-                .output()
-                .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
-            if show.status.success() {
-                let raw = String::from_utf8_lossy(&show.stdout);
-                out.push(Comment::parse(&raw)?);
-            }
+            .map(|name| format!("{git_ref}:{rel}/{name}"))
+            .collect();
+        let mut out = Vec::new();
+        for blob in self.cat_file_batch(&specs)?.into_iter().flatten() {
+            let raw = String::from_utf8_lossy(&blob);
+            out.push(Comment::parse(&raw)?);
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -388,6 +418,64 @@ impl Store {
     /// All activity events, sorted chronologically by id. Empty when there is no
     /// git repo or no events yet.
     pub fn events(&self) -> Result<Vec<Event>> {
+        self.events_since(None)
+    }
+
+    /// Activity events whose id sorts strictly after `since` (all of them when `None`),
+    /// sorted chronologically by id. Empty when there is no git repo or no events yet.
+    ///
+    /// Two git processes total regardless of event count: one `for-each-ref` to list the
+    /// event refs (as `<id> <blob-sha>` pairs), then a single `cat-file --batch` reading
+    /// only the blobs newer than `since`. The `since` cursor is applied to the *refnames*
+    /// before the batch, so a `--watch` poll dereferences only genuinely new events
+    /// instead of re-reading the entire log every interval.
+    pub fn events_since(&self, since: Option<&str>) -> Result<Vec<Event>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args([
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/ticketsplease/events/",
+            ])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !out.status.success() {
+            return Ok(Vec::new());
+        }
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let mut shas = Vec::new();
+        for line in listing.lines().filter(|l| !l.is_empty()) {
+            // `refs/ticketsplease/events/<id> <sha>`
+            let Some((refname, sha)) = line.rsplit_once(' ') else {
+                continue;
+            };
+            let id = refname
+                .strip_prefix("refs/ticketsplease/events/")
+                .unwrap_or(refname);
+            if since.map_or(true, |s| id > s) {
+                shas.push(sha.to_string());
+            }
+        }
+        let mut events: Vec<Event> = self
+            .cat_file_batch(&shas)?
+            .into_iter()
+            .flatten()
+            .filter_map(|bytes| serde_json::from_slice::<Event>(&bytes).ok())
+            .collect();
+        events.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(events)
+    }
+
+    /// Delete every event ref whose id sorts strictly before `before`, compacting the log,
+    /// and return how many were pruned. One `for-each-ref` to list plus one
+    /// `update-ref --stdin` to delete the whole batch — never a delete per ref.
+    ///
+    /// The event log is the live coordination doorbell, not the durable record (that is
+    /// the tickets themselves), so dropping historical events is safe. Bounding the log
+    /// this way is the counterpart to the batched read: reads are cheap per event now, but
+    /// the ref count itself should still be boundable on a long-lived repo.
+    pub fn prune_events_before(&self, before: &str) -> Result<usize> {
         let out = Command::new("git")
             .arg("-C")
             .arg(&self.repo_root)
@@ -399,28 +487,50 @@ impl Store {
             .output()
             .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
         if !out.status.success() {
-            return Ok(Vec::new());
+            return Ok(0);
         }
-        let mut events = Vec::new();
-        for refname in String::from_utf8_lossy(&out.stdout)
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let victims: Vec<&str> = listing
             .lines()
-            .filter(|l| !l.is_empty())
-        {
-            let show = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_root)
-                .args(["cat-file", "-p", refname])
-                .output()
-                .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
-            if show.status.success() {
-                let raw = String::from_utf8_lossy(&show.stdout);
-                if let Ok(ev) = serde_json::from_str::<Event>(&raw) {
-                    events.push(ev);
-                }
-            }
+            .filter(|refname| {
+                let id = refname
+                    .strip_prefix("refs/ticketsplease/events/")
+                    .unwrap_or(refname);
+                id < before
+            })
+            .collect();
+        if victims.is_empty() {
+            return Ok(0);
         }
-        events.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(events)
+        // `update-ref --stdin` applies all deletions in one transaction. Omitting the
+        // old-value means "delete whatever it points at" — correct for a GC sweep.
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Internal("git update-ref stdin unavailable".into()))?;
+        let commands: String = victims.iter().map(|r| format!("delete {r}\n")).collect();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(commands.as_bytes());
+        });
+        let done = child.wait_with_output().map_err(Error::Io)?;
+        let _ = writer.join();
+        if !done.status.success() {
+            let err = String::from_utf8_lossy(&done.stderr);
+            return Err(Error::Invalid(format!(
+                "git update-ref --stdin (prune) failed: {}",
+                err.trim()
+            )));
+        }
+        Ok(victims.len())
     }
 
     /// Write `content` to the object store as a loose blob, returning its sha.
@@ -455,6 +565,50 @@ impl Store {
         Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
         ))
+    }
+
+    /// Read many git objects in a *single* `git cat-file --batch` process, returning each
+    /// spec's raw content in input order (`None` for a missing object). `specs` are
+    /// anything cat-file accepts on stdin — object shas, refnames, or `<rev>:<path>`.
+    ///
+    /// This is the batching primitive that collapses the store's per-item `git show` /
+    /// `git cat-file -p` fan-outs (events, cross-branch overlays, cross-ref comments) from
+    /// one subprocess *per object* to one subprocess *total*. At thousands of events or
+    /// branches the process-spawn cost dominated everything else; one pipe replaces it.
+    ///
+    /// stdin is fed from a separate thread so a large stdout can drain concurrently — the
+    /// classic write-all-then-read pipe deadlock cannot occur.
+    fn cat_file_batch(&self, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Internal("git cat-file stdin unavailable".into()))?;
+        let input = specs.join("\n");
+        let writer = std::thread::spawn(move || {
+            // Best-effort: if git exits early (e.g. a bad spec) the write errors; the
+            // caller surfaces that via the parsed output, not this thread.
+            let _ = stdin.write_all(input.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            // Dropping `stdin` here closes it, signalling EOF so git flushes and exits.
+        });
+        let out = child.wait_with_output().map_err(Error::Io)?;
+        let _ = writer.join();
+        if !out.status.success() {
+            return Ok(specs.iter().map(|_| None).collect());
+        }
+        Ok(parse_cat_file_batch(&out.stdout, specs.len()))
     }
 
     /// Atomically overwrite a ticket file. Writes back to the path the ticket was
@@ -651,6 +805,46 @@ pub fn default_config_template(tickets_dir: &str) -> String {
     )
 }
 
+/// Parse the output of `git cat-file --batch` into one entry per requested spec.
+///
+/// The `--batch` record for a found object is `<oid> <type> <size>\n<content>\n`; for a
+/// missing one it is `<spec> missing\n`. Content is read by its declared byte length (it
+/// may contain newlines), never by line-splitting. Malformed or truncated output stops
+/// parsing and pads the remainder with `None` rather than panicking.
+fn parse_cat_file_batch(data: &[u8], expected: usize) -> Vec<Option<Vec<u8>>> {
+    let mut results = Vec::with_capacity(expected);
+    let mut i = 0;
+    while results.len() < expected {
+        let Some(rel_nl) = data
+            .get(i..)
+            .and_then(|s| s.iter().position(|&b| b == b'\n'))
+        else {
+            break;
+        };
+        let header = &data[i..i + rel_nl];
+        i += rel_nl + 1;
+        if header.ends_with(b" missing") {
+            results.push(None);
+            continue;
+        }
+        // `<oid> <type> <size>` — size is the last space-separated token.
+        let size = std::str::from_utf8(header)
+            .ok()
+            .and_then(|h| h.rsplit(' ').next())
+            .and_then(|s| s.parse::<usize>().ok());
+        let Some(size) = size else { break };
+        if i + size > data.len() {
+            break; // truncated content — treat the rest as unavailable
+        }
+        results.push(Some(data[i..i + size].to_vec()));
+        i += size + 1; // skip the content and its trailing newline
+    }
+    while results.len() < expected {
+        results.push(None);
+    }
+    results
+}
+
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -681,6 +875,40 @@ fn create_exclusive(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cat_file_batch_parses_mixed_present_missing_and_binary_content() {
+        // Two found objects (the second's content contains a newline, so it must be read
+        // by declared byte length, not line-split) with a missing one between them.
+        let body_a = "first";
+        let body_b = "line1\nline2"; // 11 bytes, embedded newline
+        let mut data = Vec::new();
+        data.extend_from_slice(format!("aaaa blob {}\n", body_a.len()).as_bytes());
+        data.extend_from_slice(body_a.as_bytes());
+        data.push(b'\n');
+        data.extend_from_slice(b"deadbeef missing\n");
+        data.extend_from_slice(format!("bbbb blob {}\n", body_b.len()).as_bytes());
+        data.extend_from_slice(body_b.as_bytes());
+        data.push(b'\n');
+
+        let out = parse_cat_file_batch(&data, 3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].as_deref(), Some(body_a.as_bytes()));
+        assert_eq!(out[1], None, "the missing object maps to None");
+        assert_eq!(out[2].as_deref(), Some(body_b.as_bytes()));
+    }
+
+    #[test]
+    fn cat_file_batch_pads_truncated_output_with_none() {
+        // Only one record for two expected specs -> the second is padded None, no panic.
+        let data = b"aaaa blob 2\nhi\n";
+        let out = parse_cat_file_batch(data, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].as_deref(), Some(&b"hi"[..]));
+        assert_eq!(out[1], None);
+        // Empty input for a non-zero expectation is all None, not a panic.
+        assert_eq!(parse_cat_file_batch(b"", 2), vec![None, None]);
+    }
 
     #[test]
     fn slugify_basic() {

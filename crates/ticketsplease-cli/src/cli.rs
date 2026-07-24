@@ -573,6 +573,14 @@ pub struct EventsArgs {
     /// With `--watch`, give up after this many seconds (exit 7).
     #[arg(long)]
     pub timeout: Option<u64>,
+    /// Compact the log: delete event refs older than `--before <id>`. Events are a live
+    /// doorbell, not the durable record, so pruning history is safe. Requires an explicit
+    /// `--before` cutoff so a bare `--prune` can never wipe the whole log.
+    #[arg(long, requires = "before")]
+    pub prune: bool,
+    /// With `--prune`, the exclusive cutoff: delete every event whose id sorts before this.
+    #[arg(long)]
+    pub before: Option<String>,
 }
 
 /// `next` arguments.

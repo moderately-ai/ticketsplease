@@ -1391,13 +1391,36 @@ pub fn events(repo: &Path, fmt: Format, args: &EventsArgs) -> Result<()> {
     if let Some(ticket) = &args.ticket {
         store.load(ticket)?; // NotFound (exit 4) for a ghost ticket
     }
+    if args.prune {
+        // `--prune` requires `--before` (enforced by clap), so the cutoff is present.
+        let before = args.before.as_deref().unwrap_or_default();
+        let pruned = store.prune_events_before(before)?;
+        return match fmt {
+            Format::Json => print_json(&json!({
+                "schema_version": 1,
+                "pruned": pruned,
+                "before": before,
+            })),
+            Format::Human => {
+                println!("pruned {pruned} event(s) before {before}");
+                Ok(())
+            }
+        };
+    }
     if !args.watch {
         let evs = filter_events(store.events()?, args);
         return print_events(fmt, &evs);
     }
     let start = Instant::now();
+    // Tail incrementally: advance a cursor to the newest event seen each poll so a busy
+    // log is not re-read in full every interval — only events past the cursor are fetched.
+    let mut cursor: Option<String> = args.since.clone();
     loop {
-        let evs = filter_events(store.events()?, args);
+        let batch = store.events_since(cursor.as_deref())?;
+        if let Some(last) = batch.last() {
+            cursor = Some(last.id.clone()); // sorted by id, so last is newest
+        }
+        let evs = filter_events(batch, args);
         if !evs.is_empty() {
             return print_events(fmt, &evs);
         }
@@ -1942,19 +1965,11 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
         };
     }
 
-    let pattern = format!("refs/heads/{}*", args.prefix);
-    let branches = git_lines(
-        repo,
-        &["for-each-ref", "--format=%(refname:short)", &pattern],
-    )?;
+    // One `cat-file --batch` over all `prefix*` branch tips, not a `git show` per branch.
     let mut rows = Vec::new();
-    for branch in &branches {
-        let id = branch
-            .strip_prefix(&args.prefix)
-            .unwrap_or(branch)
-            .to_string();
-        match store.load_at_ref(&id, branch) {
-            Ok(t) => rows.push(json!({
+    for (branch, ticket) in store.load_branch_tickets(&args.prefix)? {
+        match ticket {
+            Some(t) => rows.push(json!({
                 "branch": branch,
                 "id": t.id,
                 "status": t.status.as_str(),
@@ -1962,12 +1977,18 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
                 "lease_expires_at": t.lease_expires_at,
             })),
             // The ticket file may be absent on this branch tip — report, don't abort.
-            Err(_) => rows.push(json!({
-                "branch": branch,
-                "id": id,
-                "status": Value::Null,
-                "note": "ticket not found on branch tip",
-            })),
+            None => {
+                let id = branch
+                    .strip_prefix(&args.prefix)
+                    .unwrap_or(&branch)
+                    .to_string();
+                rows.push(json!({
+                    "branch": branch,
+                    "id": id,
+                    "status": Value::Null,
+                    "note": "ticket not found on branch tip",
+                }));
+            }
         }
     }
     match fmt {

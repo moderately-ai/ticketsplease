@@ -1217,6 +1217,70 @@ fn status_claim_release_emit_events() {
     assert!(kinds.contains(&"release"), "release event: {kinds:?}");
 }
 
+/// `events --prune --before <id>` compacts the log: it deletes exactly the events whose
+/// id sorts before the cutoff, leaves the rest intact, and requires an explicit cutoff.
+#[test]
+fn events_prune_before_compacts_the_log() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+
+    // Emit a handful of events (status transitions) so the log has several ids.
+    for st in ["review", "todo", "review", "todo", "review"] {
+        tkt(repo)
+            .args(["set", "t", "--status", st])
+            .assert()
+            .success();
+    }
+    let ids = |repo: &std::path::Path| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_slice(
+            &tkt(repo)
+                .args(["events", "--format", "json"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let before = ids(repo);
+    assert!(before.len() >= 5, "expected several events: {before:?}");
+
+    // Prune everything before the third id: the first two go, the rest stay.
+    let cutoff = before[2].clone();
+    let out = tkt(repo)
+        .args(["events", "--prune", "--before", &cutoff, "--format", "json"])
+        .output()
+        .unwrap();
+    let pruned: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        pruned["pruned"].as_u64().unwrap(),
+        2,
+        "two events before cutoff"
+    );
+
+    let after = ids(repo);
+    assert_eq!(
+        after,
+        before[2..].to_vec(),
+        "only pre-cutoff events removed"
+    );
+
+    // Safety: a bare `--prune` with no `--before` is rejected (never wipes the log).
+    tkt(repo).args(["events", "--prune"]).assert().failure();
+    assert_eq!(ids(repo), after, "the rejected prune changed nothing");
+}
+
 /// `events --watch` returns immediately when an event exists, and exits 7 on timeout.
 #[test]
 fn events_watch_wakes_and_times_out() {
