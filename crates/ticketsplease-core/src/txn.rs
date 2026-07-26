@@ -380,6 +380,7 @@ mod tests {
             paths: vec![],
             tags: vec![],
             body: format!("body for {}\n", title),
+            template: None,
         }
     }
 

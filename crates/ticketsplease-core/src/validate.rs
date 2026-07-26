@@ -198,6 +198,7 @@ mod tests {
             paths: vec![],
             tags: vec![],
             body: String::new(),
+            template: None,
         }
     }
 

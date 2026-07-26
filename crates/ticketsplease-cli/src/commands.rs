@@ -16,11 +16,12 @@ use ticketsplease_core::config::{Backend, Config, Recipe, CONFIG_FILE};
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
+use ticketsplease_core::plan::{plan_creates, CreateRenderer, CreateSpec};
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::views::Views;
 use ticketsplease_core::{
-    lint as lint_core, query, schedule, validate_ticket_links, Error, Priority, Result, StateClass,
-    StateRegistry, Store, Ticket, WriteFields,
+    lint as lint_core, query, schedule, validate_plan, validate_ticket_links, Error, Priority,
+    Result, StateClass, StateRegistry, Store, Ticket, ValidationOptions, WriteFields,
 };
 
 use crate::cli::{
@@ -462,49 +463,41 @@ fn parse_manifest(from: &str, raw: &str) -> Result<Vec<TicketSpec>> {
     }
 }
 
-/// A batch spec with its fields parsed once (shared by the validate and write passes).
-struct ParsedSpec {
-    id: Option<String>,
-    title: String,
-    status: String,
-    priority: Priority,
-    depends_on: Vec<String>,
-    related: Vec<String>,
-    scopes: Vec<String>,
-    shared_scopes: Vec<String>,
-    paths: Vec<String>,
-    tags: Vec<String>,
-    body: String,
-    template: Option<String>,
+/// CLI renderer: resolves `--body` / `template` with `{{id}}` bound to the **final** id.
+struct BatchCreateRenderer<'a> {
+    repo: &'a Path,
 }
 
-impl ParsedSpec {
-    /// Render this spec's ticket contents for a chosen id. `repo` is needed to resolve
-    /// a `template` body (with `{{id}}` bound to the final id).
-    fn render(&self, repo: &Path, id: &str) -> Result<String> {
-        let body =
-            resolve_create_body(repo, &self.body, self.template.as_deref(), id, &self.title)?;
+impl CreateRenderer for BatchCreateRenderer<'_> {
+    fn render(&mut self, spec: &CreateSpec, final_id: &str) -> Result<String> {
+        let body = resolve_create_body(
+            self.repo,
+            &spec.body,
+            spec.template.as_deref(),
+            final_id,
+            &spec.title,
+        )?;
         Ticket::new(
-            id,
-            &self.title,
-            &self.status,
-            self.priority,
-            &self.depends_on,
-            &self.related,
-            &self.scopes,
-            &self.shared_scopes,
-            &self.paths,
-            &self.tags,
+            final_id,
+            &spec.title,
+            &spec.status,
+            spec.priority,
+            &spec.depends_on,
+            &spec.related,
+            &spec.scopes,
+            &spec.shared_scopes,
+            &spec.paths,
+            &spec.tags,
             &body,
         )
         .map(|t| t.render())
     }
 }
 
-/// Batch-create from a JSON array of specs (file path, or `-` for stdin). The batch
-/// is validated in full before any write (a bad element aborts before partial state),
-/// auto-ids are content-addressed-idempotent (re-running is a no-op, not a clone),
-/// and the result reports created vs unchanged per element.
+/// Batch-create from a JSON array or TOML `[[ticket]]` manifest (file path, or `-` for
+/// stdin). Pipeline: parse → plan_creates (final ids) → validate_plan → dry-run emit
+/// **or** journaled `Store::commit`. All-or-nothing on failure; dry-run reports the
+/// same final ids the write would use.
 fn create_batch(
     store: &Store,
     fmt: Format,
@@ -516,129 +509,71 @@ fn create_batch(
     let raw_specs = parse_manifest(from, &raw)?;
 
     // Parse every element up front so a bad status/priority aborts before any write.
-    let specs: Vec<ParsedSpec> = raw_specs
-        .into_iter()
-        .enumerate()
-        .map(|(i, s)| {
-            Ok(ParsedSpec {
-                status: s.status.clone().unwrap_or_else(|| "todo".to_string()),
-                priority: parse_field(s.priority.as_deref().unwrap_or("p2"), i)?,
-                id: s.id,
-                title: s.title,
-                depends_on: norm_list(&s.depends_on),
-                related: norm_list(&s.related),
-                scopes: norm_list(&s.scopes),
-                shared_scopes: norm_list(&s.shared_scopes),
-                paths: norm_list(&s.paths),
-                tags: norm_list(&s.tags),
-                body: s.body,
-                template: s.template,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    // Validate pass (no writes): render each ticket, and reject an explicit id that is
-    // invalid or already on disk with different content — so the batch is all-or-nothing
-    // for these failure modes rather than applying partially.
     let registry = store.config.state_registry();
-    for spec in &specs {
-        if !registry.contains(&spec.status) {
+    let mut create_specs: Vec<CreateSpec> = Vec::with_capacity(raw_specs.len());
+    for (i, s) in raw_specs.into_iter().enumerate() {
+        let status = s.status.clone().unwrap_or_else(|| "todo".to_string());
+        if !registry.contains(&status) {
             return Err(Error::Invalid(format!(
-                "unknown status `{}` (not a defined workflow state; see `tkt states`)",
-                spec.status
+                "unknown status `{status}` (not a defined workflow state; see `tkt states`)"
             )));
         }
-        if let Some(id) = &spec.id {
+        let priority: Priority = parse_field(s.priority.as_deref().unwrap_or("p2"), i)?;
+        if let Some(id) = &s.id {
             store::validate_slug(id)?;
-            let contents = spec.render(&store.repo_root, id)?;
-            let path = store.path_for(id);
-            if path.exists() && std::fs::read_to_string(&path).map_err(Error::Io)? != contents {
-                return Err(Error::Invalid(format!(
-                    "ticket `{id}` already exists with different content"
-                )));
-            }
-        } else {
-            // Render at the base id just to surface any render error before writing.
-            spec.render(&store.repo_root, &store::slugify(&spec.title))?;
         }
+        create_specs.push(CreateSpec {
+            id: s.id,
+            title: s.title,
+            status,
+            priority,
+            depends_on: norm_list(&s.depends_on),
+            related: norm_list(&s.related),
+            scopes: norm_list(&s.scopes),
+            shared_scopes: norm_list(&s.shared_scopes),
+            paths: norm_list(&s.paths),
+            tags: norm_list(&s.tags),
+            body: s.body,
+            template: s.template,
+        });
     }
 
-    // Scope + link validation (unless bypassed): undefined scopes and dangling
-    // related/dependency ids fail the whole batch here, before any write. Intra-batch
-    // cross-references resolve (the batch's own ids count as existing) and the combined
-    // graph is cycle-checked. Runs before the dry-run preview so it is caught either way.
-    if !no_validate {
-        let mut graph = store.load_all_lenient()?.0;
-        let base = graph.len();
-        for spec in &specs {
-            let id = spec
-                .id
-                .clone()
-                .unwrap_or_else(|| store::slugify(&spec.title));
-            graph.push(Ticket::new(
-                &id,
-                &spec.title,
-                &spec.status,
-                spec.priority,
-                &spec.depends_on,
-                &spec.related,
-                &spec.scopes,
-                &spec.shared_scopes,
-                &spec.paths,
-                &spec.tags,
-                "",
-            )?);
-        }
-        let known: BTreeMap<&str, &Ticket> = graph.iter().map(|t| (t.id.as_str(), t)).collect();
-        for (spec, t) in specs.iter().zip(&graph[base..]) {
-            validate_write(
-                &store.config,
-                &t.id,
-                &WriteFields {
-                    scopes: &spec.scopes,
-                    shared_scopes: &spec.shared_scopes,
-                    related: &spec.related,
-                    dependencies: &spec.depends_on,
-                },
-                &known,
-            )?;
-        }
-        schedule::ensure_acyclic(&graph)?;
-    }
+    // Pure plan: freeze final ids (same algorithm as create_unique_idempotent).
+    let snapshot = store.snapshot_for_plan()?;
+    let mut renderer = BatchCreateRenderer {
+        repo: &store.repo_root,
+    };
+    let plan = plan_creates(&snapshot, &create_specs, &mut renderer)?;
 
-    // Preview without writing: report the would-be outcome per element.
+    // Post-image validation. Cycles always run; refs respect --no-validate.
+    let opts = if no_validate {
+        ValidationOptions::cycles_only()
+    } else {
+        ValidationOptions::full()
+    };
+    validate_plan(&store.config, &snapshot, &plan, opts).map_err(enrich_auto_id_hint)?;
+
     if dry_run {
-        let results: Vec<(String, CreateOutcome)> = specs
-            .iter()
-            .map(|spec| {
-                let id = spec
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| store::slugify(&spec.title));
-                let outcome = outcome_for_preview(store, &id);
-                (id, outcome)
-            })
-            .collect();
-        return emit_create_results(fmt, store, &results, true);
+        return emit_create_results(fmt, store, &plan.create_results, true);
     }
 
-    // Write pass.
-    let mut results = Vec::with_capacity(specs.len());
-    for spec in &specs {
-        let item = if let Some(id) = &spec.id {
-            (
-                id.clone(),
-                store.create_exact(id, &spec.render(&store.repo_root, id)?)?,
-            )
-        } else {
-            store.create_unique_idempotent(&store::slugify(&spec.title), |id| {
-                spec.render(&store.repo_root, id)
-            })?
-        };
-        results.push(item);
-    }
+    let report = store.commit(&plan)?;
+    emit_create_results(fmt, store, &report.create_results, false)
+}
 
-    emit_create_results(fmt, store, &results, false)
+/// When a missing dep target equals some planned create's *base* slug but that peer
+/// allocated a different final id, append a hint (no silent rewrite).
+fn enrich_auto_id_hint(err: Error) -> Error {
+    match err {
+        Error::Invalid(msg) if msg.contains("depends on missing ticket") => {
+            // Best-effort hint: callers often hit this when a peer auto-id lost its base.
+            Error::Invalid(format!(
+                "{msg} (hint: if a batch peer auto-allocated a suffix like `name-2`, set an explicit \
+                 `id` on graph members — depends_on tokens are never rewritten)"
+            ))
+        }
+        other => other,
+    }
 }
 
 /// Parse a status/priority field, tagging the error with the batch element index.

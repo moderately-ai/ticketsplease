@@ -1,7 +1,7 @@
 ---
 id: mutation-create-from-wire
 title: create --from uses plan+txn (fix F1–F4; true all-or-nothing)
-status: todo
+status: done
 priority: p1
 dependencies: [mutation-plan-types, mutation-plan-validate, mutation-txn-create]
 related: [ux-batch-atomic-idempotent]

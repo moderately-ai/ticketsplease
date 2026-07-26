@@ -176,8 +176,11 @@ pub struct CreateSpec {
     pub paths: Vec<String>,
     /// Tags.
     pub tags: Vec<String>,
-    /// Body markdown (already resolved templates when provided to plan_creates).
+    /// Body markdown (raw; templates may still need `{{id}}` substitution at final id).
     pub body: String,
+    /// Optional body template name (CLI resolves via `.ticketsplease/templates/`).
+    /// Core's [`TicketRenderer`] ignores this and uses `body` as-is.
+    pub template: Option<String>,
 }
 
 /// One planned create with a frozen final id and fully rendered body.
@@ -490,6 +493,7 @@ mod tests {
             paths: vec![],
             tags: vec![],
             body: "body\n".into(),
+            template: None,
         }
     }
 

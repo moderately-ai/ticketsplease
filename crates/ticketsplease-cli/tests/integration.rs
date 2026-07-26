@@ -2675,6 +2675,191 @@ fn batch_create_rejects_unknown_keys() {
         .code(3);
 }
 
+/// F1: duplicate explicit ids with different bodies abort with nothing written.
+#[test]
+fn batch_duplicate_explicit_ids_different_bodies_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let specs = r#"[
+      {"id":"alpha","title":"First OK"},
+      {"id":"dup","title":"First Dup"},
+      {"id":"dup","title":"Second Dup Different"},
+      {"id":"omega","title":"Would Be Third"}
+    ]"#;
+    let path = repo.join("b.json");
+    std::fs::write(&path, specs).unwrap();
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .code(3);
+    assert!(
+        !repo.join("tickets/alpha.md").exists()
+            && !repo.join("tickets/dup.md").exists()
+            && !repo.join("tickets/omega.md").exists(),
+        "duplicate explicit ids must leave zero new files"
+    );
+}
+
+/// F4: dry-run final auto-id matches the subsequent write when base is occupied.
+#[test]
+fn batch_auto_id_collision_dry_run_matches_write() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "same-title",
+            "--title",
+            "Existing",
+            "--body",
+            "old",
+        ])
+        .assert()
+        .success();
+    let specs = r#"[{"title":"Same Title","body":"new"},{"title":"Other"}]"#;
+    let path = repo.join("b.json");
+    std::fs::write(&path, specs).unwrap();
+    let dry = tkt(repo)
+        .args([
+            "create",
+            "--from",
+            path.to_str().unwrap(),
+            "--dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(dry.status.success());
+    let dry_v: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    let dry_ids: Vec<&str> = dry_v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(dry_ids, vec!["same-title-2", "other"]);
+
+    let real = tkt(repo)
+        .args([
+            "create",
+            "--from",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(real.status.success());
+    let real_v: serde_json::Value = serde_json::from_slice(&real.stdout).unwrap();
+    let real_ids: Vec<&str> = real_v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(real_ids, dry_ids, "dry-run ids must equal write ids");
+    assert!(repo.join("tickets/same-title-2.md").exists());
+}
+
+/// F2: edge to a base slug that a peer lost (suffix) does not silent-rewrite; fails cleanly.
+#[test]
+fn batch_edge_to_missing_after_suffix_does_not_silent_rewrite() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "auth",
+            "--title",
+            "Existing Auth",
+            "--body",
+            "old",
+        ])
+        .assert()
+        .success();
+    // Peer title "Auth" will allocate auth-2; consumer depends_on ["auth"] (existing or wrong).
+    // With existing auth, dep resolves to the *existing* ticket — not silent rewrite to auth-2.
+    // Stronger case: two auto same-title + consumer depends on base that only exists as -2 peer.
+    let specs = r#"[
+      {"title":"Same Title","body":"one"},
+      {"title":"Same Title","body":"two"},
+      {"id":"consumer","title":"Consumer","depends_on":["same-title-2"]}
+    ]"#;
+    let path = repo.join("b.json");
+    std::fs::write(&path, specs).unwrap();
+    // same-title + same-title-2 planned; consumer depends on same-title-2 — should succeed.
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(repo.join("tickets/same-title.md").exists());
+    assert!(repo.join("tickets/same-title-2.md").exists());
+    assert!(repo.join("tickets/consumer.md").exists());
+
+    // Now: depend on a base that is NOT the final id of any peer and not on disk.
+    let dir2 = TempDir::new().unwrap();
+    let repo2 = dir2.path();
+    tkt(repo2).args(["init", "--no-skill"]).assert().success();
+    tkt(repo2)
+        .args([
+            "create",
+            "--id",
+            "ghost-base",
+            "--title",
+            "Occupied",
+            "--body",
+            "x",
+        ])
+        .assert()
+        .success();
+    // Title "Ghost Base" → wants ghost-base, gets ghost-base-2; consumer depends_on ghost-base
+    // which exists (Occupied) — ok. Force missing: depend on a name nobody has.
+    let bad = r#"[
+      {"title":"Peer One","body":"a"},
+      {"id":"c","title":"C","depends_on":["no-such-peer"]}
+    ]"#;
+    let path2 = repo2.join("bad.json");
+    std::fs::write(&path2, bad).unwrap();
+    tkt(repo2)
+        .args(["create", "--from", path2.to_str().unwrap()])
+        .assert()
+        .code(3);
+    assert!(
+        !repo2.join("tickets/peer-one.md").exists() && !repo2.join("tickets/c.md").exists(),
+        "failed batch must write nothing"
+    );
+}
+
+/// Cycle in a batch → exit 5, nothing written; --no-validate still rejects cycles.
+#[test]
+fn batch_cycle_exit_5_nothing_written_even_with_no_validate() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let specs = r#"[
+      {"id":"a","title":"A","depends_on":["b"]},
+      {"id":"b","title":"B","depends_on":["a"]}
+    ]"#;
+    let path = repo.join("c.json");
+    std::fs::write(&path, specs).unwrap();
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap()])
+        .assert()
+        .code(5);
+    assert!(!repo.join("tickets/a.md").exists() && !repo.join("tickets/b.md").exists());
+    tkt(repo)
+        .args(["create", "--from", path.to_str().unwrap(), "--no-validate"])
+        .assert()
+        .code(5);
+    assert!(!repo.join("tickets/a.md").exists() && !repo.join("tickets/b.md").exists());
+}
+
 /// Single and batch create share one result shape: a `results` array.
 #[test]
 fn create_emits_a_uniform_results_array() {
