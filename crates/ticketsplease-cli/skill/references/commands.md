@@ -36,13 +36,17 @@ ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3
                       [--path 'glob'] [--tag t] [--body <s>] [--template <name>] [--dry-run] [--no-validate]
 ticketsplease create --from <file|-> [--dry-run] [--no-validate]
 ```
-Writes new tickets atomically. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
+Writes new tickets. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
 `--template <name>` scaffolds the body from `.ticketsplease/templates/<name>.md` (seeded by `init`; add your own), substituting `{{title}}` and `{{id}}`. An explicit `--body` wins over `--template`; an unknown template is exit 4.
 
-`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). The whole batch is validated before any write (a bad element aborts before partial state). `--dry-run` previews without writing.
+`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly).
 
-**Write-time validation (default on).** `create` rejects (exit 3) a declared **scope not defined** in `ticketsplease.toml` (`[scopes]`/`[scope_crates]`/`[external_scopes]`) and a **dangling `related`/`depends_on`** id, so a bad batch fails at filing rather than surfacing later at `lint`/`guard`. A `--from` batch resolves cross-references among its own members, so a self-consistent batch passes. Pass **`--no-validate`** for a forward reference to a ticket or scope you will add next. (Same checks apply to `set`/`link` — see below.)
+**Transactional batch pipeline.** A `--from` batch freezes **final ids** first (same suffix rules as single auto-id create), validates the full post-image board (board ∪ planned tickets), then applies every create in one journaled commit under `.ticketsplease/txn/`. On any failure the invocation leaves **no partial creates**. `--dry-run` runs the same plan + validate path and reports the **final** ids/outcomes the write would use (no disk). Re-running an identical successful batch is all `created: false`.
+
+**Authoring rule for graphs:** set an explicit `id` on every ticket that another batch member references in `depends_on` / `related`. Edge tokens are **literal** final ids — never silently rewritten to a `slug-2` peer. Auto-id is fine for unreferenced leaves.
+
+**Write-time validation (default on).** `create` rejects (exit 3) a declared **scope not defined** in `ticketsplease.toml` (`[scopes]`/`[scope_crates]`/`[external_scopes]`) and a **dangling `related`/`depends_on`** id. Dependency **cycles** are always rejected (exit 5), including under `--no-validate`. A `--from` batch resolves cross-references among its own **final** ids. Pass **`--no-validate`** only for forward references to tickets/scopes you will add next (skips missing targets and undefined scopes; does **not** skip cycles, bad slugs, unknown keys, or injectivity/content conflicts). (Same ref checks apply to `set`/`link` — see below.)
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
@@ -60,7 +64,7 @@ ticketsplease set (<id> | --where <expr> | --view <name>)
 ```
 Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. An **added** scope that is undefined, or an added `related`/`depends_on` id that does not resolve, is rejected (exit 3) — only the additions are checked, so an unrelated edit never trips on a pre-existing dangling link; `--no-validate` skips it. Setting a terminal status (`done` or `closed`) clears the claim (assignee + lease). `--reason <duplicate|wontdo|obsolete|superseded|cancelled>` and `--note <text>` are valid only alongside `--status closed` (they record the resolution, and are cleared automatically when the ticket later leaves `closed`); prefer the `close`/`reopen` verbs below. When `[workflow] enforce_transitions` is on, a status change that is not a permitted transition is rejected (exit 6) unless `--force` is passed (bulk `--where` skips illegal ones instead). `--dry-run` previews without writing.
 
-**Single vs bulk:** pass an `id` to edit one ticket, or `--where`/`--view` to edit **every matching ticket** in one operation (exactly one of the two; passing both, or neither, is exit 3). Bulk applies field edits only — `--title` and the body edits are single-target and rejected with `--where`/`--view`. A single cycle check runs over the whole edited set after all dependency edits.
+**Single vs bulk:** pass an `id` to edit one ticket, or `--where`/`--view` to edit **every matching ticket** in one operation (exactly one of the two; passing both, or neither, is exit 3). Bulk applies field edits only — `--title` and the body edits are single-target and rejected with `--where`/`--view`. A single cycle check runs over the whole edited set after all dependency edits; changed matches are applied in **one journaled multi-upsert commit** (no partial bulk write on failure).
 
 Single JSON: `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 Bulk JSON: `{ "schema_version", "matched": N, "results": [ {id, changed: bool} ], "dry_run": bool }`.
@@ -290,7 +294,7 @@ JSON (**schema_version 2**): `{ "schema_version", "ticket", "base", "branch", "c
 ticketsplease delete <id>
 ticketsplease rename <old> <new>
 ```
-`delete` removes the ticket file and its comments (git history preserves it). `rename` writes the new file, rewrites the `id`, repoints every dependent, moves the comments, then removes the old file (new-first, so an interruption never loses the ticket).
+`delete` removes the ticket file and its comments in **one journaled commit** (git history preserves the ticket). Inbound `depends_on`/`related` edges are left dangling by design (`lint` reports them). `rename` applies create-new + repoint referrers + move comments + delete-old as **one journaled MutationPlan** so a crash never leaves a dual-id board.
 
 delete JSON: `{ "schema_version", "id", "deleted": true }`. rename JSON: `{ "schema_version", "old", "new", "repointed": [ids] }`.
 

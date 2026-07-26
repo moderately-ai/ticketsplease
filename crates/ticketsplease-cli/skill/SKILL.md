@@ -109,7 +109,7 @@ For the full tuning playbook — scope weights (`[scope_policy]`), the escape ha
 ```sh
 ticketsplease create --title "Add vector index" --priority p1 \
   --scope query/planner --shared-scope changelog --depends-on build-index-trait --related design-doc --template default
-ticketsplease create --from backlog.toml    # batch from a JSON array or TOML [[ticket]] (- reads stdin); all-or-nothing
+ticketsplease create --from backlog.toml    # batch from JSON/TOML (- = stdin); transactional (no partial creates); dry-run shows final ids
 ticketsplease set <id> --status in-progress --add-scope core --add-dependency other
 ticketsplease set --where 'tag:epic' --add-tag ready-soon   # bulk-edit every match (field edits only, not title/body)
 ticketsplease link <id> (--depends-on <o> | --related <o>)  # depends-on cycle → exit 5; related is non-blocking, never cycle-checked

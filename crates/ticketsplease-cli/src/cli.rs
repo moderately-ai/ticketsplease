@@ -149,9 +149,11 @@ pub struct CreateArgs {
     #[arg(long)]
     pub title: Option<String>,
     /// Batch-create from a JSON array of ticket specs, or a TOML `[[ticket]]`
-    /// document (chosen by `.json`/`.toml` extension; `-` reads stdin as JSON). Each
-    /// spec: `{title, id?, status?, priority?, depends_on?, related?, scopes?, paths?,
-    /// tags?, body?}`.
+    /// document (chosen by `.json`/`.toml` extension; `-` reads stdin as JSON unless
+    /// content starts with `[[`). Each spec: `{title, id?, status?, priority?,
+    /// depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?}`.
+    /// Transactional: final ids planned, validated as a whole, committed all-or-nothing.
+    /// Set explicit `id` on every graph member referenced by depends_on/related.
     #[arg(long)]
     pub from: Option<String>,
     /// Explicit id (slug); defaults to a slug of the title.
@@ -192,8 +194,9 @@ pub struct CreateArgs {
     /// Preview what would be created without writing anything.
     #[arg(long)]
     pub dry_run: bool,
-    /// Skip write-time validation (undefined scopes, dangling related/dependency ids).
-    /// Use for a forward reference to a ticket or scope you will add next.
+    /// Skip referential write-time checks (undefined scopes, dangling related/dependency
+    /// ids). Cycles, bad slugs, unknown keys, and content conflicts still fail. Use for a
+    /// forward reference to a ticket or scope you will add next.
     #[arg(long)]
     pub no_validate: bool,
 }

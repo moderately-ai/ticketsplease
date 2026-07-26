@@ -1,7 +1,7 @@
 ---
 id: mutation-plan-docs
 title: "skill/docs: transactional batch + explicit-id graph rule"
-status: todo
+status: done
 priority: p2
 dependencies: [mutation-create-from-wire]
 related: []

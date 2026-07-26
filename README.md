@@ -43,6 +43,7 @@ tkt guide                             # the conceptual model in one screen
 # edit ticketsplease.toml to define your scopes (see below)
 tkt create --title "Add vector index" --priority p1 --scope query/planner
 tkt create --id build-index-trait --title "Build the index trait" --scope core
+tkt create --from backlog.toml          # batch JSON/TOML; transactional, dry-run shows final ids
 tkt link add-vector-index --depends-on build-index-trait
 tkt ready                             # what's dispatchable now
 tkt list --where 'priority:p0 AND NOT status:done'   # boolean filter (AND/OR/NOT, parens)
