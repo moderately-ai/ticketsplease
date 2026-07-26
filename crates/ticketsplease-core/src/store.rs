@@ -40,10 +40,13 @@ impl Store {
     /// Open a repository, loading its config (errors if not initialized).
     pub fn open(repo_root: &Path) -> Result<Self> {
         let config = Config::load(repo_root)?;
-        Ok(Self {
+        let store = Self {
             repo_root: repo_root.to_path_buf(),
             config,
-        })
+        };
+        // Finish or roll back any incomplete multi-file transaction left by a crash.
+        store.recover_pending_txn()?;
+        Ok(store)
     }
 
     /// Every recipe available in this repo: the inline `[recipe.<name>]` tables merged
@@ -910,7 +913,9 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_exclusive(path: &Path, contents: &str) -> Result<()> {
+/// Create a new file exclusively (O_EXCL). Used by single-ticket create and by
+/// journaled multi-create publish. `pub(crate)` so `txn` can publish staged bodies.
+pub(crate) fn create_exclusive(path: &Path, contents: &str) -> Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)

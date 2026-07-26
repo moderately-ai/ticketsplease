@@ -1,7 +1,7 @@
 ---
 id: mutation-txn-create
 title: "core: journaled Store::commit for creates + recovery"
-status: todo
+status: done
 priority: p1
 dependencies: [mutation-plan-types]
 related: []

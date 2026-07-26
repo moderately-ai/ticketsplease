@@ -21,6 +21,7 @@ pub mod schedule;
 pub mod states;
 pub mod store;
 pub mod ticket;
+pub mod txn;
 pub mod validate;
 pub mod views;
 
