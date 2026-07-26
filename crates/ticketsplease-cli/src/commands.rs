@@ -18,6 +18,7 @@ use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::plan::{plan_creates, CreateRenderer, CreateSpec};
 use ticketsplease_core::store::{self, CreateOutcome};
+use ticketsplease_core::txn::plan_upserts;
 use ticketsplease_core::views::Views;
 use ticketsplease_core::{
     lint as lint_core, query, schedule, validate_plan, validate_ticket_links, Error, Priority,
@@ -918,10 +919,14 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
     if any_deps_added {
         schedule::ensure_acyclic(&all)?;
     }
-    if !args.dry_run {
-        for &i in &to_save {
-            store.save(&all[i])?;
-        }
+    // Single journaled commit for every changed match (no sequential save loop).
+    if !args.dry_run && !to_save.is_empty() {
+        let upserts: Vec<(String, String)> = to_save
+            .iter()
+            .map(|&i| (all[i].id.clone(), all[i].render()))
+            .collect();
+        let plan = plan_upserts(&upserts);
+        store.commit(&plan)?;
         for (id, data) in &events {
             let _ = store.emit_event("status", id, None, data.clone());
         }

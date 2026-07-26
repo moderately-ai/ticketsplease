@@ -1,7 +1,7 @@
 ---
 id: mutation-set-bulk-wire
 title: set --where/--view commits via MutationPlan
-status: todo
+status: done
 priority: p2
 dependencies: [mutation-txn-upsert, mutation-plan-validate]
 related: [bulk-edit-manifest]
