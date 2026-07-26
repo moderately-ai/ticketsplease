@@ -19,8 +19,8 @@ use ticketsplease_core::migrate as migrate_core;
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::views::Views;
 use ticketsplease_core::{
-    lint as lint_core, query, schedule, Error, Priority, Result, StateClass, StateRegistry, Store,
-    Ticket,
+    lint as lint_core, query, schedule, validate_ticket_links, Error, Priority, Result, StateClass,
+    StateRegistry, Store, Ticket, WriteFields,
 };
 
 use crate::cli::{
@@ -218,73 +218,14 @@ pub fn self_update(fmt: Format, args: &SelfUpdateArgs) -> Result<()> {
     }
 }
 
-/// The scope and link fields to validate for a create/set/link write.
-struct WriteFields<'a> {
-    scopes: &'a [String],
-    shared_scopes: &'a [String],
-    related: &'a [String],
-    dependencies: &'a [String],
-}
-
-/// Validate a new or edited ticket's scopes and links at write time — the same
-/// vocabulary `lint` enforces, so a bad batch fails at filing instead of surfacing
-/// later at the next gate. `known` maps every id considered to exist (on-disk plus any
-/// same-batch peers) to its ticket. Every problem is aggregated into one error. The
-/// scope check is a no-op when the repo defines no scopes (not using the system).
+/// CLI thin wrapper around core write-time link/scope validation.
 fn validate_write(
     config: &Config,
     id: &str,
-    fields: &WriteFields,
+    fields: &WriteFields<'_>,
     known: &BTreeMap<&str, &Ticket>,
 ) -> Result<()> {
-    let mut problems: Vec<String> = Vec::new();
-    let defined = config.defined_scopes();
-    if !defined.is_empty() {
-        for scope in fields.scopes.iter().chain(fields.shared_scopes) {
-            if !defined.contains(scope.as_str()) {
-                problems.push(format!(
-                    "declares scope `{scope}` not defined in {CONFIG_FILE} \
-                     ([scopes], [scope_crates], or [external_scopes])"
-                ));
-            }
-        }
-    }
-    for r in fields.related {
-        if r == id {
-            problems.push(format!("related link `{r}` points at itself"));
-        } else if !known.contains_key(r.as_str()) {
-            problems.push(format!("related link points at missing ticket `{r}`"));
-        }
-    }
-    for d in fields.dependencies {
-        if d == id {
-            problems.push(format!("dependency `{d}` points at itself"));
-        } else if let Some(dep) = known.get(d.as_str()) {
-            // A live dependency on a ticket closed without completing is a dead end
-            // (mirrors lint's `orphaned-by-closed-dep`).
-            if dep.is_terminal() && !dep.completes_dependencies() {
-                problems.push(format!(
-                    "depends on `{d}` which was closed without completing \
-                     (re-point, waive, or drop it)"
-                ));
-            }
-        } else {
-            problems.push(format!("depends on missing ticket `{d}`"));
-        }
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        let subject = if id.is_empty() {
-            "edit".to_string()
-        } else {
-            format!("ticket `{id}`")
-        };
-        Err(Error::Invalid(format!(
-            "{subject}: {} (pass --no-validate to skip)",
-            problems.join("; ")
-        )))
-    }
+    validate_ticket_links(config, id, fields, known)
 }
 
 /// `create` — write a new ticket (idempotent with an explicit `--id`).

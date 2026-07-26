@@ -21,6 +21,7 @@ pub mod schedule;
 pub mod states;
 pub mod store;
 pub mod ticket;
+pub mod validate;
 pub mod views;
 
 pub use error::{Error, Result};
@@ -28,3 +29,4 @@ pub use plan::{BoardSnapshot, CreateSpec, IdAllocator, MutationPlan, PlannedCrea
 pub use states::{Category, StateClass, StateRegistry};
 pub use store::{CreateOutcome, Store};
 pub use ticket::{ClosedReason, Priority, Ticket};
+pub use validate::{validate_plan, validate_ticket_links, ValidationOptions, WriteFields};

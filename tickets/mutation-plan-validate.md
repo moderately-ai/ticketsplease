@@ -1,7 +1,7 @@
 ---
 id: mutation-plan-validate
 title: "core: validate_plan + move validate_write out of CLI"
-status: todo
+status: done
 priority: p1
 dependencies: [mutation-plan-types]
 related: []
