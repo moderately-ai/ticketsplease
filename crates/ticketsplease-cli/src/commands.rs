@@ -2500,19 +2500,23 @@ pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
     // `tkt migrate` skips it entirely rather than loading every ticket to match nothing,
     // leaving just the one scan inside `migrate_core::migrate`.
     if !remaps.is_empty() {
+        let mut upserts: Vec<(String, String)> = Vec::new();
         for mut ticket in store.load_all()? {
             if let Some((_, new)) = remaps
                 .iter()
                 .find(|(old, _)| ticket.status.eq_ignore_ascii_case(old))
             {
                 ticket.set_status(new, &registry)?;
-                if !dry_run {
-                    store.save(&ticket)?;
-                }
+                upserts.push((ticket.id.clone(), ticket.render()));
                 remapped.push(ticket.id.clone());
             }
         }
         remapped.sort();
+        // One journaled commit for the whole remap pass (no half-remapped board).
+        if !dry_run && !upserts.is_empty() {
+            let plan = plan_upserts(&upserts);
+            store.commit(&plan)?;
+        }
     }
     let report = migrate_core::migrate(&store, dry_run)?;
     // The project skill link is stale when it exists but is not a symlink to the

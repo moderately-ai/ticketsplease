@@ -1,7 +1,7 @@
 ---
 id: mutation-migrate-wire
 title: migrate remap/engine use multi-upsert commit
-status: todo
+status: done
 priority: p3
 dependencies: [mutation-txn-upsert]
 related: [migrate-engine]

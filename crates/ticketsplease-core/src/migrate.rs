@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::frontmatter::Document;
-use crate::store::{self, Store};
+use crate::store::Store;
+use crate::txn::plan_upserts;
 
 /// Managed frontmatter keys the schema guarantees on every ticket. A ticket missing any
 /// of these is "behind" and [`backfill_managed_keys`] adds it. Kept as one list so the
@@ -42,6 +43,7 @@ pub struct MigrateReport {
 pub fn migrate(store: &Store, dry_run: bool) -> Result<MigrateReport> {
     let mut migrated = Vec::new();
     let mut unchanged = 0;
+    let mut upserts: Vec<(String, String)> = Vec::new();
     for path in store.ticket_files()? {
         let raw = std::fs::read_to_string(&path).map_err(Error::Io)?;
         let mut doc = Document::parse(&raw)?;
@@ -53,17 +55,20 @@ pub fn migrate(store: &Store, dry_run: bool) -> Result<MigrateReport> {
             continue;
         }
         backfill_managed_keys(&mut doc)?;
-        if !dry_run {
-            store::write_atomic(&path, &doc.render())?;
-        }
         let id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
+        upserts.push((id.clone(), doc.render()));
         migrated.push(id);
     }
     migrated.sort();
+    // One journaled multi-upsert commit so a mid-run failure cannot leave a half-migrated board.
+    if !dry_run && !upserts.is_empty() {
+        let plan = plan_upserts(&upserts);
+        store.commit(&plan)?;
+    }
     Ok(MigrateReport {
         migrated,
         unchanged,
