@@ -1,7 +1,7 @@
 ---
 id: mutation-plan-acceptance
 title: Permanent acceptance suite + doctor stranded-txn
-status: todo
+status: done
 priority: p2
 dependencies: [mutation-create-from-wire, mutation-set-bulk-wire, mutation-rename-delete-plans, mutation-migrate-wire, mutation-plan-docs]
 related: []

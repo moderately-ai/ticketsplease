@@ -3686,6 +3686,39 @@ pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
         );
     }
 
+    // Stranded multi-file transaction dirs (crash mid-commit). Recovery runs on the next
+    // Store::open; surface them so operators know to re-run any command that opens the store.
+    let txn_root = repo.join(ticketsplease_core::txn::TXN_ROOT);
+    let stranded: Vec<String> = if txn_root.is_dir() {
+        std::fs::read_dir(&txn_root)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if stranded.is_empty() {
+        check(
+            "txn_clean",
+            true,
+            "no stranded multi-file transactions".to_string(),
+        );
+    } else {
+        check(
+            "txn_clean",
+            false,
+            format!(
+                "stranded txn dir(s) under {}: {} (re-run any tkt command to recover, or inspect journal.json)",
+                ticketsplease_core::txn::TXN_ROOT,
+                stranded.join(", ")
+            ),
+        );
+    }
+
     // The skill checks are advisory — a stale/absent global skill copy is a warning to
     // surface, not a reason to fail a repo's setup gate (it has no per-repo fix).
     let ok = checks

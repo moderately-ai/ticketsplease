@@ -3050,6 +3050,50 @@ fn doctor_checks_setup() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
+    // txn_clean is present and ok when no stranded multi-file txns exist.
+    let txn = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "txn_clean")
+        .expect("txn_clean check");
+    assert_eq!(txn["ok"], true);
+}
+
+/// doctor flags stranded `.ticketsplease/txn/*` dirs left by a crash mid-commit.
+#[test]
+fn doctor_flags_stranded_txn_dirs() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    git_init_commit(repo);
+    let stranded = repo.join(".ticketsplease/txn/fake-stranded");
+    std::fs::create_dir_all(&stranded).unwrap();
+    std::fs::write(
+        stranded.join("journal.json"),
+        "{\"phase\":\"publishing\"}\n",
+    )
+    .unwrap();
+    let out = tkt(repo)
+        .args(["doctor", "--format", "json"])
+        .output()
+        .unwrap();
+    // Non-skill failures (including stranded txn) make doctor fail.
+    assert!(!out.status.success(), "stranded txn must fail doctor");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let txn = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "txn_clean")
+        .expect("txn_clean check");
+    assert_eq!(txn["ok"], false);
+    assert!(
+        txn["detail"].as_str().unwrap().contains("fake-stranded"),
+        "detail should name the stranded dir: {}",
+        txn["detail"]
+    );
 }
 
 /// --dry-run previews create/set without writing.
