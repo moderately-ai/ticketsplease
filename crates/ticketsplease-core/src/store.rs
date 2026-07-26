@@ -699,6 +699,26 @@ impl Store {
         }
         unreachable!("u32 id-suffix range is effectively unbounded")
     }
+
+    /// Snapshot for pure planning: lenient tickets + raw file contents for
+    /// content-identical Unchanged checks. Malformed files are omitted from
+    /// `tickets` but still appear in `contents_by_id` when readable.
+    pub fn snapshot_for_plan(&self) -> Result<crate::plan::BoardSnapshot> {
+        let (tickets, _warnings) = self.load_all_lenient()?;
+        let mut contents_by_id = BTreeMap::new();
+        for path in self.ticket_files()? {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if let Ok(raw) = fs::read_to_string(&path) {
+                contents_by_id.insert(stem.to_string(), raw);
+            }
+        }
+        Ok(crate::plan::BoardSnapshot::with_contents(
+            tickets,
+            contents_by_id,
+        ))
+    }
 }
 
 /// Outcome of [`init_repo`].

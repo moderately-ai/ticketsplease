@@ -15,6 +15,7 @@ pub mod guard;
 pub mod ids;
 pub mod lint;
 pub mod migrate;
+pub mod plan;
 pub mod query;
 pub mod schedule;
 pub mod states;
@@ -23,6 +24,7 @@ pub mod ticket;
 pub mod views;
 
 pub use error::{Error, Result};
+pub use plan::{BoardSnapshot, CreateSpec, IdAllocator, MutationPlan, PlannedCreate};
 pub use states::{Category, StateClass, StateRegistry};
-pub use store::Store;
+pub use store::{CreateOutcome, Store};
 pub use ticket::{ClosedReason, Priority, Ticket};
