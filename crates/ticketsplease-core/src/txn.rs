@@ -89,6 +89,9 @@ enum JournalOp {
     DeleteTicket {
         id: String,
         dest: String,
+        /// Relative path under txn dir for pre-delete backup (empty if missing).
+        #[serde(default)]
+        backup: String,
     },
     DeletePath {
         path: String,
@@ -173,9 +176,19 @@ impl Store {
                 }
                 PendingMutation::DeleteTicket { id } => {
                     let dest = self.path_for(id);
+                    // Backup existing contents so a publishing crash can restore the file.
+                    let backup = if dest.exists() {
+                        let backup_rel = format!("staging/backup/delete-{id}.md");
+                        let existing = fs::read_to_string(&dest).map_err(Error::Io)?;
+                        write_stage(&txn_dir.join(&backup_rel), &existing)?;
+                        backup_rel
+                    } else {
+                        String::new()
+                    };
                     journal.ops.push(JournalOp::DeleteTicket {
                         id: id.clone(),
                         dest: dest.display().to_string(),
+                        backup,
                     });
                 }
                 PendingMutation::DeletePath { path } => {
@@ -424,7 +437,12 @@ fn publish_all(store: &Store, txn_dir: &Path, journal: &mut Journal) -> Result<(
                     write_journal(txn_dir, journal)?;
                 }
             }
-            JournalOp::DeleteTicket { id: _, dest } | JournalOp::DeletePath { path: dest } => {
+            JournalOp::DeleteTicket {
+                id: _,
+                dest,
+                backup: _,
+            }
+            | JournalOp::DeletePath { path: dest } => {
                 let p = PathBuf::from(dest);
                 if p.is_dir() {
                     fs::remove_dir_all(&p).map_err(Error::Io)?;
@@ -440,11 +458,29 @@ fn publish_all(store: &Store, txn_dir: &Path, journal: &mut Journal) -> Result<(
 }
 
 fn rollback_all(store: &Store, txn_dir: &Path, journal: &Journal) -> Result<()> {
-    // Reverse order of effects: reverse renames, restore upserts, unlink creates.
-    // Deletes are not restored (they run last in publish; if we failed mid-delete,
-    // earlier ops still roll back; a completed delete stays deleted only if we
-    // reached committed — on publishing failure after a delete, we cannot un-delete
-    // without backups. Delete ops should be last in the plan so this is rare.)
+    // Reverse order of effects: restore deleted ticket files, reverse renames,
+    // restore upserts, unlink creates.
+
+    // Restore deleted ticket files from pre-delete backups (ops list has backup paths).
+    for op in journal.ops.iter().rev() {
+        if let JournalOp::DeleteTicket { dest, backup, .. } = op {
+            if backup.is_empty() {
+                continue;
+            }
+            if !journal.deleted_by_txn.iter().any(|d| d == dest) {
+                continue; // delete never applied
+            }
+            let backup_path = txn_dir.join(backup);
+            if backup_path.exists() {
+                let contents = fs::read_to_string(&backup_path).map_err(Error::Io)?;
+                let dest_path = PathBuf::from(dest);
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent).map_err(Error::Io)?;
+                }
+                store::write_atomic(&dest_path, &contents)?;
+            }
+        }
+    }
 
     for rec in journal.renamed_by_txn.iter().rev() {
         let from = PathBuf::from(&rec.from);

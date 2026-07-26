@@ -1,7 +1,7 @@
 ---
 id: mutation-rename-delete-plans
 title: rename + delete as first-class MutationPlans
-status: todo
+status: done
 priority: p2
 dependencies: [mutation-txn-upsert]
 related: []

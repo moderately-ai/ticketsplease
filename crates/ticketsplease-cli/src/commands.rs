@@ -16,7 +16,9 @@ use ticketsplease_core::config::{Backend, Config, Recipe, CONFIG_FILE};
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
-use ticketsplease_core::plan::{plan_creates, CreateRenderer, CreateSpec};
+use ticketsplease_core::plan::{
+    plan_creates, CreateRenderer, CreateSpec, MutationPlan, PendingMutation,
+};
 use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::txn::plan_upserts;
 use ticketsplease_core::views::Views;
@@ -3482,11 +3484,18 @@ pub fn delete(repo: &Path, fmt: Format, args: &DeleteArgs) -> Result<()> {
     if !path.exists() {
         return Err(Error::NotFound(args.id.clone()));
     }
-    std::fs::remove_file(&path).map_err(Error::Io)?;
+    // One journaled plan: ticket file + comments dir together (no half-delete).
+    // Inbound deps/related are left dangling by design (lint reports them).
+    let mut plan = MutationPlan::default();
+    plan.mutations.push(PendingMutation::DeleteTicket {
+        id: args.id.clone(),
+    });
     let comments = store.comments_dir(&args.id);
     if comments.exists() {
-        std::fs::remove_dir_all(&comments).map_err(Error::Io)?;
+        plan.mutations
+            .push(PendingMutation::DeletePath { path: comments });
     }
+    store.commit(&plan)?;
     match fmt {
         Format::Json => print_json(&json!({ "schema_version": 1, "id": args.id, "deleted": true })),
         Format::Human => {
@@ -3496,9 +3505,8 @@ pub fn delete(repo: &Path, fmt: Format, args: &DeleteArgs) -> Result<()> {
     }
 }
 
-/// `rename` — change a ticket's id: write the new file, repoint every dependent, move
-/// the comments, then remove the old file. New file first so an interruption never
-/// loses the ticket.
+/// `rename` — change a ticket's id: create new + repoint edges + move comments +
+/// delete old as one journaled MutationPlan (no dual-id residual on failure).
 pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
     let store = Store::open(repo)?;
     store::validate_slug(&args.new)?;
@@ -3513,15 +3521,14 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
         )));
     }
     ticket.set_id(&args.new)?;
-    store.create_exact(&args.new, &ticket.render())?;
+    let new_contents = ticket.render();
 
     // Repoint every ticket that referenced the old id — dependency *and* related
-    // edges (a dangling `related` is a `missing-related` lint, so leaving it behind
-    // manufactures the very violation lint then reports). A ticket holding both edge
-    // kinds to the old id is saved once and reported once (union semantics).
+    // edges. Collect full post-image renders; commit applies them with backups.
     let mut repointed = Vec::new();
+    let mut upserts: Vec<(String, String)> = Vec::new();
     for mut t in store.load_all()? {
-        if t.id == args.new {
+        if t.id == args.old || t.id == args.new {
             continue;
         }
         let mut changed = false;
@@ -3536,17 +3543,42 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
             changed = true;
         }
         if changed {
-            store.save(&t)?;
+            upserts.push((t.id.clone(), t.render()));
             repointed.push(t.id.clone());
         }
     }
 
-    // Move the comments directory, then drop the old file.
+    let mut plan = MutationPlan::default();
+    // 1. Create the new ticket file (O_EXCL).
+    plan.mutations.push(PendingMutation::Create {
+        id: args.new.clone(),
+        contents: new_contents,
+        outcome: CreateOutcome::Created,
+    });
+    plan.create_results
+        .push((args.new.clone(), CreateOutcome::Created));
+    // 2. Upsert repointed referrers.
+    for (id, contents) in upserts {
+        plan.mutations.push(PendingMutation::Upsert {
+            id,
+            contents,
+            path: None,
+        });
+    }
+    // 3. Move comments directory if present.
     let old_comments = store.comments_dir(&args.old);
     if old_comments.exists() {
-        std::fs::rename(&old_comments, store.comments_dir(&args.new)).map_err(Error::Io)?;
+        plan.mutations.push(PendingMutation::RenameDir {
+            from: old_comments,
+            to: store.comments_dir(&args.new),
+        });
     }
-    std::fs::remove_file(store.path_for(&args.old)).map_err(Error::Io)?;
+    // 4. Delete the old ticket file last.
+    plan.mutations.push(PendingMutation::DeleteTicket {
+        id: args.old.clone(),
+    });
+
+    store.commit(&plan)?;
 
     match fmt {
         Format::Json => print_json(&json!({
