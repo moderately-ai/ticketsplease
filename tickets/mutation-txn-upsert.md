@@ -1,7 +1,7 @@
 ---
 id: mutation-txn-upsert
 title: "core: upsert mutations with backup/restore in commit"
-status: todo
+status: done
 priority: p2
 dependencies: [mutation-txn-create]
 related: []
