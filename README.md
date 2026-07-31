@@ -4,7 +4,7 @@
 
 `ticketsplease` (short alias `tkt`) manages development work as **git-versioned markdown tickets** carrying dependency and affected-area metadata, and computes **conflict-free parallel work assignment** so multiple workers — primarily AI coding agents, humans secondarily — can be dispatched onto disjoint areas of a codebase without merge collisions. No server, no database: GitHub stays git-only.
 
-It's driven from the command line and built to be scripted: every command speaks JSON, exit codes are the API, and output is deterministic.
+It's driven from the command line and built to be scripted: every command speaks JSON, exit codes are the API, and output is deterministic. Ticket detail commands include complete comment threads; collection commands carry a comment count so discussion is never silently hidden.
 
 ## The two commands that matter
 
@@ -52,6 +52,7 @@ tkt tracks                            # conflict-free parallel batches
 tkt next --parallel 4                 # four disjoint picks for four agents
 tkt guard my-branch                   # gate a branch before merge (exit 6 = conflict)
 tkt status --all-branches             # each worker's tip status across tkt/* branches
+tkt show add-vector-index             # detail + comments from this tree and tkt/add-vector-index
 tkt watch add-vector-index --until review --timeout 600  # block until a worker is ready (exit 7 on timeout)
 tkt lint                              # validate schema, links, and cycles
 ```
@@ -91,6 +92,10 @@ A **scope** is a stable abstract name for an area of the codebase. Tickets refer
 schema_version = 1
 tickets_dir = "tickets"
 default_base = "main"          # base ref for `guard`
+
+[output]
+comments = "auto"              # detail=full thread, collections=count; full|summary|none override
+comment_source = "all"         # union worktree + tkt/<id>; or worktree|ticket-branch
 
 [language]
 backend = "rust"               # "none" (path globs only) or "rust" (also use the cargo crate graph)
@@ -136,6 +141,8 @@ When `backend = "rust"`, the guard maps a branch's changed files to crates and w
 
 **Maintenance advisories (interactive only).** In an interactive human session the CLI may print a stderr hint after a command — an update is available, the repo has drifted (`run tkt migrate`), or the board has lint findings. They are gated off for every non-interactive caller (`--format json`, no TTY, or `CI` set), so agents and pipelines never see them and stdout stays a clean data channel. `[maintenance]` tunes them: `update_check` (default true; probes the latest release at most once per `check_interval_hours`, default 24) and `auto_migrate` (default false — when true, an interactive session auto-applies the drift repair instead of only nudging; the `--auto-doctor` flag does the same for one command). `TICKETSPLEASE_NO_ADVISORIES=1` disables all of them.
 
+**Comment visibility.** Global `--comments auto|full|summary|none` and `--comment-source all|worktree|ticket-branch` override `[output]` for one invocation. `auto` shows full threads for `show`/`comment list`, adds `comment_count` and `comment_sources` to ticket collections, and leaves unrelated results alone. `all` deduplicates by comment id across the current worktree and matching `tkt/<id>` branch while retaining sorted source provenance. `--ref` remains an exact-source detail read.
+
 ## Tool-managed state — `.ticketsplease/`
 
 Saved views (and bundled body templates) live under `.ticketsplease/` at the repo root. Unlike most tool dot-dirs this is **meant to be committed** — a saved view like "the open p0/p1 epic" or a shared ticket-body template is a project artifact, not local state. Don't add it to `.gitignore`.
@@ -143,6 +150,7 @@ Saved views (and bundled body templates) live under `.ticketsplease/` at the rep
 ## The contract
 
 - **`--format json`** on every command yields a stable, versioned payload (`schema_version: 1`), deterministically ordered (sorted keys, no timestamps) — safe to diff and cache.
+- Comment fields are additive within the existing schema versions: summaries use `comment_count`/`comment_sources`; full comment objects also carry `sources`.
 - **Exit codes are the API:** `0` ok · `2` usage · `3` invalid/dirty · `4` not found · `5` dependency cycle · `6` conflict · `7` watch timeout.
 - Every command takes `--repo <path>`; everything is offline and atomic.
 

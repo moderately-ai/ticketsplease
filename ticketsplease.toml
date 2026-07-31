@@ -2,6 +2,10 @@ schema_version = 1
 tickets_dir = "tickets"
 default_base = "main"
 
+[output]
+comments = "auto"
+comment_source = "all"
+
 [language]
 # ticketsplease dogfoods itself: the Rust backend expands a changed crate through
 # the cargo reverse-dependency graph when guarding a branch.

@@ -11,8 +11,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use ticketsplease_cargo::{workspace_members, CargoMapper, WorkspaceMember};
 use ticketsplease_core::claim as claim_core;
-use ticketsplease_core::comment::Comment;
-use ticketsplease_core::config::{Backend, Config, Recipe, CONFIG_FILE};
+use ticketsplease_core::comment::{
+    Comment, CommentQuery, CommentSummary, CommentThread, SourcedComment,
+};
+use ticketsplease_core::config::{
+    Backend, CommentMode, CommentSourceMode, Config, Recipe, CONFIG_FILE,
+};
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
 use ticketsplease_core::migrate as migrate_core;
@@ -34,7 +38,7 @@ use crate::cli::{
     SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs,
     ViewShowArgs, WatchArgs, WhyArgs,
 };
-use crate::format::{print_json, Format};
+use crate::format::{print_json, Format, OutputOverrides};
 use crate::recipe;
 use crate::skill;
 use crate::templates;
@@ -52,6 +56,114 @@ fn buffered_stdout(
     write(&mut out)
         .and_then(|()| out.flush())
         .map_err(Error::Io)
+}
+
+#[derive(Copy, Clone)]
+enum CommentContext {
+    Detail,
+    Collection,
+}
+
+#[derive(Debug)]
+enum LoadedComments {
+    None,
+    Summary(BTreeMap<String, CommentSummary>),
+    Full(BTreeMap<String, CommentThread>),
+}
+
+fn comment_policy(
+    store: &Store,
+    overrides: OutputOverrides,
+    context: CommentContext,
+    prefix: &str,
+) -> (CommentMode, CommentQuery) {
+    let configured = overrides
+        .comments
+        .map(Into::into)
+        .unwrap_or(store.config.output.comments);
+    let mode = match (configured, context) {
+        (CommentMode::Auto, CommentContext::Detail) => CommentMode::Full,
+        (CommentMode::Auto, CommentContext::Collection) => CommentMode::Summary,
+        (other, _) => other,
+    };
+    let source = overrides
+        .comment_source
+        .map(Into::into)
+        .unwrap_or(store.config.output.comment_source);
+    let query = match source {
+        CommentSourceMode::All => CommentQuery::All {
+            prefix: prefix.to_string(),
+        },
+        CommentSourceMode::Worktree => CommentQuery::Worktree,
+        CommentSourceMode::TicketBranch => CommentQuery::TicketBranch {
+            prefix: prefix.to_string(),
+        },
+    };
+    (mode, query)
+}
+
+fn load_comments(
+    store: &Store,
+    ids: &[String],
+    mode: CommentMode,
+    query: &CommentQuery,
+) -> Result<LoadedComments> {
+    match mode {
+        CommentMode::None => Ok(LoadedComments::None),
+        CommentMode::Summary => store
+            .comment_summaries(ids, query)
+            .map(LoadedComments::Summary),
+        CommentMode::Full => store.comment_threads(ids, query).map(LoadedComments::Full),
+        CommentMode::Auto => unreachable!("auto is resolved before comment loading"),
+    }
+}
+
+fn comment_summary<'a>(comments: &'a LoadedComments, id: &str) -> Option<&'a CommentSummary> {
+    match comments {
+        LoadedComments::None => None,
+        LoadedComments::Summary(map) => map.get(id),
+        LoadedComments::Full(map) => map.get(id).map(|t| &t.summary),
+    }
+}
+
+fn comment_thread<'a>(comments: &'a LoadedComments, id: &str) -> Option<&'a CommentThread> {
+    match comments {
+        LoadedComments::Full(map) => map.get(id),
+        _ => None,
+    }
+}
+
+fn enrich_comment_json(value: &mut Value, id: &str, comments: &LoadedComments) {
+    if let Some(summary) = comment_summary(comments, id) {
+        value["comment_count"] = json!(summary.count);
+        value["comment_sources"] = json!(summary.sources);
+    }
+    if let Some(thread) = comment_thread(comments, id) {
+        value["comments"] = json!(thread
+            .comments
+            .iter()
+            .map(sourced_comment_value)
+            .collect::<Vec<_>>());
+    }
+}
+
+fn comment_marker(comments: &LoadedComments, id: &str) -> String {
+    comment_summary(comments, id).map_or_else(String::new, |summary| {
+        if summary.count == 0 {
+            String::new()
+        } else {
+            format!(" [comments:{}]", summary.count)
+        }
+    })
+}
+
+fn print_full_thread_if_any(comments: &LoadedComments, id: &str) {
+    if let Some(thread) = comment_thread(comments, id) {
+        if !thread.comments.is_empty() {
+            println!("  comments for `{id}`:");
+            print_comment_thread(&thread.comments, now_epoch(), 2);
+        }
+    }
 }
 
 /// `init` — scaffold the tickets directory and config.
@@ -1192,23 +1304,37 @@ pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
 
 /// `show` — print a single ticket and its comments, from the working tree or a
 /// git ref (`--ref`).
-pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
+pub fn show(repo: &Path, fmt: Format, output: OutputOverrides, args: &ShowArgs) -> Result<()> {
     let store = Store::open(repo)?;
-    let (ticket, comments) = match &args.r#ref {
+    if args.r#ref.is_some() && output.comment_source.is_some() {
+        return Err(Error::Invalid(
+            "--ref cannot be combined with --comment-source".into(),
+        ));
+    }
+    let (mode, default_query) = comment_policy(&store, output, CommentContext::Detail, "tkt/");
+    let (ticket, query) = match &args.r#ref {
         Some(git_ref) => (
             store.load_at_ref(&args.id, git_ref)?,
-            store.comments_at_ref(&args.id, git_ref)?,
+            CommentQuery::Ref {
+                git_ref: git_ref.clone(),
+            },
         ),
-        None => (store.load(&args.id)?, store.comments(&args.id)?),
+        None => (store.load(&args.id)?, default_query),
     };
+    let comments = load_comments(&store, std::slice::from_ref(&args.id), mode, &query)?;
     match fmt {
         Format::Json => {
             let mut v = ticket_json(&ticket);
-            v["comments"] = json!(comments.iter().map(comment_value).collect::<Vec<_>>());
+            enrich_comment_json(&mut v, &ticket.id, &comments);
             print_json(&v)
         }
         Format::Human => {
-            println!("{}  {}", ticket.id, ticket.title);
+            println!(
+                "{}  {}{}",
+                ticket.id,
+                ticket.title,
+                comment_marker(&comments, &ticket.id)
+            );
             println!("  status:   {}", ticket.status);
             println!("  priority: {}", ticket.priority);
             let line = |label: &str, items: &[String]| {
@@ -1235,9 +1361,11 @@ pub fn show(repo: &Path, fmt: Format, args: &ShowArgs) -> Result<()> {
             if !body.trim().is_empty() {
                 println!("\n{body}");
             }
-            if !comments.is_empty() {
-                println!("\n## Comments");
-                print_comment_thread(&comments, now_epoch());
+            if let Some(thread) = comment_thread(&comments, &ticket.id) {
+                if !thread.comments.is_empty() {
+                    println!("\n## Comments ({})", thread.summary.count);
+                    print_comment_thread(&thread.comments, now_epoch(), 0);
+                }
             }
             Ok(())
         }
@@ -1262,6 +1390,7 @@ pub fn comment_add(repo: &Path, fmt: Format, args: &CommentAddArgs) -> Result<()
     match fmt {
         Format::Json => {
             let mut v = comment_value(&comment);
+            v["sources"] = json!(["worktree"]);
             v["schema_version"] = json!(1);
             v["ticket"] = json!(args.id);
             print_json(&v)
@@ -1274,24 +1403,43 @@ pub fn comment_add(repo: &Path, fmt: Format, args: &CommentAddArgs) -> Result<()
 }
 
 /// `comment list` — a ticket's comments, from the working tree or a git ref.
-pub fn comment_list(repo: &Path, fmt: Format, args: &CommentListArgs) -> Result<()> {
+pub fn comment_list(
+    repo: &Path,
+    fmt: Format,
+    output: OutputOverrides,
+    args: &CommentListArgs,
+) -> Result<()> {
     let store = Store::open(repo)?;
-    let comments = match &args.r#ref {
-        Some(git_ref) => store.comments_at_ref(&args.id, git_ref)?,
+    if args.r#ref.is_some() && output.comment_source.is_some() {
+        return Err(Error::Invalid(
+            "--ref cannot be combined with --comment-source".into(),
+        ));
+    }
+    let (mode, default_query) = comment_policy(&store, output, CommentContext::Detail, "tkt/");
+    let query = match &args.r#ref {
+        Some(git_ref) => CommentQuery::Ref {
+            git_ref: git_ref.clone(),
+        },
         None => {
             // Working-tree read: surface a typo'd ticket id as not-found.
             store.load(&args.id)?;
-            store.comments(&args.id)?
+            default_query
         }
     };
+    let comments = load_comments(&store, std::slice::from_ref(&args.id), mode, &query)?;
     match fmt {
-        Format::Json => print_json(&json!({
-            "schema_version": 1,
-            "ticket": args.id,
-            "comments": comments.iter().map(comment_value).collect::<Vec<_>>(),
-        })),
+        Format::Json => {
+            let mut value = json!({ "schema_version": 1, "ticket": args.id });
+            enrich_comment_json(&mut value, &args.id, &comments);
+            print_json(&value)
+        }
         Format::Human => {
-            print_comment_thread(&comments, now_epoch());
+            if let Some(summary) = comment_summary(&comments, &args.id) {
+                println!("{} comment(s)", summary.count);
+            }
+            if let Some(thread) = comment_thread(&comments, &args.id) {
+                print_comment_thread(&thread.comments, now_epoch(), 0);
+            }
             Ok(())
         }
     }
@@ -1305,6 +1453,12 @@ fn comment_value(c: &Comment) -> Value {
         "reply_to": c.reply_to,
         "body": c.body,
     })
+}
+
+fn sourced_comment_value(c: &SourcedComment) -> Value {
+    let mut value = comment_value(&c.comment);
+    value["sources"] = json!(c.sources);
+    value
 }
 
 /// `events` — the cross-branch activity log, filterable and resumable via `--since`.
@@ -1415,7 +1569,7 @@ fn print_events(fmt: Format, evs: &[Event]) -> Result<()> {
 }
 
 /// `list` — list tickets, optionally filtered by status.
-pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
+pub fn list(repo: &Path, fmt: Format, output: OutputOverrides, args: &ListArgs) -> Result<()> {
     let store = Store::open(repo)?;
     // `--status` matches a workflow state name (custom states allowed); a typo simply
     // matches nothing, like the `--where status:` term.
@@ -1438,10 +1592,20 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
         .filter(|t| !args.hide_done || !t.is_terminal())
         .filter(|t| predicate.as_ref().map_or(true, |p| p.matches(t)))
         .collect();
+    let ids: Vec<String> = tickets.iter().map(|t| t.id.clone()).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
 
     match fmt {
         Format::Json => {
-            let rows: Vec<Value> = tickets.iter().map(ticket_summary).collect();
+            let rows: Vec<Value> = tickets
+                .iter()
+                .map(|ticket| {
+                    let mut value = ticket_summary(ticket);
+                    enrich_comment_json(&mut value, &ticket.id, &comments);
+                    value
+                })
+                .collect();
             print_json(&json!({
                 "schema_version": 1,
                 "tickets": rows,
@@ -1461,11 +1625,14 @@ pub fn list(repo: &Path, fmt: Format, args: &ListArgs) -> Result<()> {
                             t.priority.as_str(),
                             t.status.as_str(),
                             t.id,
-                            t.title
+                            format_args!("{}{}", t.title, comment_marker(&comments, &t.id))
                         )?;
                     }
                     writeln!(out, "({} ticket(s))", tickets.len())
                 })?;
+                for t in &tickets {
+                    print_full_thread_if_any(&comments, &t.id);
+                }
             }
             for warn in &warnings {
                 eprintln!("warning: skipped {warn}");
@@ -1584,7 +1751,7 @@ pub fn view_delete(repo: &Path, fmt: Format, args: &ViewShowArgs) -> Result<()> 
 /// counts, percent done, the ready frontier, and the blocked set. Readiness is
 /// computed over the **full** board (so a dependency outside the selection is still
 /// honoured) and then intersected with the selection. No selector = the whole board.
-pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
+pub fn rollup(repo: &Path, fmt: Format, output: OutputOverrides, args: &RollupArgs) -> Result<()> {
     let store = Store::open(repo)?;
     // Strict load: rollup reports readiness, which needs a valid (acyclic) graph.
     let all = store.load_all()?;
@@ -1654,6 +1821,44 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
         }
     }
 
+    let record_ids: Vec<String> = ready
+        .iter()
+        .map(|t| t.id.clone())
+        .chain(blocked.iter().map(|(t, _)| t.id.clone()))
+        .chain(orphaned.iter().map(|(t, _)| t.id.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &record_ids, comment_mode, &query)?;
+
+    let ready_json: Vec<Value> = ready
+        .iter()
+        .map(|t| {
+            let mut value = json!({
+                "id": t.id, "title": t.title, "priority": t.priority.as_str(),
+            });
+            enrich_comment_json(&mut value, &t.id, &comments);
+            value
+        })
+        .collect();
+    let blocked_json: Vec<Value> = blocked
+        .iter()
+        .map(|(t, unmet)| {
+            let mut value = json!({ "id": t.id, "title": t.title, "unmet": unmet });
+            enrich_comment_json(&mut value, &t.id, &comments);
+            value
+        })
+        .collect();
+    let orphaned_json: Vec<Value> = orphaned
+        .iter()
+        .map(|(t, closed_deps)| {
+            let mut value = json!({ "id": t.id, "title": t.title, "closed_deps": closed_deps });
+            enrich_comment_json(&mut value, &t.id, &comments);
+            value
+        })
+        .collect();
+
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
@@ -1665,15 +1870,9 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
             "width": width,
             "by_status": by_status,
             "by_priority": by_priority,
-            "ready": ready.iter().map(|t| json!({
-                "id": t.id, "title": t.title, "priority": t.priority.as_str(),
-            })).collect::<Vec<_>>(),
-            "blocked": blocked.iter().map(|(t, unmet)| json!({
-                "id": t.id, "title": t.title, "unmet": unmet,
-            })).collect::<Vec<_>>(),
-            "orphaned": orphaned.iter().map(|(t, closed_deps)| json!({
-                "id": t.id, "title": t.title, "closed_deps": closed_deps,
-            })).collect::<Vec<_>>(),
+            "ready": ready_json,
+            "blocked": blocked_json,
+            "orphaned": orphaned_json,
         })),
         Format::Human => {
             let scope = match (&args.tag, &args.where_, &args.view) {
@@ -1710,7 +1909,10 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 .filter_map(|p| by_priority.get(*p).map(|n| format!("{p} {n}")))
                 .collect();
             println!("  priority: {}", join_or_none(&prios));
-            let ready_ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
+            let ready_ids: Vec<String> = ready
+                .iter()
+                .map(|t| format!("{}{}", t.id, comment_marker(&comments, &t.id)))
+                .collect();
             println!(
                 "  ready ({}): {}",
                 ready_ids.len(),
@@ -1722,7 +1924,12 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
             } else {
                 println!("  blocked ({}):", blocked.len());
                 for (t, unmet) in &blocked {
-                    println!("    {}  (waiting on: {})", t.id, unmet.join(", "));
+                    println!(
+                        "    {}{}  (waiting on: {})",
+                        t.id,
+                        comment_marker(&comments, &t.id),
+                        unmet.join(", ")
+                    );
                 }
             }
             // Orphaned is an exceptional condition (a blocker was abandoned), so it prints
@@ -1731,11 +1938,15 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
                 println!("  orphaned ({}):", orphaned.len());
                 for (t, closed_deps) in &orphaned {
                     println!(
-                        "    {}  (blocker closed: {} — re-point, waive, or close)",
+                        "    {}{}  (blocker closed: {} — re-point, waive, or close)",
                         t.id,
+                        comment_marker(&comments, &t.id),
                         closed_deps.join(", ")
                     );
                 }
+            }
+            for id in &record_ids {
+                print_full_thread_if_any(&comments, id);
             }
             Ok(())
         }
@@ -1746,7 +1957,7 @@ pub fn rollup(repo: &Path, fmt: Format, args: &RollupArgs) -> Result<()> {
 /// optional tag/where/view selectors restrict the emitted subgraph (an induced
 /// subgraph: an edge is kept only when both endpoints are selected). `--dot` emits
 /// Graphviz (dependencies solid, related links dashed) for visualization.
-pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
+pub fn graph(repo: &Path, fmt: Format, output: OutputOverrides, args: &GraphArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let all = store.load_all()?;
     let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?;
@@ -1780,6 +1991,14 @@ pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
                 .map(move |r| (t.id.as_str(), r.as_str()))
         })
         .collect();
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    if args.dot && comment_mode == CommentMode::Full {
+        return Err(Error::Invalid(
+            "graph --dot cannot render --comments full; use summary, human, or JSON output".into(),
+        ));
+    }
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
 
     if args.dot {
         println!("digraph tickets {{");
@@ -1789,7 +2008,7 @@ pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
             println!(
                 "  {:?} [label={:?}];",
                 n.id,
-                format!("{}\n{}", n.id, n.status)
+                format!("{}\n{}{}", n.id, n.status, comment_marker(&comments, &n.id))
             );
         }
         for e in &dep_edges {
@@ -1804,8 +2023,15 @@ pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
 
     match fmt {
         Format::Json => {
-            let nodes_json = serde_json::to_value(&nodes)
-                .map_err(|e| Error::Internal(format!("serializing graph nodes: {e}")))?;
+            let nodes_json: Vec<Value> = nodes
+                .iter()
+                .map(|node| {
+                    let mut value = serde_json::to_value(node)
+                        .map_err(|e| Error::Internal(format!("serializing graph node: {e}")))?;
+                    enrich_comment_json(&mut value, &node.id, &comments);
+                    Ok(value)
+                })
+                .collect::<Result<_>>()?;
             let edges_json = serde_json::to_value(&dep_edges)
                 .map_err(|e| Error::Internal(format!("serializing graph edges: {e}")))?;
             print_json(&json!({
@@ -1831,6 +2057,12 @@ pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
             for (from, to) in &related_edges {
                 println!("  {from} ~ {to} (related)");
             }
+            for id in &ids {
+                if !comment_marker(&comments, id).is_empty() {
+                    println!("  {id}{}", comment_marker(&comments, id));
+                }
+                print_full_thread_if_any(&comments, id);
+            }
             Ok(())
         }
     }
@@ -1838,30 +2070,41 @@ pub fn graph(repo: &Path, fmt: Format, args: &GraphArgs) -> Result<()> {
 
 /// `path` — the critical prerequisite path to a ticket: the longest chain of
 /// dependencies that must complete before it, root-first with each step's status.
-pub fn path(repo: &Path, fmt: Format, args: &PathArgs) -> Result<()> {
+pub fn path(repo: &Path, fmt: Format, output: OutputOverrides, args: &PathArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let all = store.load_all()?;
     let chain = schedule::longest_prerequisite_path(&all, &args.id)?;
     let by_id: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &chain, comment_mode, &query)?;
     match fmt {
-        Format::Json => print_json(&json!({
-            "schema_version": 1,
-            "id": args.id,
-            "length": chain.len(),
-            "path": chain.iter().map(|id| {
-                let t = by_id.get(id.as_str());
-                json!({
-                    "id": id,
-                    "status": t.map(|t| t.status.as_str()),
-                    "title": t.map(|t| t.title.clone()),
+        Format::Json => {
+            let rows = chain
+                .iter()
+                .map(|id| {
+                    let t = by_id.get(id.as_str());
+                    let mut value = json!({
+                        "id": id,
+                        "status": t.map(|t| t.status.as_str()),
+                        "title": t.map(|t| t.title.clone()),
+                    });
+                    enrich_comment_json(&mut value, id, &comments);
+                    value
                 })
-            }).collect::<Vec<_>>(),
-        })),
+                .collect::<Vec<_>>();
+            print_json(&json!({
+                "schema_version": 1,
+                "id": args.id,
+                "length": chain.len(),
+                "path": rows,
+            }))
+        }
         Format::Human => {
             println!("critical path to `{}` ({} step(s)):", args.id, chain.len());
             for id in &chain {
                 let st = by_id.get(id.as_str()).map_or("?", |t| t.status.as_str());
-                println!("  {st:<12} {id}");
+                println!("  {st:<12} {id}{}", comment_marker(&comments, id));
+                print_full_thread_if_any(&comments, id);
             }
             Ok(())
         }
@@ -1870,21 +2113,27 @@ pub fn path(repo: &Path, fmt: Format, args: &PathArgs) -> Result<()> {
 
 /// `status` — report ticket status. With `--all-branches`, read each ticket as
 /// committed on its `<prefix>*` branch tip; otherwise from the working tree.
-pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
+pub fn status(repo: &Path, fmt: Format, output: OutputOverrides, args: &StatusArgs) -> Result<()> {
     let store = Store::open(repo)?;
     if !args.all_branches {
         let (tickets, warnings) = store.load_all_lenient()?;
+        let ids: Vec<String> = tickets.iter().map(|t| t.id.clone()).collect();
+        let (comment_mode, query) =
+            comment_policy(&store, output, CommentContext::Collection, &args.prefix);
+        let comments = load_comments(&store, &ids, comment_mode, &query)?;
         return match fmt {
             Format::Json => {
                 let rows: Vec<Value> = tickets
                     .iter()
                     .map(|t| {
-                        json!({
+                        let mut value = json!({
                             "id": t.id,
                             "status": t.status.as_str(),
                             "assignee": t.assignee,
                             "lease_expires_at": t.lease_expires_at,
-                        })
+                        });
+                        enrich_comment_json(&mut value, &t.id, &comments);
+                        value
                     })
                     .collect();
                 print_json(&json!({
@@ -1900,10 +2149,19 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
                 }
                 buffered_stdout(|out| {
                     for t in &tickets {
-                        writeln!(out, "{:<12} {}", t.status.as_str(), t.id)?;
+                        writeln!(
+                            out,
+                            "{:<12} {}{}",
+                            t.status.as_str(),
+                            t.id,
+                            comment_marker(&comments, &t.id)
+                        )?;
                     }
                     Ok(())
                 })?;
+                for id in &ids {
+                    print_full_thread_if_any(&comments, id);
+                }
                 for warn in &warnings {
                     eprintln!("warning: skipped {warn}");
                 }
@@ -1938,6 +2196,18 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
             }
         }
     }
+    let ids: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_string))
+        .collect();
+    let (comment_mode, query) =
+        comment_policy(&store, output, CommentContext::Collection, &args.prefix);
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
+    for row in &mut rows {
+        if let Some(id) = row["id"].as_str().map(str::to_string) {
+            enrich_comment_json(row, &id, &comments);
+        }
+    }
     match fmt {
         Format::Json => {
             print_json(&json!({ "schema_version": 1, "source": "branches", "tickets": rows }))
@@ -1953,11 +2223,19 @@ pub fn status(repo: &Path, fmt: Format, args: &StatusArgs) -> Result<()> {
                         "{:<24} {:<12} {}",
                         r["branch"].as_str().unwrap_or(""),
                         r["status"].as_str().unwrap_or("(missing)"),
-                        r["id"].as_str().unwrap_or(""),
+                        format_args!(
+                            "{}{}",
+                            r["id"].as_str().unwrap_or(""),
+                            comment_marker(&comments, r["id"].as_str().unwrap_or_default())
+                        ),
                     )?;
                 }
                 Ok(())
-            })
+            })?;
+            for id in &ids {
+                print_full_thread_if_any(&comments, id);
+            }
+            Ok(())
         }
     }
 }
@@ -2140,13 +2418,23 @@ pub fn lint(repo: &Path, fmt: Format) -> Result<()> {
 }
 
 /// `ready` — the dependency-satisfied, priority-ordered queue.
-pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
+pub fn ready(repo: &Path, fmt: Format, output: OutputOverrides) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
     let ready = schedule::ready(&tickets)?;
+    let ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
     match fmt {
         Format::Json => {
-            let rows: Vec<Value> = ready.iter().map(|t| ticket_summary(t)).collect();
+            let rows: Vec<Value> = ready
+                .iter()
+                .map(|t| {
+                    let mut value = ticket_summary(t);
+                    enrich_comment_json(&mut value, &t.id, &comments);
+                    value
+                })
+                .collect();
             print_json(&json!({ "schema_version": 1, "ready": rows }))
         }
         Format::Human => {
@@ -2161,18 +2449,22 @@ pub fn ready(repo: &Path, fmt: Format) -> Result<()> {
                         t.priority.as_str(),
                         t.status.as_str(),
                         t.id,
-                        t.title
+                        format_args!("{}{}", t.title, comment_marker(&comments, &t.id))
                     )?;
                 }
                 Ok(())
-            })
+            })?;
+            for t in &ready {
+                print_full_thread_if_any(&comments, &t.id);
+            }
+            Ok(())
         }
     }
 }
 
 /// `tracks` — parallel batches of ready tickets (conflict-free by default; `--max-overlap`
 /// lets cheaply-overlapping tickets share a batch).
-pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
+pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
@@ -2207,11 +2499,24 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
             .collect();
     }
     let overlap_cost = batch_overlap_cost(&batches, &weights);
+    let ids: Vec<String> = batches.iter().flatten().map(|t| t.id.clone()).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
     match fmt {
         Format::Json => {
             let arr: Vec<Value> = batches
                 .iter()
-                .map(|b| Value::Array(b.iter().map(|t| ticket_summary(t)).collect()))
+                .map(|b| {
+                    Value::Array(
+                        b.iter()
+                            .map(|t| {
+                                let mut value = ticket_summary(t);
+                                enrich_comment_json(&mut value, &t.id, &comments);
+                                value
+                            })
+                            .collect(),
+                    )
+                })
                 .collect();
             print_json(&json!({
                 "schema_version": 1,
@@ -2225,11 +2530,17 @@ pub fn tracks(repo: &Path, fmt: Format, args: &TracksArgs) -> Result<()> {
                 println!("(no ready tickets)");
             }
             for (i, batch) in batches.iter().enumerate() {
-                let ids: Vec<&str> = batch.iter().map(|t| t.id.as_str()).collect();
+                let ids: Vec<String> = batch
+                    .iter()
+                    .map(|t| format!("{}{}", t.id, comment_marker(&comments, &t.id)))
+                    .collect();
                 println!("batch {}: {}", i + 1, ids.join(", "));
             }
             if overlap_cost > 0 {
                 println!("(tolerated overlap cost: {overlap_cost})");
+            }
+            for id in &ids {
+                print_full_thread_if_any(&comments, id);
             }
             Ok(())
         }
@@ -2251,7 +2562,7 @@ fn batch_overlap_cost(batches: &[Vec<&Ticket>], weights: &BTreeMap<String, i64>)
 }
 
 /// `lanes` — plan worker queues that sequence conflicting work instead of dropping it.
-pub fn lanes(repo: &Path, fmt: Format, args: &LanesArgs) -> Result<()> {
+pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
@@ -2262,12 +2573,25 @@ pub fn lanes(repo: &Path, fmt: Format, args: &LanesArgs) -> Result<()> {
         None => schedule::parallel_width(&tickets, max_overlap, &weights)?.max(1),
     };
     let plan = schedule::lanes(&tickets, n, max_overlap, &weights)?;
+    let ids: Vec<String> = plan.lanes.iter().flatten().map(|t| t.id.clone()).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
     match fmt {
         Format::Json => {
             let lanes: Vec<Value> = plan
                 .lanes
                 .iter()
-                .map(|l| Value::Array(l.iter().map(|t| ticket_summary(t)).collect()))
+                .map(|l| {
+                    Value::Array(
+                        l.iter()
+                            .map(|t| {
+                                let mut value = ticket_summary(t);
+                                enrich_comment_json(&mut value, &t.id, &comments);
+                                value
+                            })
+                            .collect(),
+                    )
+                })
                 .collect();
             let merge_order: Vec<&str> = plan.merge_order.iter().map(|t| t.id.as_str()).collect();
             print_json(&json!({
@@ -2281,12 +2605,18 @@ pub fn lanes(repo: &Path, fmt: Format, args: &LanesArgs) -> Result<()> {
                 println!("(no ready tickets)");
             }
             for (i, lane) in plan.lanes.iter().enumerate() {
-                let ids: Vec<&str> = lane.iter().map(|t| t.id.as_str()).collect();
+                let ids: Vec<String> = lane
+                    .iter()
+                    .map(|t| format!("{}{}", t.id, comment_marker(&comments, &t.id)))
+                    .collect();
                 println!("lane {}: {}", i + 1, ids.join(" -> "));
             }
             if !plan.merge_order.is_empty() {
                 let order: Vec<&str> = plan.merge_order.iter().map(|t| t.id.as_str()).collect();
                 println!("merge order: {}", order.join(", "));
+            }
+            for id in &ids {
+                print_full_thread_if_any(&comments, id);
             }
             Ok(())
         }
@@ -2376,7 +2706,7 @@ fn parse_overlap_budget(s: &str) -> Result<i64> {
 }
 
 /// `next` — scored recommendation(s); `--parallel N` returns N disjoint picks.
-pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
+pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     // `--allow-overlap` is the unbounded alias; otherwise parse the per-pair budget.
@@ -2428,12 +2758,17 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
         };
     }
 
+    let ids: Vec<String> = picks.iter().map(|p| p.ticket.id.clone()).collect();
+    let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
+
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = picks
                 .iter()
                 .map(|p| {
                     let mut v = ticket_summary(p.ticket);
+                    enrich_comment_json(&mut v, &p.ticket.id, &comments);
                     v["score"] = json!(p.score);
                     v["conflicts_with"] = json!(p
                         .conflicts_with
@@ -2463,10 +2798,17 @@ pub fn next(repo: &Path, fmt: Format, args: &NextArgs) -> Result<()> {
                 println!("(no ready tickets to recommend)");
             }
             for p in &picks {
-                println!("{}  (score {})  {}", p.ticket.id, p.score, p.ticket.title);
+                println!(
+                    "{}  (score {})  {}{}",
+                    p.ticket.id,
+                    p.score,
+                    p.ticket.title,
+                    comment_marker(&comments, &p.ticket.id)
+                );
                 for c in &p.conflicts_with {
                     println!("    overlaps `{}` on: {}", c.ticket, c.scopes.join(", "));
                 }
+                print_full_thread_if_any(&comments, &p.ticket.id);
             }
             Ok(())
         }
@@ -3131,6 +3473,7 @@ fn build_config(repo: &Path, tickets_dir: &str) -> String {
 fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
     let mut s = format!(
         "schema_version = 1\ntickets_dir = \"{tickets_dir}\"\ndefault_base = \"main\"\n\n\
+         [output]\ncomments = \"auto\"\ncomment_source = \"all\"\n\n\
          [language]\n# Auto-detected a cargo workspace; the guard expands a changed crate\n\
          # through the cargo reverse-dependency graph.\nbackend = \"rust\"\n\
          # reverse_dep_expansion = false  # default true; off = path/crate-only,\n\
@@ -3314,7 +3657,7 @@ pub fn release(repo: &Path, fmt: Format, args: &ReleaseArgs) -> Result<()> {
 
 /// `claims` — who holds what: assignee, lease expiry, and live/expired state. With
 /// `--all-branches`, also surfaces claims recorded on `<prefix>*` branch tips.
-pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
+pub fn claims(repo: &Path, fmt: Format, output: OutputOverrides, args: &ClaimsArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let (tickets, warnings) = if args.all_branches {
         store.load_all_cross_branch(&args.prefix)?
@@ -3323,18 +3666,24 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
     };
     let now = now_epoch();
     let claimed: Vec<&Ticket> = tickets.iter().filter(|t| t.assignee.is_some()).collect();
+    let ids: Vec<String> = claimed.iter().map(|t| t.id.clone()).collect();
+    let (comment_mode, query) =
+        comment_policy(&store, output, CommentContext::Collection, &args.prefix);
+    let comments = load_comments(&store, &ids, comment_mode, &query)?;
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = claimed
                 .iter()
                 .map(|t| {
-                    json!({
+                    let mut value = json!({
                         "id": t.id,
                         "assignee": t.assignee,
                         "lease_expires_at": t.lease_expires_at,
                         "live": t.lease_live(now),
                         "status": t.status.as_str(),
-                    })
+                    });
+                    enrich_comment_json(&mut value, &t.id, &comments);
+                    value
                 })
                 .collect();
             print_json(&json!({
@@ -3365,11 +3714,14 @@ pub fn claims(repo: &Path, fmt: Format, args: &ClaimsArgs) -> Result<()> {
                         "{:<16} {:<28} {}",
                         t.assignee.as_deref().unwrap_or("?"),
                         lease,
-                        t.id
+                        format_args!("{}{}", t.id, comment_marker(&comments, &t.id))
                     )?;
                 }
                 Ok(())
             })?;
+            for id in &ids {
+                print_full_thread_if_any(&comments, id);
+            }
             for w in &warnings {
                 eprintln!("warning: skipped {w}");
             }
@@ -3748,12 +4100,12 @@ pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
 
 /// Render comments as a nested thread: replies indented under their parent. An
 /// orphan reply (its parent absent on this ref) renders at the top level.
-fn print_comment_thread(comments: &[Comment], now: u64) {
-    let ids: BTreeSet<&str> = comments.iter().map(|c| c.id.as_str()).collect();
-    let mut children: BTreeMap<&str, Vec<&Comment>> = BTreeMap::new();
-    let mut roots: Vec<&Comment> = Vec::new();
+fn print_comment_thread(comments: &[SourcedComment], now: u64, base_depth: usize) {
+    let ids: BTreeSet<&str> = comments.iter().map(|c| c.comment.id.as_str()).collect();
+    let mut children: BTreeMap<&str, Vec<&SourcedComment>> = BTreeMap::new();
+    let mut roots: Vec<&SourcedComment> = Vec::new();
     for c in comments {
-        match c.reply_to.as_deref() {
+        match c.comment.reply_to.as_deref() {
             Some(parent) if ids.contains(parent) => {
                 children.entry(parent).or_default().push(c);
             }
@@ -3761,25 +4113,31 @@ fn print_comment_thread(comments: &[Comment], now: u64) {
         }
     }
     for r in &roots {
-        print_comment_node(r, 0, &children, now);
+        print_comment_node(r, base_depth, &children, now);
     }
 }
 
 fn print_comment_node(
-    c: &Comment,
+    c: &SourcedComment,
     depth: usize,
-    children: &BTreeMap<&str, Vec<&Comment>>,
+    children: &BTreeMap<&str, Vec<&SourcedComment>>,
     now: u64,
 ) {
     let indent = "  ".repeat(depth);
-    let when =
-        c.at.map(|a| format!(" · {}", humanize_epoch(a, now)))
-            .unwrap_or_default();
-    println!("{indent}— {}{when}:", c.by.as_deref().unwrap_or("?"));
-    for line in c.body.lines() {
+    let when = c
+        .comment
+        .at
+        .map(|a| format!(" · {}", humanize_epoch(a, now)))
+        .unwrap_or_default();
+    let origins = format!(" [{}]", c.sources.join(", "));
+    println!(
+        "{indent}— {}{when}{origins}:",
+        c.comment.by.as_deref().unwrap_or("?")
+    );
+    for line in c.comment.body.lines() {
         println!("{indent}  {line}");
     }
-    if let Some(kids) = children.get(c.id.as_str()) {
+    if let Some(kids) = children.get(c.comment.id.as_str()) {
         for k in kids {
             print_comment_node(k, depth + 1, children, now);
         }

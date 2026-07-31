@@ -3,7 +3,7 @@
 //! All writes are atomic (temp file + rename); new tickets are created with
 //! `O_EXCL` so concurrent agents never clobber each other (R15).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 
 use rayon::prelude::*;
 
-use crate::comment::Comment;
+use crate::comment::{Comment, CommentQuery, CommentSummary, CommentThread, SourcedComment};
 use crate::config::{Config, Recipe, CONFIG_FILE};
 use crate::error::{Error, Result};
 use crate::event::Event;
@@ -35,6 +35,27 @@ pub enum CreateOutcome {
     /// An identical file already existed (idempotent no-op).
     Unchanged,
 }
+
+/// A ticket and its complete, source-aware comment thread.
+#[derive(Debug, Clone)]
+pub struct TicketDetails {
+    pub ticket: Ticket,
+    pub comments: CommentThread,
+}
+
+#[derive(Debug, Clone)]
+enum CommentLocation {
+    Worktree(PathBuf),
+    GitBlob(String),
+}
+
+#[derive(Debug, Clone)]
+struct InventoryEntry {
+    source: String,
+    location: CommentLocation,
+}
+
+type CommentInventory = BTreeMap<String, BTreeMap<String, Vec<InventoryEntry>>>;
 
 impl Store {
     /// Open a repository, loading its config (errors if not initialized).
@@ -384,6 +405,253 @@ impl Store {
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    /// Count comments for many tickets without parsing their bodies. Worktree comment
+    /// directories are scanned once; git comment trees are read through one batch.
+    pub fn comment_summaries(
+        &self,
+        ticket_ids: &[String],
+        query: &CommentQuery,
+    ) -> Result<BTreeMap<String, CommentSummary>> {
+        let inventory = self.comment_inventory(ticket_ids, query)?;
+        Ok(ticket_ids
+            .iter()
+            .map(|id| {
+                let entries = inventory.get(id);
+                let mut sources = BTreeMap::new();
+                if let Some(entries) = entries {
+                    for locations in entries.values() {
+                        for location in locations {
+                            *sources.entry(location.source.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                (
+                    id.clone(),
+                    CommentSummary {
+                        count: entries.map_or(0, BTreeMap::len),
+                        sources,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Load and deduplicate complete comment threads for many tickets. Git blobs for
+    /// every selected ticket are fetched in one `cat-file --batch` invocation.
+    pub fn comment_threads(
+        &self,
+        ticket_ids: &[String],
+        query: &CommentQuery,
+    ) -> Result<BTreeMap<String, CommentThread>> {
+        let inventory = self.comment_inventory(ticket_ids, query)?;
+        let blob_specs: Vec<String> = inventory
+            .values()
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .filter_map(|e| match &e.location {
+                CommentLocation::GitBlob(oid) => Some(oid.clone()),
+                CommentLocation::Worktree(_) => None,
+            })
+            .collect();
+        let blobs = self.cat_file_batch(&blob_specs)?;
+        let blobs_by_oid: BTreeMap<String, Option<Vec<u8>>> =
+            blob_specs.into_iter().zip(blobs).collect();
+        let mut threads = BTreeMap::new();
+
+        for id in ticket_ids {
+            let Some(by_comment) = inventory.get(id) else {
+                threads.insert(id.clone(), CommentThread::default());
+                continue;
+            };
+            let mut sources = BTreeMap::new();
+            let mut comments = Vec::with_capacity(by_comment.len());
+            for (comment_id, locations) in by_comment {
+                let mut parsed: Option<Comment> = None;
+                let mut origins = Vec::with_capacity(locations.len());
+                for location in locations {
+                    *sources.entry(location.source.clone()).or_insert(0) += 1;
+                    origins.push(location.source.clone());
+                    let raw = match &location.location {
+                        CommentLocation::Worktree(path) => {
+                            fs::read_to_string(path).map_err(Error::Io)?
+                        }
+                        CommentLocation::GitBlob(oid) => {
+                            let bytes = blobs_by_oid.get(oid).cloned().flatten().ok_or_else(|| {
+                                Error::Invalid(format!(
+                                    "comment `{comment_id}` on ticket `{id}` disappeared while reading git"
+                                ))
+                            })?;
+                            String::from_utf8(bytes).map_err(|e| {
+                                Error::Invalid(format!(
+                                    "comment `{comment_id}` on ticket `{id}` is not UTF-8: {e}"
+                                ))
+                            })?
+                        }
+                    };
+                    let comment = Comment::parse(&raw).map_err(|e| {
+                        Error::Invalid(format!("comment `{comment_id}` on ticket `{id}`: {e}"))
+                    })?;
+                    if comment.id != *comment_id {
+                        return Err(Error::Invalid(format!(
+                            "comment file `{comment_id}.md` on ticket `{id}` declares id `{}`",
+                            comment.id
+                        )));
+                    }
+                    if let Some(existing) = &parsed {
+                        if existing != &comment {
+                            return Err(Error::Invalid(format!(
+                                "comment `{comment_id}` on ticket `{id}` differs across sources"
+                            )));
+                        }
+                    } else {
+                        parsed = Some(comment);
+                    }
+                }
+                origins.sort();
+                comments.push(SourcedComment {
+                    comment: parsed.expect("inventory entries are never empty"),
+                    sources: origins,
+                });
+            }
+            threads.insert(
+                id.clone(),
+                CommentThread {
+                    summary: CommentSummary {
+                        count: by_comment.len(),
+                        sources,
+                    },
+                    comments,
+                },
+            );
+        }
+        Ok(threads)
+    }
+
+    /// Load one ticket and its complete comment thread. An exact ref supplies both the
+    /// ticket and comments; other queries keep the ticket in the current worktree.
+    pub fn load_details(&self, id: &str, query: &CommentQuery) -> Result<TicketDetails> {
+        let ticket = match query {
+            CommentQuery::Ref { git_ref } => self.load_at_ref(id, git_ref)?,
+            _ => self.load(id)?,
+        };
+        let mut threads = self.comment_threads(&[id.to_string()], query)?;
+        Ok(TicketDetails {
+            ticket,
+            comments: threads.remove(id).unwrap_or_default(),
+        })
+    }
+
+    fn comment_inventory(
+        &self,
+        ticket_ids: &[String],
+        query: &CommentQuery,
+    ) -> Result<CommentInventory> {
+        let wanted: BTreeSet<&str> = ticket_ids.iter().map(String::as_str).collect();
+        let mut inventory = CommentInventory::new();
+        if matches!(query, CommentQuery::Worktree | CommentQuery::All { .. }) {
+            let tickets_dir = self.tickets_dir();
+            if tickets_dir.is_dir() {
+                for entry in fs::read_dir(&tickets_dir).map_err(Error::Io)? {
+                    let entry = entry.map_err(Error::Io)?;
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let Some(id) = name.strip_suffix(".comments") else {
+                        continue;
+                    };
+                    if !wanted.contains(id) {
+                        continue;
+                    }
+                    for file in fs::read_dir(&path).map_err(Error::Io)? {
+                        let file = file.map_err(Error::Io)?.path();
+                        if file.extension().is_some_and(|ext| ext == "md") {
+                            if let Some(comment_id) = file.file_stem().and_then(|s| s.to_str()) {
+                                inventory
+                                    .entry(id.to_string())
+                                    .or_default()
+                                    .entry(comment_id.to_string())
+                                    .or_default()
+                                    .push(InventoryEntry {
+                                        source: "worktree".to_string(),
+                                        location: CommentLocation::Worktree(file),
+                                    });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let refs: Vec<(String, String)> = match query {
+            CommentQuery::Worktree => Vec::new(),
+            CommentQuery::TicketBranch { prefix } | CommentQuery::All { prefix } => ticket_ids
+                .iter()
+                .map(|id| (id.clone(), format!("{prefix}{id}")))
+                .collect(),
+            CommentQuery::Ref { git_ref } => ticket_ids
+                .iter()
+                .map(|id| (id.clone(), git_ref.clone()))
+                .collect(),
+        };
+        if refs.is_empty() {
+            return Ok(inventory);
+        }
+
+        let oid_len = match self.git_oid_len() {
+            Ok(len) => len,
+            Err(_) if matches!(query, CommentQuery::All { .. }) => return Ok(inventory),
+            Err(e) => return Err(e),
+        };
+        let specs: Vec<String> = refs
+            .iter()
+            .map(|(id, git_ref)| format!("{git_ref}:{}/{id}.comments", self.config.tickets_dir))
+            .collect();
+        let trees = self.cat_file_batch(&specs)?;
+        for ((id, git_ref), tree) in refs.into_iter().zip(trees) {
+            let Some(tree) = tree else { continue };
+            for (name, oid) in parse_git_tree(&tree, oid_len)? {
+                let Some(comment_id) = name.strip_suffix(".md") else {
+                    continue;
+                };
+                inventory
+                    .entry(id.clone())
+                    .or_default()
+                    .entry(comment_id.to_string())
+                    .or_default()
+                    .push(InventoryEntry {
+                        source: git_ref.clone(),
+                        location: CommentLocation::GitBlob(oid),
+                    });
+            }
+        }
+        Ok(inventory)
+    }
+
+    fn git_oid_len(&self) -> Result<usize> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", "--show-object-format"])
+            .output()
+            .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+        if !output.status.success() {
+            return Err(Error::Invalid(
+                "comment source requires a git repository".into(),
+            ));
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "sha1" => Ok(20),
+            "sha256" => Ok(32),
+            other => Err(Error::Invalid(format!(
+                "unsupported git object format `{other}`"
+            ))),
+        }
     }
 
     /// Emit an activity event as a `refs/ticketsplease/events/<id>` ref pointing at
@@ -813,6 +1081,12 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          # (or pass `guard --strict`) to make an overlap gate too.\n\
          # gate_collisions = false\n\
          \n\
+         [output]\n\
+         # Detail commands show full threads; collections show counts. Comment reads\n\
+         # union this worktree with the matching tkt/<id> branch by default.\n\
+         comments = \"auto\"\n\
+         comment_source = \"all\"\n\
+         \n\
          [language]\n\
          # \"none\" = path-glob scopes only; \"rust\" = also expand via the cargo crate graph.\n\
          backend = \"none\"\n\
@@ -878,6 +1152,36 @@ fn parse_cat_file_batch(data: &[u8], expected: usize) -> Vec<Option<Vec<u8>>> {
         results.push(None);
     }
     results
+}
+
+/// Parse the raw contents of a git tree object: `<mode> <name>\0<raw oid>` entries.
+/// Comment directories are flat, so only blob names and ids are needed.
+fn parse_git_tree(data: &[u8], oid_len: usize) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let Some(space) = data[i..].iter().position(|&b| b == b' ') else {
+            return Err(Error::Invalid("malformed git comment tree".into()));
+        };
+        i += space + 1;
+        let Some(nul) = data[i..].iter().position(|&b| b == 0) else {
+            return Err(Error::Invalid("malformed git comment tree".into()));
+        };
+        let name = std::str::from_utf8(&data[i..i + nul])
+            .map_err(|e| Error::Invalid(format!("non-UTF-8 comment filename in git: {e}")))?
+            .to_string();
+        i += nul + 1;
+        if i + oid_len > data.len() {
+            return Err(Error::Invalid("truncated git comment tree".into()));
+        }
+        let oid = data[i..i + oid_len]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        i += oid_len;
+        out.push((name, oid));
+    }
+    Ok(out)
 }
 
 /// Load, parse, and class-resolve each ticket file in parallel across the machine's
@@ -962,6 +1266,17 @@ mod tests {
         assert_eq!(out[1], None);
         // Empty input for a non-zero expectation is all None, not a panic.
         assert_eq!(parse_cat_file_batch(b"", 2), vec![None, None]);
+    }
+
+    #[test]
+    fn parses_raw_git_tree_entries() {
+        let mut tree = b"100644 a.md\0".to_vec();
+        tree.extend([0xabu8; 20]);
+        tree.extend_from_slice(b"100644 b.md\0");
+        tree.extend([0xcdu8; 20]);
+        let entries = parse_git_tree(&tree, 20).unwrap();
+        assert_eq!(entries[0], ("a.md".into(), "ab".repeat(20)));
+        assert_eq!(entries[1], ("b.md".into(), "cd".repeat(20)));
     }
 
     #[test]

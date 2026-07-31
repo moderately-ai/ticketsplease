@@ -8,6 +8,8 @@
 //! A comment file is itself a frontmatter document, so it round-trips and is
 //! hand-editable like a ticket.
 
+use std::collections::BTreeMap;
+
 use yaml_rust2::YamlLoader;
 
 use crate::error::{Error, Result};
@@ -15,7 +17,7 @@ use crate::frontmatter::Document;
 use crate::ids;
 
 /// A single comment on a ticket.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     /// Sortable unique id `<epoch_millis>-<rand>`; the prefix orders chronologically.
     pub id: String,
@@ -27,6 +29,43 @@ pub struct Comment {
     pub reply_to: Option<String>,
     /// Markdown body.
     pub body: String,
+}
+
+/// Which durable source(s) to inspect for a ticket's comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentQuery {
+    /// The current checkout only.
+    Worktree,
+    /// The matching `<prefix><ticket-id>` branch tip only.
+    TicketBranch { prefix: String },
+    /// The union of the worktree and matching ticket branch tip.
+    All { prefix: String },
+    /// One exact git ref, used by `show/comment list --ref`.
+    Ref { git_ref: String },
+}
+
+/// Count-only comment metadata for one ticket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommentSummary {
+    /// Unique comment ids across every selected source.
+    pub count: usize,
+    /// Raw count per source. The sum may exceed `count` when a committed comment is
+    /// present in both the worktree and its branch.
+    pub sources: BTreeMap<String, usize>,
+}
+
+/// A comment plus every selected source in which its id appeared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedComment {
+    pub comment: Comment,
+    pub sources: Vec<String>,
+}
+
+/// A complete, deduplicated comment thread and its count metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommentThread {
+    pub summary: CommentSummary,
+    pub comments: Vec<SourcedComment>,
 }
 
 impl Comment {

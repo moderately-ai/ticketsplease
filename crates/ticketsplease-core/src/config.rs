@@ -60,6 +60,9 @@ pub struct Config {
     /// Maintenance-advisory behaviour (update-check, drift auto-migrate, cadence).
     #[serde(default)]
     pub maintenance: Maintenance,
+    /// Output presentation defaults used by the CLI.
+    #[serde(default)]
+    pub output: Output,
     /// Named recipes: typed, parameterized procedures over the tool's own subcommands,
     /// registered inline as `[recipe.<name>]` (also discoverable as
     /// `.ticketsplease/recipes/<name>.toml`). Run with `tkt run <name>`. Distinct from
@@ -182,6 +185,46 @@ pub struct Maintenance {
     /// Minimum hours between update-check network probes. Default 24.
     #[serde(default = "default_check_interval")]
     pub check_interval_hours: u64,
+}
+
+/// CLI output defaults. They live in the repository config so a project can make
+/// comment visibility a shared policy while command-line flags still override it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Output {
+    /// Comment verbosity: auto | full | summary | none.
+    #[serde(default)]
+    pub comments: CommentMode,
+    /// Where comments are discovered: all | worktree | ticket-branch.
+    #[serde(default)]
+    pub comment_source: CommentSourceMode,
+}
+
+/// How much comment content a command should emit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommentMode {
+    /// Full on detail commands, summary on collection commands, none elsewhere.
+    #[default]
+    Auto,
+    /// Emit complete comment threads.
+    Full,
+    /// Emit counts and provenance, but not bodies.
+    Summary,
+    /// Omit comment data and avoid comment reads.
+    None,
+}
+
+/// The default source set used to discover comments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommentSourceMode {
+    /// Union the current worktree with the matching ticket branch.
+    #[default]
+    All,
+    /// Read only the current worktree.
+    Worktree,
+    /// Read only the matching ticket branch.
+    TicketBranch,
 }
 
 impl Default for Maintenance {
@@ -334,6 +377,7 @@ impl Default for Config {
             workflow: Workflow::default(),
             guard: Guard::default(),
             maintenance: Maintenance::default(),
+            output: Output::default(),
             recipes: BTreeMap::new(),
         }
     }
@@ -428,6 +472,20 @@ mod tests {
         assert!(!c.maintenance.update_check);
         assert!(c.maintenance.auto_migrate);
         assert_eq!(c.maintenance.check_interval_hours, 6);
+    }
+
+    #[test]
+    fn output_table_defaults_and_parses() {
+        let d = Config::default().output;
+        assert_eq!(d.comments, CommentMode::Auto);
+        assert_eq!(d.comment_source, CommentSourceMode::All);
+
+        let c: Config = toml::from_str(
+            "[output]\ncomments = \"summary\"\ncomment_source = \"ticket-branch\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.output.comments, CommentMode::Summary);
+        assert_eq!(c.output.comment_source, CommentSourceMode::TicketBranch);
     }
 
     #[test]

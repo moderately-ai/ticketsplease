@@ -6,7 +6,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ticketsplease_core::Result;
 
 use crate::commands;
-use crate::format::Format;
+use crate::format::{CommentModeArg, CommentSourceArg, Format, OutputOverrides};
 
 /// Top-level CLI.
 #[derive(Parser)]
@@ -24,6 +24,14 @@ pub struct Cli {
     /// Output format (human-readable by default; JSON is the stable contract).
     #[arg(long, global = true, value_enum, default_value = "human")]
     pub format: Format,
+    /// Comment detail: auto chooses full threads for detail commands and counts for
+    /// ticket collections; CLI values override `[output].comments`.
+    #[arg(long, global = true, value_enum)]
+    pub comments: Option<CommentModeArg>,
+    /// Durable comment sources to inspect; CLI values override
+    /// `[output].comment_source`.
+    #[arg(long, global = true, value_enum)]
+    pub comment_source: Option<CommentSourceArg>,
     /// Auto-apply a detected drift repair (`migrate`) after this command instead of
     /// only nudging — interactive human sessions only (never in JSON / CI / non-TTY).
     /// A per-invocation form of `[maintenance] auto_migrate = true`.
@@ -52,7 +60,7 @@ pub enum Command {
     Reopen(ReopenArgs),
     /// Add or remove a dependency link between tickets.
     Link(LinkArgs),
-    /// Show a single ticket.
+    /// Show a single ticket and its source-aware comment thread.
     Show(ShowArgs),
     /// List tickets.
     List(ListArgs),
@@ -358,8 +366,8 @@ pub struct LinkArgs {
 pub struct ShowArgs {
     /// Ticket id.
     pub id: String,
-    /// Read the ticket as committed on this git ref (e.g. a `tkt/<id>` branch)
-    /// instead of the working tree.
+    /// Read the ticket and comments exactly as committed on this git ref instead of
+    /// unioning the worktree and matching ticket branch.
     #[arg(long)]
     pub r#ref: Option<String>,
 }
@@ -549,7 +557,8 @@ pub struct CommentAddArgs {
 pub struct CommentListArgs {
     /// Ticket id.
     pub id: String,
-    /// Read comments as committed on this git ref instead of the working tree.
+    /// Read comments exactly as committed on this git ref instead of the configured
+    /// comment-source union.
     #[arg(long)]
     pub r#ref: Option<String>,
 }
@@ -958,6 +967,10 @@ pub struct RunArgs {
 pub fn run(cli: Cli) -> Result<()> {
     let repo = cli.repo.as_path();
     let fmt = cli.format;
+    let output = OutputOverrides {
+        comments: cli.comments,
+        comment_source: cli.comment_source,
+    };
     match &cli.command {
         Command::Init(a) => commands::init(repo, fmt, a),
         Command::Create(a) => commands::create(repo, fmt, a),
@@ -965,33 +978,33 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Close(a) => commands::close(repo, fmt, a),
         Command::Reopen(a) => commands::reopen(repo, fmt, a),
         Command::Link(a) => commands::link(repo, fmt, a),
-        Command::Show(a) => commands::show(repo, fmt, a),
-        Command::List(a) => commands::list(repo, fmt, a),
+        Command::Show(a) => commands::show(repo, fmt, output, a),
+        Command::List(a) => commands::list(repo, fmt, output, a),
         Command::View(a) => match &a.command {
             ViewCommand::Save(a) => commands::view_save(repo, fmt, a),
             ViewCommand::List => commands::view_list(repo, fmt),
             ViewCommand::Show(a) => commands::view_show(repo, fmt, a),
             ViewCommand::Delete(a) => commands::view_delete(repo, fmt, a),
         },
-        Command::Rollup(a) => commands::rollup(repo, fmt, a),
-        Command::Graph(a) => commands::graph(repo, fmt, a),
-        Command::Path(a) => commands::path(repo, fmt, a),
-        Command::Status(a) => commands::status(repo, fmt, a),
+        Command::Rollup(a) => commands::rollup(repo, fmt, output, a),
+        Command::Graph(a) => commands::graph(repo, fmt, output, a),
+        Command::Path(a) => commands::path(repo, fmt, output, a),
+        Command::Status(a) => commands::status(repo, fmt, output, a),
         Command::Reconcile(a) => commands::reconcile(repo, fmt, a),
         Command::Watch(a) => commands::watch(repo, fmt, a),
         Command::Comment(a) => match &a.command {
             CommentCommand::Add(a) => commands::comment_add(repo, fmt, a),
-            CommentCommand::List(a) => commands::comment_list(repo, fmt, a),
+            CommentCommand::List(a) => commands::comment_list(repo, fmt, output, a),
         },
         Command::Events(a) => commands::events(repo, fmt, a),
         Command::Lint(_) => commands::lint(repo, fmt),
-        Command::Ready(_) => commands::ready(repo, fmt),
-        Command::Tracks(a) => commands::tracks(repo, fmt, a),
-        Command::Lanes(a) => commands::lanes(repo, fmt, a),
-        Command::Next(a) => commands::next(repo, fmt, a),
+        Command::Ready(_) => commands::ready(repo, fmt, output),
+        Command::Tracks(a) => commands::tracks(repo, fmt, output, a),
+        Command::Lanes(a) => commands::lanes(repo, fmt, output, a),
+        Command::Next(a) => commands::next(repo, fmt, output, a),
         Command::Claim(a) => commands::claim(repo, fmt, a),
         Command::Release(a) => commands::release(repo, fmt, a),
-        Command::Claims(a) => commands::claims(repo, fmt, a),
+        Command::Claims(a) => commands::claims(repo, fmt, output, a),
         Command::Delete(a) => commands::delete(repo, fmt, a),
         Command::Rename(a) => commands::rename(repo, fmt, a),
         Command::Doctor => commands::doctor(repo, fmt),

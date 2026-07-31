@@ -4,6 +4,8 @@ Global flags (accepted by every command):
 
 - `--repo <path>` — repository root (default `.`).
 - `--format human|json` — `human` is the default; `json` is the stable, versioned contract. Every JSON payload includes `"schema_version": 1` and is deterministically ordered.
+- `--comments auto|full|summary|none` — defaults from `[output].comments` (`auto` when omitted). `auto` means full threads for detail commands, count/provenance for ticket collections, none elsewhere.
+- `--comment-source all|worktree|ticket-branch` — defaults from `[output].comment_source` (`all`). `all` deduplicates the worktree plus matching `tkt/<id>` branch by comment id. An explicit detail `--ref` is exact and cannot be combined with this flag.
 
 Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage · `3` invalid · `4` not found · `5` cycle · `6` conflict · `7` timeout).
 
@@ -18,6 +20,7 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 - **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
 - **Access intent: `scopes` exclusive, `shared_scopes` additive.** A scope in `scopes` is an *exclusive* (rewrite) claim; one in `shared_scopes` is a *shared* (additive/append) claim. Two tickets that both hold a scope shared are compatible (run in parallel); a shared claim still conflicts with an exclusive one. `[scope_policy]` in `ticketsplease.toml` sets a per-scope conflict-cost `weight` (default 1; `0` = free to co-edit). `tracks`/`next`/`lanes` gate on a per-pair **overlap budget** (`--max-overlap K`, `0`=strict … `any`=unbounded), so you can fill workers least-riskily instead of single-threading. The guard tags a shared-by-both collision `cause: shared` and does not fail on it.
+- **Comment metadata on ticket records.** In auto/summary/full modes, ticket objects returned by `list`, `status`, `rollup`, `graph`, `path`, `ready`, `tracks`, `lanes`, `next`, and `claims` add `comment_count` (unique ids) and `comment_sources` (raw per-source counts). Full mode also adds `comments`; every comment has sorted `sources`. These are additive fields and do not bump existing schema versions.
 
 ## init
 
@@ -96,7 +99,7 @@ JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`
 ticketsplease show <id> [--ref <branch>]
 ticketsplease list [--status <s>] [--scope <s>] [--tag <t>] [--priority <p>] [--where <expr>] [--view <name>] [--hide-done]
 ```
-`show --format human` prints a rendered field view + body + comments (including the close reason/note on a closed ticket); `--format json` → the ticket's fields (`closed_reason`/`closed_note` included). `--ref` reads the ticket as committed on a git ref (no checkout). `list` filters compose (AND); `--hide-done` drops terminal tickets (`done` + `closed`). A malformed ticket file degrades to a warning rather than failing the listing.
+`show --format human` prints a rendered field view + body + comments (including the close reason/note on a closed ticket); JSON includes the ticket fields, `comment_count`, `comment_sources`, and (in full mode) `comments`. By default comments are unioned from the worktree and matching `tkt/<id>` tip. `--ref` reads the ticket and comments exactly as committed on one git ref (no checkout). `list` filters compose (AND); `--hide-done` drops terminal tickets (`done` + `closed`). A malformed ticket file degrades to a warning rather than failing the listing.
 
 `--where` is a boolean filter expression: `field:value` terms joined by `AND` / `OR` / `NOT` (case-insensitive) with parentheses; it composes (AND) with the single-axis flags. Fields: `status`, `priority`, `tag`, `scope`, `assignee`, `id`, `dep`, `related`, `reason`. Values are barewords (`p0`, `query/planner`, slug ids) or quoted (`"needs review"`). `status:`/`priority:`/`reason:` values are validated, so a typo exits 3. Examples: `--where 'tag:dialect AND NOT status:done'`, `--where 'status:closed AND reason:duplicate'`, `--where '(priority:p0 OR priority:p1) AND scope:core'`. `--view <name>` applies a saved expression and ANDs with `--where`.
 
@@ -134,7 +137,9 @@ ticketsplease path <id>
 graph JSON: `{ "schema_version", "nodes": [ {id,title,status,priority,score,critical_path,downstream_count} ], "edges": [ {from,to} ], "related_edges": [ {from,to} ] }`.
 path JSON: `{ "schema_version", "id", "length", "path": [ {id,status,title} ] }` (exit 4 if the id is unknown).
 
-list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags} ], "warnings": [...] }`.
+DOT node labels include nonzero comment counts in auto/summary mode. `graph --dot --comments full` is rejected because DOT cannot faithfully carry Markdown threads; use human or JSON output for full comments.
+
+list JSON: `{ "schema_version", "tickets": [ {id,title,status,priority,scopes,paths,dependencies,tags,comment_count,comment_sources,comments?} ], "warnings": [...] }`.
 
 ## status
 
@@ -175,7 +180,7 @@ Blocks until the ticket reaches `--until` (or `done`, always terminal), then exi
 ticketsplease comment add <id> [--as <author>] [--reply-to <comment-id>] (--body <text> | --body-file <f|->)
 ticketsplease comment list <id> [--ref <branch>]
 ```
-`comment add` appends a comment as its own file under `<tickets_dir>/<id>.comments/<comment-id>.md` (one file per comment — concurrent authors never conflict). `--reply-to` must reference an existing comment id (else exit 4). The ticket must exist (else exit 4). `comment list` shows comments chronologically, replies nested under their parent (human) with relative timestamps; `--ref` reads them as committed on a branch. `tkt show <id>` folds comments in. JSON: `{ "schema_version", "ticket", "comments": [ {id, by, at, reply_to, body} ] }`. Adding a comment also emits an **event**.
+`comment add` appends a comment as its own file under `<tickets_dir>/<id>.comments/<comment-id>.md` (one file per comment — concurrent authors never conflict). `--reply-to` must reference an existing comment id (else exit 4). The ticket must exist (else exit 4). `comment list` shows comments chronologically, replies nested under their parent (human) with relative timestamps; its default `all` source unions the worktree and `tkt/<id>` tip. `--ref` is an exact committed view. `tkt show <id>` folds comments in. JSON: `{ "schema_version", "ticket", "comment_count", "comment_sources", "comments": [ {id, by, at, reply_to, body, sources} ] }`. Adding a comment also emits an **event**.
 
 ## events
 

@@ -74,7 +74,7 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ticketsplease events --watch --since <cursor> --format json   # wake on the next status/claim/comment, across all tickets
    ticketsplease comment add <id> --as <worker> --body-file -     # leave a durable note (e.g. a blocked-reason)
    ```
-   Events are `.git` refs, so they're visible the instant they're written — no commit needed — and `comment add` rings the same doorbell. Comments are append-only files (one per comment), conflict-free under concurrent authors. `tkt show <id>` folds a ticket's comments in. See `references/parallel-workflow.md` for the full observe/coordinate loop.
+   Events are `.git` refs, so they're visible the instant they're written — no commit needed — and `comment add` rings the same doorbell. Comments are append-only files (one per comment), conflict-free under concurrent authors. `tkt show <id>` folds in the worktree plus matching `tkt/<id>` thread by default; collection JSON carries `comment_count`, so always inspect it before dispatch/review. Use `--comment-source` or exact `--ref` when provenance matters. See `references/parallel-workflow.md` for the full observe/coordinate loop.
 
 For a single highest-leverage pick instead of a whole batch:
 ```sh

@@ -1012,7 +1012,8 @@ fn comments_are_readable_across_branches() {
     );
     git(repo, &["checkout", "-q", "main"]);
 
-    // Working tree on main has no comments; --ref tkt/t sees it.
+    // Default detail output unions the worktree with the matching ticket branch, so
+    // an orchestrator on main cannot miss the worker's comment.
     let wt: serde_json::Value = serde_json::from_slice(
         &tkt(repo)
             .args(["comment", "list", "t", "--format", "json"])
@@ -1021,7 +1022,28 @@ fn comments_are_readable_across_branches() {
             .stdout,
     )
     .unwrap();
-    assert_eq!(wt["comments"].as_array().unwrap().len(), 0);
+    assert_eq!(wt["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(wt["comment_count"], 1);
+    assert_eq!(wt["comment_sources"]["tkt/t"], 1);
+
+    // The worktree-only override preserves an exact local view when requested.
+    let local: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args([
+                "comment",
+                "list",
+                "t",
+                "--comment-source",
+                "worktree",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(local["comments"].as_array().unwrap().len(), 0);
 
     let on_ref: serde_json::Value = serde_json::from_slice(
         &tkt(repo)
@@ -1034,6 +1056,187 @@ fn comments_are_readable_across_branches() {
     let cs = on_ref["comments"].as_array().unwrap();
     assert_eq!(cs.len(), 1);
     assert_eq!(cs[0]["body"], "from the branch");
+    assert_eq!(cs[0]["sources"], serde_json::json!(["tkt/t"]));
+}
+
+#[test]
+fn adaptive_comment_modes_enrich_every_ticket_record() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A", "--priority", "p1"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--depends-on", "a"])
+        .assert()
+        .success();
+    for id in ["a", "b"] {
+        tkt(repo)
+            .args(["comment", "add", id, "--as", "reviewer", "--body", "note"])
+            .assert()
+            .success();
+    }
+
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = tkt(repo).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let find = |rows: &serde_json::Value, id: &str| -> serde_json::Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()
+            .clone()
+    };
+
+    let list = run(&["list", "--format", "json"]);
+    assert_eq!(find(&list["tickets"], "a")["comment_count"], 1);
+    assert!(find(&list["tickets"], "a").get("comments").is_none());
+    let status = run(&["status", "--format", "json"]);
+    assert_eq!(find(&status["tickets"], "a")["comment_count"], 1);
+    let rollup = run(&["rollup", "--format", "json"]);
+    assert_eq!(find(&rollup["ready"], "a")["comment_count"], 1);
+    assert_eq!(find(&rollup["blocked"], "b")["comment_count"], 1);
+    let graph = run(&["graph", "--format", "json"]);
+    assert_eq!(find(&graph["nodes"], "a")["comment_count"], 1);
+    let dot = tkt(repo)
+        .args(["graph", "--dot", "--comments", "summary"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&dot.stdout).contains("[comments:1]"));
+    tkt(repo)
+        .args(["graph", "--dot", "--comments", "full"])
+        .assert()
+        .code(3);
+    let path = run(&["path", "b", "--format", "json"]);
+    assert_eq!(find(&path["path"], "a")["comment_count"], 1);
+    let ready = run(&["ready", "--format", "json"]);
+    assert_eq!(find(&ready["ready"], "a")["comment_count"], 1);
+    let tracks = run(&["tracks", "--format", "json"]);
+    assert_eq!(tracks["batches"][0][0]["comment_count"], 1);
+    let lanes = run(&["lanes", "--format", "json"]);
+    assert_eq!(lanes["lanes"][0][0]["comment_count"], 1);
+    let next = run(&["next", "--format", "json"]);
+    assert_eq!(next["picks"][0]["comment_count"], 1);
+
+    let full = run(&["list", "--comments", "full", "--format", "json"]);
+    let full_a = find(&full["tickets"], "a");
+    assert_eq!(full_a["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        full_a["comments"][0]["sources"],
+        serde_json::json!(["worktree"])
+    );
+    let none = run(&["list", "--comments", "none", "--format", "json"]);
+    assert!(find(&none["tickets"], "a").get("comment_count").is_none());
+    let summary = run(&["show", "a", "--comments", "summary", "--format", "json"]);
+    assert_eq!(summary["comment_count"], 1);
+    assert!(summary.get("comments").is_none());
+
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "a", "--as", "worker"])
+        .assert()
+        .success();
+    let claims = run(&["claims", "--format", "json"]);
+    assert_eq!(find(&claims["claims"], "a")["comment_count"], 1);
+
+    let human = tkt(repo).args(["list"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("[comments:1]"),
+        "human summaries flag comment presence"
+    );
+}
+
+#[test]
+fn comment_config_precedence_and_union_dedup_are_deterministic() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "t", "--title", "T"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["comment", "add", "t", "--as", "w", "--body", "shared"])
+        .assert()
+        .success();
+    git_init_commit(repo);
+    git(repo, &["branch", "tkt/t"]);
+
+    let shown: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(shown["comment_count"], 1, "same id is counted once");
+    assert_eq!(shown["comment_sources"]["worktree"], 1);
+    assert_eq!(shown["comment_sources"]["tkt/t"], 1);
+    assert_eq!(
+        shown["comments"][0]["sources"],
+        serde_json::json!(["tkt/t", "worktree"]),
+        "provenance is sorted"
+    );
+
+    let config = std::fs::read_to_string(repo.join("ticketsplease.toml")).unwrap();
+    let config = config.replace("comments = \"auto\"", "comments = \"none\"");
+    std::fs::write(repo.join("ticketsplease.toml"), config).unwrap();
+    let configured: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(configured.get("comment_count").is_none());
+    let overridden: serde_json::Value = serde_json::from_slice(
+        &tkt(repo)
+            .args(["show", "t", "--comments", "full", "--format", "json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(overridden["comment_count"], 1);
+
+    tkt(repo)
+        .args([
+            "show",
+            "t",
+            "--ref",
+            "tkt/t",
+            "--comment-source",
+            "worktree",
+        ])
+        .assert()
+        .code(3);
+
+    let comment_file = std::fs::read_dir(repo.join("tickets/t.comments"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let raw = std::fs::read_to_string(&comment_file).unwrap();
+    std::fs::write(&comment_file, raw.replace("shared", "changed")).unwrap();
+    let conflict = tkt(repo)
+        .args(["show", "t", "--comments", "full"])
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("differs across sources"));
 }
 
 /// The conflict-free guarantee: 8 concurrent authors all land, none lost.

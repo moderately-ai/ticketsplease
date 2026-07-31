@@ -175,6 +175,7 @@ mod tests {
             workflow: Default::default(),
             guard: Default::default(),
             maintenance: Default::default(),
+            output: Default::default(),
             recipes: BTreeMap::new(),
         }
     }
