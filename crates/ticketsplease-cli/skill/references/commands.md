@@ -51,6 +51,8 @@ Writes new tickets. Without `--id`, the id is a slug of the title and the create
 
 **Write-time validation (default on).** `create` rejects (exit 3) a declared **scope not defined** in `ticketsplease.toml` (`[scopes]`/`[scope_crates]`/`[external_scopes]`) and a **dangling `related`/`depends_on`** id. Dependency **cycles** are always rejected (exit 5), including under `--no-validate`. A `--from` batch resolves cross-references among its own **final** ids. Pass **`--no-validate`** only for forward references to tickets/scopes you will add next (skips missing targets and undefined scopes; does **not** skip cycles, bad slugs, unknown keys, or injectivity/content conflicts). (Same ref checks apply to `set`/`link` — see below.)
 
+`[defaults].shared_scopes` is merged into both single and batch creates before validation and rendering. Explicit exclusive scopes win over the same default; existing shared values are retained and deduplicated. Because create idempotency compares the fully rendered post-image, use `claim` to backfill defaults onto older tickets rather than re-running an old create.
+
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
 ## set
@@ -66,6 +68,8 @@ ticketsplease set (<id> | --where <expr> | --view <name>)
                        [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run] [--no-validate]
 ```
 Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. An **added** scope that is undefined, or an added `related`/`depends_on` id that does not resolve, is rejected (exit 3) — only the additions are checked, so an unrelated edit never trips on a pre-existing dangling link; `--no-validate` skips it. Setting a terminal status (`done` or `closed`) clears the claim (assignee + lease). `--reason <duplicate|wontdo|obsolete|superseded|cancelled>` and `--note <text>` are valid only alongside `--status closed` (they record the resolution, and are cleared automatically when the ticket later leaves `closed`); prefer the `close`/`reopen` verbs below. When `[workflow] enforce_transitions` is on, a status change that is not a permitted transition is rejected (exit 6) unless `--force` is passed (bulk `--where` skips illegal ones instead). `--dry-run` previews without writing.
+
+Additive aliases improve discovery without introducing replacement semantics: `--scope`/`--scopes` → `--add-scope`, `--shared-scope`/`--shared-scopes` → `--add-shared-scope`, `--tag`/`--tags` → `--add-tag`, and `--related` → `--add-related`. Removal still uses the explicit `--remove-*` flags. To change an existing scope's access mode, add it in the new mode and remove it from the old mode in the same command; leaving it in both produces the `scope-mode-conflict` lint diagnostic.
 
 **Single vs bulk:** pass an `id` to edit one ticket, or `--where`/`--view` to edit **every matching ticket** in one operation (exactly one of the two; passing both, or neither, is exit 3). Bulk applies field edits only — `--title` and the body edits are single-target and rejected with `--where`/`--view`. A single cycle check runs over the whole edited set after all dependency edits; changed matches are applied in **one journaled multi-upsert commit** (no partial bulk write on failure).
 
@@ -118,11 +122,13 @@ view JSON: `save` → `{ "schema_version", "name", "where", "replaced" }`; `list
 ## rollup
 
 ```
-ticketsplease rollup [--tag <t>] [--where <expr>] [--view <name>]
+ticketsplease rollup [--tag <t>] [--where <expr>] [--view <name>] [--ignore-claims]
 ```
 Aggregates an initiative (a tag and/or filter; selectors AND together — no selector = the whole board): status & priority counts, percent done, the **ready frontier**, and the **blocked set**. Readiness is computed over the *full* board (so a prerequisite outside the selection still counts) and then intersected with the selection; `blocked` is the selected dispatchable-status tickets that have an unfinished dependency, each with the unmet ids. Use it to answer "where does this initiative stand and what's next in it" in one call.
 
-JSON: `{ "schema_version", "selector": {tag,where,view}, "total", "done", "percent_done", "width", "by_status": {status: n}, "by_priority": {p: n}, "ready": [ {id,title,priority} ], "blocked": [ {id,title,unmet: [ids]} ] }` (`width` = safe parallel width within the ready frontier).
+`ready` remains the raw dependency-ready list. `width` is the additional recommended capacity after live claims are considered; `claim_overlaps` explains candidates outside that recommendation and `stale_claims` is advisory. `--ignore-claims` keeps all ready candidates in the capacity calculation while preserving context.
+
+JSON adds `claim_overlaps` and `stale_claims` to `{ "schema_version", "selector": {tag,where,view}, "total", "done", "percent_done", "width", "by_status", "by_priority", "ready", "blocked", "orphaned" }`.
 
 ## graph / path
 
@@ -202,32 +208,33 @@ JSON: `{ "schema_version", "ready": [ {id,title,status,priority,scopes,paths,dep
 
 ```
 ticketsplease tracks [--parallel N] [--max-overlap K] [--width] [--overlap-matrix]
-                     [--assume-shared | --strict]
+                     [--ignore-claims] [--assume-shared | --strict]
 ```
-Partitions the ready set into batches; no two tickets in a batch conflict beyond the budget. Dispatch one batch fully in parallel. `--parallel N` caps each batch to N tickets (splitting larger ones), giving worker-sized fronts.
+Partitions the dependency-ready set into recommended batches. A live claim overlap beyond the budget removes a candidate from the recommendation but remains visible in `claim_overlaps`; stale claims are reported without removing candidates. `--ignore-claims` requests an unfiltered recommendation while retaining the context. `--parallel N` caps each batch to N tickets.
 
-`--max-overlap K` is the per-pair overlap budget: `0` (default) = strictly conflict-free; `K` = let tickets that conflict by ≤ K per pair share a batch; `any` = unbounded. Each batch's residual `overlap_cost` is reported. `--width` prints only the **safe parallel width** (the largest set runnable at once within the budget) — how many workers to spin up. `--overlap-matrix` instead emits the raw conflict graph (every ready pair with conflicting scopes and cost) for self-service assignment. `--assume-shared` treats every claim as shared (collapse conflicts; reconcile at merge); `--strict` treats every claim as exclusive (ignore `shared_scopes` and weights).
+`--max-overlap K` is the per-pair overlap budget: `0` (default), `K`, or `any`. Each batch's residual `overlap_cost` is reported. `--width` is the additional recommended capacity. `--overlap-matrix` remains the raw dependency-ready conflict graph and raw width, deliberately unaffected by claim recommendations. `--assume-shared` treats every claim as shared; `--strict` treats every claim as exclusive.
 
-JSON: `{ "schema_version", "batches": [ [ {id,...} ] ], "overlap_cost", "width" }`; with `--width`: `{ "schema_version", "width" }`; with `--overlap-matrix`: `{ "schema_version", "matrix": [ {a, b, scopes, cost} ], "width" }`.
+JSON: `{ "schema_version", "batches", "overlap_cost", "width", "claim_overlaps", "stale_claims" }`; `claim_overlaps[]` contains `{candidate, claims: [{ticket,assignee,lease_expires_at,lease_state,scopes,cost,exceeds_budget}], excluded_from_recommended_front}`. Here `candidate` is ready work being evaluated and each nested `claims[].ticket` is already-started work affecting it. `--width --format json` includes the same context. The raw matrix shape stays `{ "schema_version", "matrix", "width" }`.
 
 ## lanes
 
 ```
-ticketsplease lanes [--parallel N] [--max-overlap K] [--assume-shared | --strict]
+ticketsplease lanes [--parallel N] [--max-overlap K] [--ignore-claims] [--assume-shared | --strict]
 ```
-Plans **worker lanes**: ordered per-worker queues that *sequence* conflicting work onto one lane (the later rebases on the earlier) instead of dropping it to a future batch and idling a worker. `--parallel N` is the lane count (default: the safe parallel width); `--max-overlap` tolerates cheap overlaps within a concurrent round (same model as `tracks`). The merge order completes an earlier round everywhere before the next round's heads start.
+Plans **worker lanes** from the recommended front: ordered per-worker queues that sequence conflicting candidates onto one lane. `--parallel N` is the lane count (default: the recommended additional width); `--max-overlap` applies the same budget as `tracks`, and `--ignore-claims` requests the unfiltered front while retaining context.
 
-JSON: `{ "schema_version", "lanes": [ [ {id,...} ] ], "merge_order": [ids] }`.
+JSON: `{ "schema_version", "lanes": [ [ {id,...} ] ], "merge_order": [ids], "claim_overlaps", "stale_claims" }`.
 
 ## next
 
 ```
 ticketsplease next [--parallel N] [--max-overlap K] [--running ids] [--allow-overlap]
-                   [--assume-shared | --strict] [--claim --as <worker> [--ttl <secs>]]
+                   [--ignore-claims] [--assume-shared | --strict]
+                   [--claim --as <worker> [--ttl <secs>]]
 ```
-The highest-scored dispatchable ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks` — higher is more impactful. Picks fill in two passes: highest-scored compatible picks first, then — within `--max-overlap` (`0` default … `any`) — the lowest-cost overlaps to fill N, each annotated with `conflicts_with` (scopes + cost). `--allow-overlap` is the `--max-overlap any` alias. `--running <ids>` (alias `--avoid`) drops picks conflicting with those in-flight tickets; omit it to default to every in-progress ticket with a live claim (so a dispatch loop is in-flight-aware with no args). `--claim --as <worker>` atomically claims the first still-free pick (a lost race falls through to the next).
+The highest-scored recommended ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks`. Picks fill compatible work first, then overlaps within the budget, each annotated with `conflicts_with`. `--running <ids>` (alias `--avoid`) supplies explicit in-flight work; omit it to use live claims. `--ignore-claims` is mutually exclusive with `--running` and requests the unfiltered automatic view. Claim context remains visible either way. `--claim --as <worker>` atomically claims the first still-free pick.
 
-JSON: `{ "schema_version", "picks": [ {id,...,score, "conflicts_with": [ {ticket,scopes,cost} ]} ], "overlap_cost", "width" }`, or with `--claim`: a claim payload (see below) or `{ "schema_version", "claimed": null }` when nothing is free.
+JSON: `{ "schema_version", "picks", "overlap_cost", "width", "claim_overlaps", "stale_claims" }`, or with `--claim`: a claim payload (see below); an empty result retains context beside `"claimed": null`.
 
 ## why
 
@@ -265,11 +272,11 @@ tkt run supersede --arg id=auth --arg with=auth-api,auth-ui,auth-db
 ticketsplease claim <id> --as <worker> [--ttl <secs>] [--force]   # default ttl 3600
 ticketsplease release <id> [--as <worker>] [--force]
 ```
-`claim` atomically takes a ticket (git-ref compare-and-swap on `refs/ticketsplease/claim/<id>`): of N racing workers, exactly one wins, the rest get **exit 6**. It records `assignee` + `lease_expires_at` (an unquoted integer) and marks the ticket in-progress, remembering the pre-claim status. An expired lease is reclaimable (`stolen: true`); `--force` steals even a *live* lease. Re-claiming as the holder is a `renewed` no-op (no duplicate event). A ticket is unclaimable if its status isn't todo/ready/in-progress (exit 6) **or** its dependencies aren't all done (exit 6).
+`claim` atomically takes a ticket (git-ref compare-and-swap on `refs/ticketsplease/claim/<id>`): of N racing workers, exactly one wins, the rest get **exit 6**. It records `assignee` + `lease_expires_at`, marks the ticket in-progress, and merges `[defaults].shared_scopes` into visible frontmatter. Existing shared declarations remain; an explicit exclusive declaration wins. Unknown configured defaults fail before mutation. An expired lease is reclaimable (`stolen: true`); `--force` steals even a live lease. Re-claiming as the holder renews the lease without duplicate scope entries or events.
 
 `release` restores the pre-claim status (not always `ready`) — but keeps real progress if the worker advanced to review/blocked/done. Without `--force`, only the recorded holder may release; a **bare** `release` (no `--as`) on a held ticket is refused (pass `--as <holder>` or `--force`).
 
-claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool, "renewed": bool }`.
+claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool, "renewed": bool, "default_shared_scopes_added": [names] }`.
 release JSON: `{ "schema_version", "id", "released": bool }`.
 
 ## guard
@@ -281,7 +288,7 @@ Diffs the branch vs `--base` and makes two decoupled judgements, at **different 
 
 It reads the `[scopes]` contract (and the `[guard]` section) from `--config-ref` (default: the base), **not** the possibly stale/empty config on the checked-out branch — so an emptied branch config can't give a false all-clear or silently downgrade the guard. Sibling tickets' in-flight status is read from `<prefix>*` branch tips, so a collision fires in the branch-per-ticket flow even when the current checkout shows the sibling as `todo`.
 
-**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it; a `shared_scopes` claim counts as declared). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap), `transitive` (reverse-dep only — safe for additive work), or `shared` (both tickets claim the scope additively — reported but **non-gating**, like `--ignore-transitive` for transitive). `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
+**Under-declaration is file-authoritative** (the cargo reverse-dep expansion never drives it; a `shared_scopes` claim counts as declared). **Collisions** use the full affected set (path globs + `[external_scopes]` pins + cargo reverse-deps), each tagged `cause`: `direct` (real overlap), `transitive` (reverse-dep only — often lower-risk for additive work), or `shared` (both tickets claim the scope additively — reported but **non-gating**, like `--ignore-transitive` for transitive). `warnings` flags scope-map gaps (changed files no scope covers) and an empty `[scopes]`.
 
 **Make overlaps gate.** To restore hard-fail-on-overlap (the pre-`WARN`-default behaviour), pass `--strict` or set `[guard] gate_collisions = true` in `ticketsplease.toml` — the config is the default, the flags override per-invocation (`--strict` gates, `--warn-collisions` forces warn; the two are mutually exclusive). Under-declaration always gates regardless. When collisions gate, `--ignore-transitive` still waves through a transitive-only overlap.
 
@@ -328,7 +335,7 @@ By default a repo uses the built-in states (`todo`, `ready`, `in-progress`, `blo
 ```
 ticketsplease lint
 ```
-Validates schema (enums, id == filename, valid slug, duplicate ids, **unknown scope references** once a scope vocabulary exists, a scope claimed both exclusive and shared, a ticket that **declares `paths` but no scopes** — invisible to batching, see below, an **unknown workflow state**, resolution metadata on a non-closed ticket, and **workflow category coverage** — a config with no dispatchable or terminal state), links (dangling dependencies, dangling related links, and tickets **orphaned** by a closed dependency), and cycles — in one run, even when some files fail to parse. Exit 3 on schema/link problems, 5 on a cycle. Each finding carries a machine-readable `code` (`parse` | `id-mismatch` | `bad-id` | `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` | `paths-without-scopes` | `duplicate-id` | `unknown-state` | `state-coverage` | `stale-resolution` | `missing-dep` | `missing-related` | `orphaned-by-closed-dep` | `cycle`). A dangling `related` is flagged but a `related` cycle is never an error.
+Validates schema (including ticket scopes, `[scope_policy]`, and `[defaults].shared_scopes` against the configured vocabulary), links, workflow states, and cycles. Exit 3 on schema/link problems, 5 on a cycle. The default-specific diagnostic is `unknown-default-shared-scope`; existing diagnostic codes remain stable.
 
 `paths-without-scopes` catches a specific footgun: `paths` reads like a file-intent declaration, but only `guard` consumes it (as an under-declaration allowance). The scheduler — `tracks`, `why`, `lanes`, `next` — gates purely on **scope names**, so a ticket with `paths` and no `scopes`/`shared_scopes` is invisible to the conflict math and will be co-scheduled with work that rewrites the same files. The fix is to add a `scopes` entry (or `shared_scopes` for additive work). A scope-less **and** path-less ticket (a decision/epic/umbrella) declares no file intent and stays clean, and a **terminal** (done/closed) ticket is exempt — `tracks` partitions only the ready set, so a finished ticket can never be co-scheduled (an unknown status is not terminal, so it still trips).
 

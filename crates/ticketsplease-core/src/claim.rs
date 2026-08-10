@@ -48,6 +48,8 @@ pub struct ClaimOutcome {
     /// Whether this was the current holder renewing their own claim (no ownership
     /// change). Lets the caller skip emitting a duplicate claim event.
     pub renewed: bool,
+    /// Configured shared-scope defaults added by this claim. Empty on a no-op merge.
+    pub default_shared_scopes_added: Vec<String>,
 }
 
 /// Seconds since the Unix epoch. A lease is mutation state, not query output, so
@@ -69,6 +71,7 @@ pub fn claim(
     ttl_secs: u64,
     force: bool,
 ) -> Result<ClaimOutcome> {
+    validate_default_shared_scopes(store)?;
     let ticket = store.load(id)?; // NotFound (exit 4) if the id is unknown
     let registry = store.config.state_registry();
     // Claimable = a dispatchable state, or already at the claim target (a renewal). A
@@ -155,6 +158,12 @@ fn claim_locked(
     };
 
     let lease = now.saturating_add(ttl_secs);
+    let default_shared_scopes_added = store
+        .config
+        .default_shared_scope_additions(&ticket.scopes, &ticket.shared_scopes);
+    for scope in &default_shared_scopes_added {
+        ticket.add_shared_scope(scope)?;
+    }
     ticket.set_claim(agent, lease, &store.config.state_registry())?;
     store.save(&ticket)?;
     Ok(ClaimOutcome {
@@ -163,7 +172,31 @@ fn claim_locked(
         lease_expires_at: lease,
         stolen,
         renewed,
+        default_shared_scopes_added,
     })
+}
+
+fn validate_default_shared_scopes(store: &Store) -> Result<()> {
+    let defined = store.config.defined_scopes();
+    if defined.is_empty() {
+        return Ok(());
+    }
+    let invalid: Vec<&str> = store
+        .config
+        .defaults
+        .shared_scopes
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !defined.contains(*s))
+        .collect();
+    if invalid.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "[defaults].shared_scopes names undefined scope(s): {}",
+            invalid.join(", ")
+        )))
+    }
 }
 
 /// Release `id`'s claim: drop the lease, return it to `ready`. With `agent` set

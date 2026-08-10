@@ -1,11 +1,11 @@
 ---
 id: tracks-should-subtract-live-claims
 title: tracks should account for live claims, not only ready-set conflicts
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: []
-scopes: []
+scopes: [core, cli, skill, docs]
 shared_scopes: []
 paths: []
 tags: [bug, orchestration, tracks]

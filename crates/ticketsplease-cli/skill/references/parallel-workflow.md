@@ -1,6 +1,6 @@
 # Multi-agent orchestration patterns
 
-This is the workflow ticketsplease is built for: one orchestrator fanning out disjoint work to several workers, with a hard merge gate.
+This is the workflow ticketsplease is built for: one orchestrator using declared scope and claim context to recommend work to several workers, with a diff-based merge gate.
 
 ## Authoring an initiative (before you dispatch)
 
@@ -17,7 +17,9 @@ Then dispatch the ready frontier with the fan-out loop below.
 
 ```
 while there is ready work:
-    batches = `ticketsplease tracks --format json`.batches
+    plan = `ticketsplease tracks --format json`
+    inspect plan.claim_overlaps and plan.stale_claims
+    batches = plan.batches
     if batches is empty: break
     front = batches[0]                       # the immediately-dispatchable disjoint set
     for ticket in front:                     # one worker per ticket, in parallel
@@ -27,7 +29,9 @@ while there is ready work:
     on success `ticketsplease set <id> --status done`; on abandon `ticketsplease release <id> --as <worker>`
 ```
 
-Why only `batches[0]`? Every member of a single batch is scope-disjoint, so the whole front is safe to run at once. Later batches share a scope with a front member and should wait until the front merges and the graph is recomputed. (Dependency ordering is handled separately — only tickets whose dependencies are all done are ever offered, so batching gates on scope overlap alone.)
+Why start with `batches[0]`? It is the tool's recommended front under declared access intent, overlap budget, and live leases. That metadata cannot prove semantic independence, so still claim atomically and use the normal build/test/guard gates. `claim_overlaps` retains candidates that overlap live, stale, or explicit work; `excluded_from_recommended_front` says only whether policy omitted the candidate, not whether dispatch is impossible.
+
+For stale leases, inspect `claims`, `reconcile`, the matching branch/worktree, or `why` before deciding whether to reclaim; stale claims already remain in the recommendation, so `--ignore-claims` is unnecessary for them alone. Use `--ignore-claims` when evidence supports co-running a candidate that a live overlap omitted: it keeps the same structured context but returns an unfiltered recommendation. Do not treat it as a routine retry after an empty front.
 
 ## Push or pull
 
@@ -37,16 +41,16 @@ A pull worker can collapse recommend-then-claim into a single race-safe call: `t
 
 ## Tuning how parallel you go
 
-The default is strict: two tickets never run together if *either* exclusively claims a scope they share (`scopes`). That's safe but over-serializes when the overlap is benign (e.g. both only *append* to a hub crate). The knobs, in the order you'll reach for them:
+The default is conservative: the recommendation does not put two tickets together if *either* exclusively claims a scope they share (`scopes`). This can over-serialize when the overlap is benign (e.g. both only *append* to a hub crate). The knobs, in the order you'll reach for them:
 
 1. **Declare additive intent.** Put a scope in `shared_scopes` (vs `scopes`) when a ticket only appends/extends it. Two shared claims on a scope run in parallel; an exclusive (rewrite) claim still conflicts. This is the precise lever and it carries through to the guard, which won't fail a shared-by-both collision (`cause: shared`).
 2. **Weight scopes once.** `[scope_policy]` in `ticketsplease.toml` sets a per-scope clash cost (`weight = 0` = a free-to-co-edit hub; higher = riskier) — set-and-forget instead of annotating every ticket.
 3. **Tolerate a budget per dispatch.** `tracks`/`next`/`lanes --max-overlap K` co-schedules pairs whose clash cost is ≤ K (`any` = unbounded), filling N workers least-cost-first; the residual `overlap_cost` is reported so you can judge it. Pair with `guard --ignore-transitive` (and the additive-by-intent pass-through) so the merge gate agrees.
-4. **Size the fleet.** `tracks --width` (also in `next`/`rollup` JSON) is the largest set safely runnable at once under the current budget — how many workers to spin up.
+4. **Size the next dispatch.** `tracks --width` (also in `next`/`rollup` JSON) is the additional recommended capacity after live claims are considered. Stale claims are advisory. Use the raw overlap matrix when you want to perform assignment yourself.
 5. **Sequence instead of dropping.** `ticketsplease lanes --parallel N` plans ordered per-worker queues: conflicting tickets are chained onto one lane (later rebases on earlier) with a merge order, so no worker idles waiting for a recompute.
-6. **Stay compatible mid-loop.** `next --running <ids>` (or, by default, the live-claimed in-progress set) drops picks that would clash with work already in flight — the right call when a single worker frees up.
+6. **Account for work mid-loop.** `next --running <ids>` supplies explicit in-flight work; by default live claims provide it automatically. Candidates beyond the budget leave the recommended picks but remain in `claim_overlaps`, so the agent can review rather than infer an absolute prohibition.
 
-Escape hatches when you'd rather not annotate: `--assume-shared` (treat everything additive — pack it all, reconcile at merge), `--strict` (ignore `shared_scopes`/weights — the conservative view), and `tracks --overlap-matrix` (the raw weighted conflict graph, so an external orchestrator assigns work itself).
+Policy controls: `--ignore-claims` keeps the dependency-ready candidates while retaining claim context; `--assume-shared` treats everything additive; `--strict` treats shared declarations as exclusive; and `tracks --overlap-matrix` emits the raw weighted ready-set graph and raw width for an external assignment policy.
 
 ## Branch naming
 
@@ -92,6 +96,7 @@ Workers advance status on their own `tkt/<id>` branches, so an orchestrator on `
 
 ## Keeping the graph honest
 
+- Configure `[defaults].shared_scopes` for additive areas every worker edits (commonly the ticket directory). `create` writes them into new tickets and `claim` backfills older ones; read `default_shared_scopes_added` in claim JSON when provenance matters.
 - Declare scopes **before** dispatching, not after — the guard compares actual diff against declared intent, so an honest declaration up front is what makes the collision math work.
 - Prefer narrow scopes. A scope like `cli` that covers an entire crate forces everything touching that crate to serialize. Finer scopes (`cli/guard`, `cli/output`) unlock more parallelism — but only declare what a ticket truly needs.
 - Run `ticketsplease lint` after bulk edits to catch dangling dependencies and cycles before they reach the scheduler.

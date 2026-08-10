@@ -92,6 +92,151 @@ pub fn ready(tickets: &[Ticket]) -> Result<Vec<&Ticket>> {
     Ok(graph.dispatchable(tickets))
 }
 
+/// How a piece of already-started work entered a scheduling recommendation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimLeaseState {
+    /// An open ticket with an unexpired claim lease.
+    Live,
+    /// An open ticket with claim metadata but no live lease.
+    Stale,
+    /// A ticket supplied explicitly through `next --running`.
+    Explicit,
+}
+
+impl ClaimLeaseState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Stale => "stale",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+/// One ready candidate's overlap with a claimed or explicitly-running ticket.
+pub struct ClaimOverlapDetail<'a> {
+    pub claim: &'a Ticket,
+    pub lease_state: ClaimLeaseState,
+    pub scopes: Vec<String>,
+    pub cost: i64,
+    pub exceeds_budget: bool,
+}
+
+/// Advisory claim context for one ready candidate.
+pub struct CandidateClaimOverlap<'a> {
+    pub candidate: &'a Ticket,
+    pub claims: Vec<ClaimOverlapDetail<'a>>,
+    pub excluded_from_recommended_front: bool,
+}
+
+/// A ready frontier plus the claim context used to recommend it.
+pub struct ClaimAwareFrontier<'a> {
+    pub recommended: Vec<&'a Ticket>,
+    pub claim_overlaps: Vec<CandidateClaimOverlap<'a>>,
+    pub stale_claims: Vec<&'a Ticket>,
+}
+
+/// Controls how active claim overlaps affect a scheduling recommendation.
+pub struct ClaimFrontierOptions<'a> {
+    pub max_overlap: i64,
+    pub weights: &'a BTreeMap<String, i64>,
+    pub ignore_claims: bool,
+}
+
+/// Split open claim metadata into currently-live and stale sets. The caller supplies
+/// `now` so tests and JSON recommendations remain reproducible for a fixed input.
+#[must_use]
+pub fn classify_claims(tickets: &[Ticket], now: u64) -> (Vec<&Ticket>, Vec<&Ticket>) {
+    let mut live = Vec::new();
+    let mut stale = Vec::new();
+    for ticket in tickets {
+        if !ticket.is_open() {
+            continue;
+        }
+        if ticket.lease_live(now) {
+            live.push(ticket);
+        } else if ticket.assignee.is_some() || ticket.lease_expires_at.is_some() {
+            stale.push(ticket);
+        }
+    }
+    live.sort_by(|a, b| a.id.cmp(&b.id));
+    stale.sort_by(|a, b| a.id.cmp(&b.id));
+    (live, stale)
+}
+
+/// Recommend from `candidates` while retaining machine-readable overlap facts. Live
+/// (or explicit) work beyond the overlap budget is omitted unless `ignore_claims` is
+/// set. Stale claims are advisory only and never remove a candidate.
+#[must_use]
+pub fn claim_aware_frontier<'a>(
+    candidates: &[&'a Ticket],
+    active: &[(&'a Ticket, ClaimLeaseState)],
+    stale: &[&'a Ticket],
+    options: ClaimFrontierOptions<'_>,
+) -> ClaimAwareFrontier<'a> {
+    let active_ids: BTreeSet<&str> = active.iter().map(|(t, _)| t.id.as_str()).collect();
+    let stale_claims: Vec<&Ticket> = stale
+        .iter()
+        .copied()
+        .filter(|t| !active_ids.contains(t.id.as_str()))
+        .collect();
+    let mut recommended = Vec::new();
+    let mut claim_overlaps = Vec::new();
+
+    for &candidate in candidates {
+        let mut claims = Vec::new();
+        let mut excluded = false;
+        for &(claim, state) in active {
+            let scopes = overlapping_scopes(candidate, claim);
+            if scopes.is_empty() {
+                continue;
+            }
+            let cost = conflict_cost(candidate, claim, options.weights);
+            let exceeds_budget = cost > options.max_overlap;
+            excluded |= exceeds_budget && !options.ignore_claims;
+            claims.push(ClaimOverlapDetail {
+                claim,
+                lease_state: state,
+                scopes,
+                cost,
+                exceeds_budget,
+            });
+        }
+        for &claim in &stale_claims {
+            let scopes = overlapping_scopes(candidate, claim);
+            if scopes.is_empty() {
+                continue;
+            }
+            let cost = conflict_cost(candidate, claim, options.weights);
+            claims.push(ClaimOverlapDetail {
+                claim,
+                lease_state: ClaimLeaseState::Stale,
+                scopes,
+                cost,
+                exceeds_budget: cost > options.max_overlap,
+            });
+        }
+        claims.sort_by(|a, b| a.claim.id.cmp(&b.claim.id));
+        if !excluded {
+            recommended.push(candidate);
+        }
+        if !claims.is_empty() {
+            claim_overlaps.push(CandidateClaimOverlap {
+                candidate,
+                claims,
+                excluded_from_recommended_front: excluded,
+            });
+        }
+    }
+
+    ClaimAwareFrontier {
+        recommended,
+        claim_overlaps,
+        stale_claims,
+    }
+}
+
 /// Partition the ready set into parallel batches (R6): no two tickets in a batch
 /// conflict beyond `max_overlap`. With the default `max_overlap = 0` a batch is
 /// strictly conflict-free (two tickets that conflict never share a batch); a higher
@@ -133,6 +278,22 @@ pub fn tracks_and_width<'a>(
     Ok((batches, width))
 }
 
+/// Batch an already-selected candidate frontier and calculate its parallel width.
+#[must_use]
+pub fn tracks_and_width_among<'a>(
+    candidates: &[&'a Ticket],
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> (Vec<Vec<&'a Ticket>>, usize) {
+    if candidates.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let conflicts = ConflictGraph::build(candidates.to_vec(), max_overlap, weights);
+    let width = conflicts.max_compatible();
+    let batches = conflicts.batches();
+    (batches, width)
+}
+
 /// A worker-lane plan: ≤ `parallel` lanes, each an ordered queue for one worker, plus
 /// the round-by-round merge order.
 pub struct LanePlan<'a> {
@@ -155,8 +316,24 @@ pub fn lanes<'a>(
     max_overlap: i64,
     weights: &BTreeMap<String, i64>,
 ) -> Result<LanePlan<'a>> {
-    let n = parallel.max(1);
     let batches = tracks(tickets, max_overlap, weights)?;
+    Ok(lanes_from_batches(&batches, parallel))
+}
+
+/// Build lanes from an already-selected candidate frontier.
+#[must_use]
+pub fn lanes_among<'a>(
+    candidates: &[&'a Ticket],
+    parallel: usize,
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> LanePlan<'a> {
+    let (batches, _) = tracks_and_width_among(candidates, max_overlap, weights);
+    lanes_from_batches(&batches, parallel)
+}
+
+fn lanes_from_batches<'a>(batches: &[Vec<&'a Ticket>], parallel: usize) -> LanePlan<'a> {
+    let n = parallel.max(1);
     // Each conflict-free (within budget) batch, capped to n, becomes one or more rounds
     // of ≤ n concurrently-runnable tickets.
     let rounds: Vec<Vec<&Ticket>> = batches
@@ -173,7 +350,7 @@ pub fn lanes<'a>(
     }
     lanes.retain(|l| !l.is_empty());
     let merge_order: Vec<&Ticket> = rounds.iter().flatten().copied().collect();
-    Ok(LanePlan { lanes, merge_order })
+    LanePlan { lanes, merge_order }
 }
 
 /// A scored next-pick.
@@ -228,6 +405,28 @@ pub fn next<'a>(
                 .all(|r| conflict_cost(t, r, weights) <= max_overlap)
         });
     }
+    next_from_nodes(&graph, nodes, parallel, max_overlap, weights)
+}
+
+/// Score and choose from an already-selected candidate frontier.
+pub fn next_among<'a>(
+    tickets: &'a [Ticket],
+    candidates: &[&'a Ticket],
+    parallel: usize,
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> Result<Vec<Pick<'a>>> {
+    let graph = Graph::build(tickets)?;
+    next_from_nodes(&graph, candidates.to_vec(), parallel, max_overlap, weights)
+}
+
+fn next_from_nodes<'a>(
+    graph: &Graph<'a>,
+    mut nodes: Vec<&'a Ticket>,
+    parallel: usize,
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+) -> Result<Vec<Pick<'a>>> {
     if nodes.is_empty() {
         return Ok(Vec::new());
     }
@@ -647,6 +846,28 @@ pub fn conflicting_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
         .copied()
         .filter(|s| !(a_shared.contains(*s) && b_shared.contains(*s)))
         .map(str::to_string)
+        .collect()
+}
+
+/// Every declared scope both tickets mention, regardless of access intent or weight.
+/// This is advisory context; [`conflicting_scopes`] remains the gating overlap set.
+#[must_use]
+pub fn overlapping_scopes(a: &Ticket, b: &Ticket) -> Vec<String> {
+    let a_claimed: BTreeSet<&str> = a
+        .scopes
+        .iter()
+        .chain(&a.shared_scopes)
+        .map(String::as_str)
+        .collect();
+    let b_claimed: BTreeSet<&str> = b
+        .scopes
+        .iter()
+        .chain(&b.shared_scopes)
+        .map(String::as_str)
+        .collect();
+    a_claimed
+        .intersection(&b_claimed)
+        .map(|s| (*s).to_string())
         .collect()
 }
 

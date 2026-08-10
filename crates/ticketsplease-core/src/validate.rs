@@ -172,6 +172,7 @@ mod tests {
             scope_crates: BTreeMap::new(),
             external_scopes: BTreeMap::new(),
             scope_policy: BTreeMap::new(),
+            defaults: Default::default(),
             workflow: Default::default(),
             guard: Default::default(),
             maintenance: Default::default(),

@@ -1,7 +1,7 @@
 ---
 id: set-should-edit-scopes-and-tags
 title: set should edit scopes, tags, and links, not only status and comments
-status: todo
+status: closed
 priority: p3
 dependencies: []
 related: []
@@ -9,6 +9,8 @@ scopes: []
 shared_scopes: []
 paths: []
 tags: [feature, cli, set]
+closed_reason: obsolete
+closed_note: Scope, tag, path, dependency, and related-link mutation support already shipped; residual flag discoverability is tracked by set-flag-discoverability.
 ---
 
 ## Observed (tiler repo, 2026-08-06, v0.13.0-era binary)

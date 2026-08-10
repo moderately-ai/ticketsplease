@@ -1081,6 +1081,10 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          # (or pass `guard --strict`) to make an overlap gate too.\n\
          # gate_collisions = false\n\
          \n\
+         # Defaults are written into ticket frontmatter; explicit exclusive scopes win.\n\
+         [defaults]\n\
+         # shared_scopes = [\"project/tickets\"]\n\
+         \n\
          [output]\n\
          # Detail commands show full threads; collections show counts. Comment reads\n\
          # union this worktree with the matching tkt/<id> branch by default.\n\

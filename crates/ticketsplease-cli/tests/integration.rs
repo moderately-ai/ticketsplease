@@ -4796,6 +4796,264 @@ fn next_avoids_inflight_tickets() {
 }
 
 #[test]
+fn scheduling_surfaces_live_and_stale_claim_context() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    for (id, scope) in [("a", "core"), ("b", "core"), ("c", "io")] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id, "--scope", scope])
+            .assert()
+            .success();
+    }
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["claim", "a", "--as", "worker"])
+        .assert()
+        .success();
+
+    let run = |args: &[&str]| -> serde_json::Value {
+        let out = tkt(repo).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let ids = |rows: &serde_json::Value| -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch.as_array().unwrap())
+            .map(|ticket| ticket["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let tracks = run(&["tracks", "--format", "json"]);
+    assert_eq!(ids(&tracks["batches"]), vec!["c"]);
+    assert_eq!(tracks["width"], 1);
+    assert_eq!(tracks["claim_overlaps"][0]["candidate"]["id"], "b");
+    assert_eq!(
+        tracks["claim_overlaps"][0]["claims"][0]["lease_state"],
+        "live"
+    );
+    assert_eq!(
+        tracks["claim_overlaps"][0]["claims"][0]["scopes"][0],
+        "core"
+    );
+    assert_eq!(
+        tracks["claim_overlaps"][0]["excluded_from_recommended_front"],
+        true
+    );
+
+    let ignored = run(&["tracks", "--ignore-claims", "--format", "json"]);
+    assert_eq!(ids(&ignored["batches"]), vec!["b", "c"]);
+    assert_eq!(ignored["width"], 2);
+    assert_eq!(
+        ignored["claim_overlaps"][0]["excluded_from_recommended_front"],
+        false
+    );
+
+    let lanes = run(&["lanes", "--format", "json"]);
+    assert_eq!(lanes["merge_order"].as_array().unwrap().len(), 1);
+    assert_eq!(lanes["claim_overlaps"][0]["candidate"]["id"], "b");
+    let next = run(&["next", "--parallel", "3", "--format", "json"]);
+    assert_eq!(next["width"], 1);
+    assert_eq!(next["picks"][0]["id"], "c");
+    let rollup = run(&["rollup", "--format", "json"]);
+    assert_eq!(rollup["width"], 1);
+    assert_eq!(rollup["claim_overlaps"][0]["candidate"]["id"], "b");
+
+    // The matrix remains the raw dependency-ready graph by design.
+    let matrix = run(&["tracks", "--overlap-matrix", "--format", "json"]);
+    assert_eq!(matrix["width"], 2);
+    assert!(matrix.get("claim_overlaps").is_none());
+
+    // A zero-length lease is stale immediately: it stays recommended but is visible.
+    tkt(repo)
+        .args(["release", "a", "--as", "worker"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["claim", "a", "--as", "worker", "--ttl", "0"])
+        .assert()
+        .success();
+    let stale = run(&["tracks", "--format", "json"]);
+    assert_eq!(ids(&stale["batches"]), vec!["b", "c"]);
+    assert_eq!(stale["stale_claims"][0]["id"], "a");
+    assert_eq!(
+        stale["claim_overlaps"][0]["claims"][0]["lease_state"],
+        "stale"
+    );
+    assert_eq!(
+        stale["claim_overlaps"][0]["excluded_from_recommended_front"],
+        false
+    );
+}
+
+#[test]
+fn configured_default_shared_scopes_apply_on_create_and_claim() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let base = "schema_version = 1\ntickets_dir = \"tickets\"\ndefault_base = \"main\"\n\
+                [language]\nbackend = \"none\"\n[scopes]\n\
+                \"core\" = [\"core/**\"]\n\"project/tickets\" = [\"tickets/**\"]\n";
+    std::fs::write(repo.join("ticketsplease.toml"), base).unwrap();
+    tkt(repo)
+        .args(["create", "--id", "old", "--title", "Old"])
+        .assert()
+        .success();
+    std::fs::write(
+        repo.join("ticketsplease.toml"),
+        format!("{base}\n[defaults]\nshared_scopes = [\"project/tickets\"]\n"),
+    )
+    .unwrap();
+
+    tkt(repo)
+        .args(["create", "--id", "new", "--title", "New"])
+        .assert()
+        .success();
+    assert_eq!(
+        show_json(repo, "new")["shared_scopes"][0],
+        "project/tickets"
+    );
+
+    // Explicit exclusive intent wins over the configured shared default.
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "exclusive",
+            "--title",
+            "Exclusive",
+            "--scope",
+            "project/tickets",
+        ])
+        .assert()
+        .success();
+    assert!(show_json(repo, "exclusive")["shared_scopes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Batch create uses the same default merge.
+    let manifest = repo.join("batch.json");
+    std::fs::write(&manifest, r#"[{"id":"batch","title":"Batch"}]"#).unwrap();
+    tkt(repo)
+        .args(["create", "--from", manifest.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(
+        show_json(repo, "batch")["shared_scopes"][0],
+        "project/tickets"
+    );
+
+    git_init_commit(repo);
+    let out = tkt(repo)
+        .args(["claim", "old", "--as", "worker", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let claim: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(claim["default_shared_scopes_added"][0], "project/tickets");
+    assert_eq!(
+        show_json(repo, "old")["shared_scopes"][0],
+        "project/tickets"
+    );
+
+    // Renewal is idempotent and reports that no additional default was needed.
+    let out = tkt(repo)
+        .args(["claim", "old", "--as", "worker", "--format", "json"])
+        .output()
+        .unwrap();
+    let renewed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(renewed["default_shared_scopes_added"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn invalid_default_shared_scope_is_linted_and_claim_is_non_mutating() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    let mut config = std::fs::read_to_string(repo.join("ticketsplease.toml")).unwrap();
+    config.push_str("\n[defaults]\nshared_scopes = [\"ghost\"]\n");
+    std::fs::write(repo.join("ticketsplease.toml"), config).unwrap();
+    git_init_commit(repo);
+
+    let out = tkt(repo)
+        .args(["lint", "--format", "json"])
+        .output()
+        .unwrap();
+    let lint: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(lint["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "unknown-default-shared-scope"));
+    tkt(repo)
+        .args(["claim", "a", "--as", "worker"])
+        .assert()
+        .code(3);
+    let ticket = show_json(repo, "a");
+    assert_eq!(ticket["status"], "todo");
+    assert!(ticket["assignee"].is_null());
+}
+
+#[test]
+fn set_additive_aliases_are_visible_and_validated() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"docs\" = [\"docs/**\"]\n");
+    for id in ["a", "peer"] {
+        tkt(repo)
+            .args(["create", "--id", id, "--title", id])
+            .assert()
+            .success();
+    }
+    tkt(repo)
+        .args([
+            "set",
+            "a",
+            "--scopes",
+            "core",
+            "--shared-scopes",
+            "docs",
+            "--tags",
+            "bug,ux",
+            "--related",
+            "peer",
+        ])
+        .assert()
+        .success();
+    let ticket = show_json(repo, "a");
+    assert_eq!(ticket["scopes"][0], "core");
+    assert_eq!(ticket["shared_scopes"][0], "docs");
+    assert_eq!(ticket["tags"].as_array().unwrap().len(), 2);
+    assert_eq!(ticket["related"][0], "peer");
+
+    tkt(repo)
+        .args(["set", "a", "--scopes", "ghost"])
+        .assert()
+        .code(3);
+    let help = tkt(repo).args(["set", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--scopes"), "{help}");
+    assert!(help.contains("--tags"), "{help}");
+}
+
+#[test]
 fn lanes_sequence_conflicts_onto_a_worker() {
     let dir = TempDir::new().unwrap();
     let repo = dir.path();
@@ -5034,6 +5292,14 @@ fn skill_links_to_canonical_and_sync_refreshes() {
         canonical.exists(),
         "canonical skill synced under XDG_DATA_HOME"
     );
+    let canonical_root = canonical.parent().unwrap();
+    assert!(canonical_root.join("agents/openai.yaml").exists());
+    let skill_text = std::fs::read_to_string(&canonical).unwrap();
+    assert!(skill_text.contains("claim_overlaps"));
+    assert!(skill_text.contains("default_shared_scopes_added"));
+    let workflow =
+        std::fs::read_to_string(canonical_root.join("references/parallel-workflow.md")).unwrap();
+    assert!(workflow.contains("--ignore-claims"));
     let link = repo.join(".claude/skills/ticketsplease");
     assert!(
         std::fs::symlink_metadata(&link)

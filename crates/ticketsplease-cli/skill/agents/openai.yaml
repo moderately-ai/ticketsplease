@@ -1,0 +1,6 @@
+interface:
+  display_name: "ticketsplease"
+  short_description: "Coordinate conflict-aware development work"
+  default_prompt: "Use $ticketsplease to inspect the ticket board and recommend the next conflict-aware work."
+policy:
+  allow_implicit_invocation: true

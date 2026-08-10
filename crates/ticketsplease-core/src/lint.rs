@@ -19,7 +19,8 @@ pub struct Diagnostic {
     /// The ticket id, when parseable.
     pub id: Option<String>,
     /// A stable machine-readable kind: `parse` | `id-mismatch` | `bad-id` |
-    /// `unknown-scope` | `unknown-scope-policy` | `scope-mode-conflict` |
+    /// `unknown-scope` | `unknown-scope-policy` | `unknown-default-shared-scope` |
+    /// `scope-mode-conflict` |
     /// `paths-without-scopes` | `duplicate-id` | `unknown-state` | `state-coverage` |
     /// `unknown-transition-state` | `dead-end-nonterminal` | `stale-resolution` |
     /// `missing-dep` | `missing-related` | `orphaned-by-closed-dep` | `cycle`.
@@ -106,6 +107,21 @@ pub fn lint_with_tickets(store: &Store) -> Result<(Vec<Diagnostic>, Vec<Ticket>)
     // baffling later guard CONFLICT, so flag it like a dangling dep. `create`/`set`
     // reuse the same vocabulary to reject a bad scope at write time.
     let defined_scopes = store.config.defined_scopes();
+    if !defined_scopes.is_empty() {
+        for raw in &store.config.defaults.shared_scopes {
+            let scope = raw.trim();
+            if !scope.is_empty() && !defined_scopes.contains(scope) {
+                diags.push(Diagnostic {
+                    file: CONFIG_FILE.to_string(),
+                    id: None,
+                    code: "unknown-default-shared-scope",
+                    message: format!(
+                        "[defaults].shared_scopes entry `{scope}` is not a defined scope"
+                    ),
+                });
+            }
+        }
+    }
     for path in store.ticket_files()? {
         let file = rel(&store.repo_root, &path);
         let stem = path

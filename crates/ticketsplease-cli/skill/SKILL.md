@@ -1,16 +1,16 @@
 ---
 name: ticketsplease
-description: Manage and distribute development work across a codebase — break work into git-native markdown tickets, dispatch conflict-free parallel batches to multiple agents without merge collisions, query and roll up an initiative's progress, and verify a branch stayed inside its declared scope before merging. Backed by the ticketsplease CLI (`ticketsplease`, alias `tkt`). Use this whenever the user is coordinating work in a repo that has a `ticketsplease.toml` and a `tickets/` directory — deciding what to work on next, splitting work across several agents, creating/updating/linking/filtering tickets, rolling up an epic's status, or checking whether a branch's diff stayed inside its declared scope before merging. Reach for this skill whenever the user mentions tickets, parallel work, agent coordination, work distribution, what to work on next, conflict-free batches, dependency-ordered work, an initiative or epic's status, or guarding/validating a branch — even if they do not name ticketsplease explicitly.
+description: Manage and distribute development work across a codebase — break work into git-native markdown tickets, interpret claim-aware parallel-work recommendations, query and roll up initiative progress, and verify a branch stayed inside its declared scope before merging. Backed by the ticketsplease CLI (`ticketsplease`, alias `tkt`). Use this whenever the user is coordinating work in a repo that has a `ticketsplease.toml` and a `tickets/` directory — deciding what to work on next, splitting work across agents, reviewing live or stale claim overlaps, creating/updating/linking/filtering tickets, rolling up an epic's status, or guarding/validating a branch — even if they do not name ticketsplease explicitly.
 allowed-tools: Bash, Read, Write, Grep, Glob
 ---
 
 # ticketsplease — git-native parallel-work ticketing
 
-ticketsplease (CLI `ticketsplease`, short alias `tkt`) manages development work as **git-versioned markdown tickets** and computes **conflict-free parallel work assignment** — so work can be split across multiple agents that never edit the same area of the codebase at once. Tickets are plain markdown + YAML frontmatter under `tickets/`; **scopes** (abstract area names like `core` or `query/planner`) are defined in `ticketsplease.toml` and map to file globs — and, for Rust repos, to crates.
+ticketsplease (CLI `ticketsplease`, short alias `tkt`) manages development work as **git-versioned markdown tickets** and computes conflict-aware parallel-work recommendations from declared scope and claim context. Tickets are plain markdown + YAML frontmatter under `tickets/`; **scopes** (abstract area names like `core` or `query/planner`) are defined in `ticketsplease.toml` and map to file globs — and, for Rust repos, to crates.
 
 ## Why this exists
 
-ticketsplease prevents the parallel-work failure mode — two agents editing the same files and colliding at merge — two ways. `tracks` partitions ready work into batches where no two tickets share a scope, so an entire batch is safe to run in parallel. `guard` checks a branch's *actual* diff against its ticket's *declared* scope — failing if the branch wandered into an area it never claimed, or into one another open ticket owns. For Rust repos the guard maps the diff through the cargo crate graph, so a change to a leaf crate is also checked against everything that depends on it.
+ticketsplease helps agents reason about the parallel-work failure mode in two places. `tracks` recommends batches from declared scopes, overlap policy, and current claim leases while retaining structured context for agent judgment. `guard` checks a branch's *actual* diff against its ticket's declared scope. For Rust repos the guard maps the diff through the cargo crate graph, so a change to a leaf crate is also checked against everything that depends on it.
 
 ## The contract — rely on this, not on prose
 
@@ -44,21 +44,21 @@ After upgrading the binary, the installer refreshes the canonical skill; if `doc
 
 **Maintenance advisories are human-only — you will never see them.** In an interactive human session the CLI may print a stderr hint after a command (an update is available, the repo drifted → `migrate`, the board has lint findings). They are gated off for every non-interactive caller — `--format json`, no TTY, or `CI` set — so they never touch your stdout or the JSON contract, and `TICKETSPLEASE_NO_ADVISORIES=1` disables them entirely. Config + opt-in auto-repair (`[maintenance]`, `--auto-doctor`): `references/commands.md` → `maintenance advisories`.
 
-Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents (collisions from that expansion are tagged `transitive` so you can triage them; `guard --direct-only`, or `[language] reverse_dep_expansion = false` for a repo default, skips it). Under-declaration is always file-based, so this expansion never causes a false "out of scope" on a shared foundational crate. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
+Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For additive areas every worker edits, `[defaults] shared_scopes = ["project/tickets"]` makes `create` declare them and `claim` backfill older tickets; an explicit exclusive claim wins. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
 
 ## The orchestration loop (dispatching parallel work)
 
-1. **Get the conflict-free batches:**
+1. **Get the recommended dispatch front and its context:**
    ```sh
    ticketsplease tracks --format json
    ```
-   Each element of `batches` is a set of tickets that share no scope. Dispatch all members of a single batch to separate workers at the same time — they are guaranteed not to collide.
+   Start with `batches[0]`, then inspect `claim_overlaps` and `stale_claims`. In each overlap entry, `candidate` is the ready ticket being evaluated and `claims[].ticket` is the already-started work affecting it. A candidate omitted from the recommended front has `excluded_from_recommended_front: true` because a live overlap exceeded the current budget; a stale lease is advisory and does not remove it. Use `claims`, `reconcile`, branch state, or `why` when the context is ambiguous. `--ignore-claims` restores candidates that live claims filtered out while preserving the facts—use it only after making that judgment. Scope metadata is a partitioning signal, not a guarantee against semantic conflicts.
 
 2. **Per worker, claim the ticket first** — the atomic hand-off that stops two workers grabbing the same one:
    ```sh
    ticketsplease claim <id> --as <worker-id> --format json   # exit 6 → already claimed, pick another
    ```
-   The claim is race-safe and lease-backed (exactly one of N racers wins; the rest get exit 6; a crashed worker's ticket becomes reclaimable), refuses a ticket whose dependencies aren't all done, and flips it to in-progress so `ready`/`tracks`/`next` stop offering it — this is what makes **pull-based** dispatch safe with no central coordinator. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside its declared scope. `next --claim --as <worker>` collapses recommend-then-claim into one atomic call; `claims` shows who holds what; `claim --force` steals a live lease. See `references/parallel-workflow.md` for the push-vs-pull pattern and lease recovery.
+   The claim is race-safe and lease-backed (exactly one of N racers wins; the rest get exit 6; a crashed worker's ticket becomes reclaimable), refuses a ticket whose dependencies aren't all done, and flips it to in-progress. Read `default_shared_scopes_added` to see whether repository defaults expanded the ticket's additive declarations. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside its declared scope. `next --claim --as <worker>` collapses recommend-then-claim into one atomic call; `claims` shows who holds what; `claim --force` steals a live lease.
 
 3. **Before merging, guard the branch:**
    ```sh
@@ -79,16 +79,16 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
 For a single highest-leverage pick instead of a whole batch:
 ```sh
 ticketsplease next --format json               # one ticket
-ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
+ticketsplease next --parallel 4 --format json  # recommended picks + claim context
 ```
 
 ## Picking and inspecting work
 
 - `ticketsplease ready` — dependency-satisfied tickets, priority-ordered (a ticket is ready when its status is todo/ready and every dependency is **done**). A dependency that was `closed` (terminated without completing) rather than done does *not* satisfy — the dependent is left **orphaned** (surfaced by `rollup`/`lint`, never silently dispatched), so re-point, waive, or close it.
-- `ticketsplease tracks [--max-overlap K] [--width]` — conflict-free parallel batches (the headline feature); `--width` shows how many workers are safe to run right now. Overlap tuning: see **Access intent & overlap** below.
-- `ticketsplease lanes [--parallel N]` — ordered per-worker queues that *sequence* conflicting work onto one lane instead of dropping it (with a merge order). Use when you want a full N-worker plan, not just the immediate front.
+- `ticketsplease tracks [--max-overlap K] [--width] [--ignore-claims]` — recommended batches plus live/stale claim context; `--width` is the additional recommended capacity. Overlap tuning: see **Access intent & overlap** below.
+- `ticketsplease lanes [--parallel N] [--ignore-claims]` — ordered queues from the same claim-aware front, with a merge order. Use when you want a full N-worker plan, not just the immediate front.
 - `ticketsplease why <a> <b>` — explain whether two tickets can co-run, and if not, the exact reason (a shared scope, or one transitively depends on the other). Use it when the scheduler's grouping is surprising.
-- `ticketsplease next [--parallel N] [--max-overlap K] [--running ids]` — scored recommendation(s) favouring priority, critical-path position, and downstream unblock count; `--running` keeps picks compatible with in-flight work, `--claim --as <w>` claims one atomically. (Flag semantics: `references/commands.md`.)
+- `ticketsplease next [--parallel N] [--max-overlap K] [--running ids] [--ignore-claims]` — scored recommendation(s) plus claim context; `--running` supplies explicit work, while `--ignore-claims` requests an unfiltered automatic view. `--claim --as <w>` claims one atomically. (Flag semantics: `references/commands.md`.)
 - `ticketsplease list [--status <s>] [--where '<expr>']` — list/filter tickets. `--where` is a boolean expression: `field:value` joined by `AND`/`OR`/`NOT` with parens (fields: status priority tag scope assignee id dep related reason), e.g. `--where 'tag:epic AND NOT status:done'` or `--where 'status:closed AND reason:duplicate'`. `ticketsplease view save <name> '<expr>'` stores one as a reusable view (then `list --view <name>`). `ticketsplease show <id>`.
 - `ticketsplease rollup [--tag <t> | --where <e> | --view <v>]` — an initiative's dashboard: status & priority counts, % done (plus a `closed` count), the ready frontier, the blocked set (each with its unmet deps), and any tickets **orphaned** by a closed dependency. The one-call "where does this epic stand and what's next in it".
 - `ticketsplease states` — the workflow's states and their engine **category** (dispatchable/open/parked/terminal). A repo keeps the built-in states unless it declares `[workflow.states]`; custom states are named freely but pin to a category the scheduler/guard/rollup reason about (see `references/commands.md`).
@@ -98,7 +98,7 @@ ticketsplease next --parallel 4 --format json  # 4 mutually conflict-free picks
 
 ## Access intent & overlap (tuning parallelism)
 
-Claim a scope in one of two modes so you needn't single-thread on benign clashes: `scopes` is an **exclusive** (rewrite) claim, `shared_scopes` is a **shared/additive** (append/extend) one. Two shared claims on a scope co-run; any exclusive claim blocks any other claim on that scope. On top of that, `--max-overlap K` on `tracks`/`next`/`lanes` tolerates clashes up to a per-pair cost budget so you fill N workers least-riskily instead of idling them.
+Claim a scope in one of two modes so you needn't single-thread on benign clashes: `scopes` is an **exclusive** (rewrite) claim, `shared_scopes` is a **shared/additive** (append/extend) one. Two shared claims have zero conflict cost; an exclusive claim adds cost. `--max-overlap K` on `tracks`/`next`/`lanes` sets the per-pair budget. Live claim overlaps beyond it are omitted from the recommended front but remain in `claim_overlaps`; stale claims remain advisory. `--ignore-claims` keeps every dependency-ready candidate while preserving that context.
 
 **Batching keys on scope names, never on `paths`.** The scheduler — `tracks`, `why`, `lanes`, `next` — reasons purely about `scopes`/`shared_scopes`. The `paths` field is read *only* by `guard` (as an under-declaration allowance); it looks like a file-intent declaration but does not feed the conflict math. A ticket that declares `paths` but no scopes is therefore **invisible to batching** and will be co-scheduled with work that rewrites the same files — so always give a ticket a `scope`, not just `paths`. `lint` flags the omission as `paths-without-scopes`.
 
@@ -111,6 +111,8 @@ ticketsplease create --title "Add vector index" --priority p1 \
   --scope query/planner --shared-scope changelog --depends-on build-index-trait --related design-doc --template default
 ticketsplease create --from backlog.toml    # batch from JSON/TOML (- = stdin); transactional (no partial creates); dry-run shows final ids
 ticketsplease set <id> --status in-progress --add-scope core --add-dependency other
+# additive aliases: --scope/--scopes, --shared-scope/--shared-scopes, --tag/--tags, --related
+# changing a scope's mode is explicit: add the new mode and remove the old one
 ticketsplease set --where 'tag:epic' --add-tag ready-soon   # bulk-edit every match (field edits only, not title/body)
 ticketsplease link <id> (--depends-on <o> | --related <o>)  # depends-on cycle → exit 5; related is non-blocking, never cycle-checked
 ticketsplease rename <old> <new>            # moves the file, rewrites the id, repoints references (dependency + related edges)

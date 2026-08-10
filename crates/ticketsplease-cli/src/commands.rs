@@ -365,7 +365,12 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     let depends_on = norm_list(&args.depends_on);
     let related = norm_list(&args.related);
     let scopes = norm_list(&args.scopes);
-    let shared_scopes = norm_list(&args.shared_scopes);
+    let mut shared_scopes = norm_list(&args.shared_scopes);
+    shared_scopes.extend(
+        store
+            .config
+            .default_shared_scope_additions(&scopes, &shared_scopes),
+    );
     let paths = norm_list(&args.paths);
     let tags = norm_list(&args.tags);
 
@@ -637,6 +642,13 @@ fn create_batch(
         if let Some(id) = &s.id {
             store::validate_slug(id)?;
         }
+        let scopes = norm_list(&s.scopes);
+        let mut shared_scopes = norm_list(&s.shared_scopes);
+        shared_scopes.extend(
+            store
+                .config
+                .default_shared_scope_additions(&scopes, &shared_scopes),
+        );
         create_specs.push(CreateSpec {
             id: s.id,
             title: s.title,
@@ -644,8 +656,8 @@ fn create_batch(
             priority,
             depends_on: norm_list(&s.depends_on),
             related: norm_list(&s.related),
-            scopes: norm_list(&s.scopes),
-            shared_scopes: norm_list(&s.shared_scopes),
+            scopes,
+            shared_scopes,
             paths: norm_list(&s.paths),
             tags: norm_list(&s.tags),
             body: s.body,
@@ -1787,10 +1799,12 @@ pub fn rollup(repo: &Path, fmt: Format, output: OutputOverrides, args: &RollupAr
         .iter()
         .filter(|t| ready_ids.contains(t.id.as_str()))
         .collect();
-    // Safe parallel width within the initiative's ready frontier (default budget).
+    // Recommended parallel width within the initiative's ready frontier, accounting
+    // for live claims anywhere on the board. The raw `ready` list remains visible.
     let weights = store.config.scope_weights();
     let ready_refs: Vec<&Ticket> = ready.iter().map(|t| **t).collect();
-    let width = schedule::max_compatible_among(&ready_refs, 0, &weights);
+    let claim_context = auto_claim_frontier(&all, &ready_refs, 0, &weights, args.ignore_claims);
+    let width = schedule::max_compatible_among(&claim_context.recommended, 0, &weights);
 
     // Blocked vs orphaned: a selected dispatchable-status ticket whose dependencies are
     // not all satisfied. A `closed` (abandoned) dependency can never complete, so its
@@ -1860,20 +1874,25 @@ pub fn rollup(repo: &Path, fmt: Format, output: OutputOverrides, args: &RollupAr
         .collect();
 
     match fmt {
-        Format::Json => print_json(&json!({
-            "schema_version": 1,
-            "selector": { "tag": args.tag, "where": args.where_, "view": args.view },
-            "total": total,
-            "done": done,
-            "closed": closed,
-            "percent_done": percent_done,
-            "width": width,
-            "by_status": by_status,
-            "by_priority": by_priority,
-            "ready": ready_json,
-            "blocked": blocked_json,
-            "orphaned": orphaned_json,
-        })),
+        Format::Json => {
+            let (claim_overlaps, stale_claims) = claim_context_json(&claim_context);
+            print_json(&json!({
+                "schema_version": 1,
+                "selector": { "tag": args.tag, "where": args.where_, "view": args.view },
+                "total": total,
+                "done": done,
+                "closed": closed,
+                "percent_done": percent_done,
+                "width": width,
+                "by_status": by_status,
+                "by_priority": by_priority,
+                "ready": ready_json,
+                "blocked": blocked_json,
+                "orphaned": orphaned_json,
+                "claim_overlaps": claim_overlaps,
+                "stale_claims": stale_claims,
+            }))
+        }
         Format::Human => {
             let scope = match (&args.tag, &args.where_, &args.view) {
                 (Some(tag), _, _) => format!("tag={tag}"),
@@ -1918,7 +1937,8 @@ pub fn rollup(repo: &Path, fmt: Format, output: OutputOverrides, args: &RollupAr
                 ready_ids.len(),
                 join_or_none(&ready_ids)
             );
-            println!("  safe parallel width: {width}");
+            println!("  recommended parallel width: {width}");
+            print_claim_context(&claim_context);
             if blocked.is_empty() {
                 println!("  blocked (0): (none)");
             } else {
@@ -2479,17 +2499,41 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
         return emit_overlap_matrix(fmt, &tickets, &weights, width);
     }
     if args.width {
-        // `--width` is a terse one-number answer for "how many workers can I spin up".
-        let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
+        let candidates = schedule::ready(&tickets)?;
+        let context = auto_claim_frontier(
+            &tickets,
+            &candidates,
+            max_overlap,
+            &weights,
+            args.ignore_claims,
+        );
+        let width = schedule::max_compatible_among(&context.recommended, max_overlap, &weights);
         return match fmt {
-            Format::Json => print_json(&json!({ "schema_version": 1, "width": width })),
+            Format::Json => {
+                let (claim_overlaps, stale_claims) = claim_context_json(&context);
+                print_json(&json!({
+                    "schema_version": 1,
+                    "width": width,
+                    "claim_overlaps": claim_overlaps,
+                    "stale_claims": stale_claims,
+                }))
+            }
             Format::Human => {
                 println!("{width}");
                 Ok(())
             }
         };
     }
-    let (mut batches, width) = schedule::tracks_and_width(&tickets, max_overlap, &weights)?;
+    let candidates = schedule::ready(&tickets)?;
+    let context = auto_claim_frontier(
+        &tickets,
+        &candidates,
+        max_overlap,
+        &weights,
+        args.ignore_claims,
+    );
+    let (mut batches, width) =
+        schedule::tracks_and_width_among(&context.recommended, max_overlap, &weights);
     // --parallel caps each batch to N tickets, splitting larger ones so an orchestrator
     // with N workers gets worker-sized fronts. Chunking preserves the per-pair budget.
     if let Some(n) = args.parallel.filter(|&n| n > 0) {
@@ -2504,6 +2548,7 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
     match fmt {
         Format::Json => {
+            let (claim_overlaps, stale_claims) = claim_context_json(&context);
             let arr: Vec<Value> = batches
                 .iter()
                 .map(|b| {
@@ -2523,11 +2568,13 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
                 "batches": arr,
                 "overlap_cost": overlap_cost,
                 "width": width,
+                "claim_overlaps": claim_overlaps,
+                "stale_claims": stale_claims,
             }))
         }
         Format::Human => {
             if batches.is_empty() {
-                println!("(no ready tickets)");
+                println!("(no tickets in the recommended front)");
             }
             for (i, batch) in batches.iter().enumerate() {
                 let ids: Vec<String> = batch
@@ -2539,6 +2586,7 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
             if overlap_cost > 0 {
                 println!("(tolerated overlap cost: {overlap_cost})");
             }
+            print_claim_context(&context);
             for id in &ids {
                 print_full_thread_if_any(&comments, id);
             }
@@ -2567,17 +2615,26 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
-    // Default the lane count to the safe parallel width (use as many workers as fit).
+    let candidates = schedule::ready(&tickets)?;
+    let context = auto_claim_frontier(
+        &tickets,
+        &candidates,
+        max_overlap,
+        &weights,
+        args.ignore_claims,
+    );
+    // Default the lane count to the recommended additional width.
     let n = match args.parallel {
         Some(n) => n,
-        None => schedule::parallel_width(&tickets, max_overlap, &weights)?.max(1),
+        None => schedule::max_compatible_among(&context.recommended, max_overlap, &weights).max(1),
     };
-    let plan = schedule::lanes(&tickets, n, max_overlap, &weights)?;
+    let plan = schedule::lanes_among(&context.recommended, n, max_overlap, &weights);
     let ids: Vec<String> = plan.lanes.iter().flatten().map(|t| t.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
     match fmt {
         Format::Json => {
+            let (claim_overlaps, stale_claims) = claim_context_json(&context);
             let lanes: Vec<Value> = plan
                 .lanes
                 .iter()
@@ -2598,6 +2655,8 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
                 "schema_version": 1,
                 "lanes": lanes,
                 "merge_order": merge_order,
+                "claim_overlaps": claim_overlaps,
+                "stale_claims": stale_claims,
             }))
         }
         Format::Human => {
@@ -2615,6 +2674,7 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
                 let order: Vec<&str> = plan.merge_order.iter().map(|t| t.id.as_str()).collect();
                 println!("merge order: {}", order.join(", "));
             }
+            print_claim_context(&context);
             for id in &ids {
                 print_full_thread_if_any(&comments, id);
             }
@@ -2716,19 +2776,37 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
         parse_overlap_budget(&args.max_overlap)?
     };
     let weights = store.config.scope_weights();
-    // The in-flight set to avoid: explicit `--running` ids, else every in-progress
-    // ticket with a live claim (so a dispatch loop is in-flight-aware with no args).
-    let running: Vec<&Ticket> = if args.running.is_empty() {
-        let now = now_epoch();
-        tickets
-            .iter()
-            .filter(|t| t.is_open() && t.lease_live(now))
+    let candidates = schedule::ready(&tickets)?;
+    let (live, stale) = schedule::classify_claims(&tickets, now_epoch());
+    let active: Vec<(&Ticket, schedule::ClaimLeaseState)> = if args.running.is_empty() {
+        live.into_iter()
+            .map(|t| (t, schedule::ClaimLeaseState::Live))
             .collect()
     } else {
         let ids = norm_list(&args.running);
-        tickets.iter().filter(|t| ids.contains(&t.id)).collect()
+        tickets
+            .iter()
+            .filter(|t| ids.contains(&t.id))
+            .map(|t| (t, schedule::ClaimLeaseState::Explicit))
+            .collect()
     };
-    let picks = schedule::next(&tickets, args.parallel, max_overlap, &weights, &running)?;
+    let context = schedule::claim_aware_frontier(
+        &candidates,
+        &active,
+        &stale,
+        schedule::ClaimFrontierOptions {
+            max_overlap,
+            weights: &weights,
+            ignore_claims: args.ignore_claims,
+        },
+    );
+    let picks = schedule::next_among(
+        &tickets,
+        &context.recommended,
+        args.parallel,
+        max_overlap,
+        &weights,
+    )?;
 
     // Atomic dispatch: claim the first pick still free. Trying picks in order makes a
     // lost race (another worker grabbed the top pick) fall through to the next instead
@@ -2750,7 +2828,15 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
             }
         }
         return match fmt {
-            Format::Json => print_json(&json!({ "schema_version": 1, "claimed": Value::Null })),
+            Format::Json => {
+                let (claim_overlaps, stale_claims) = claim_context_json(&context);
+                print_json(&json!({
+                    "schema_version": 1,
+                    "claimed": Value::Null,
+                    "claim_overlaps": claim_overlaps,
+                    "stale_claims": stale_claims,
+                }))
+            }
             Format::Human => {
                 println!("(nothing available to claim)");
                 Ok(())
@@ -2764,6 +2850,7 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
 
     match fmt {
         Format::Json => {
+            let (claim_overlaps, stale_claims) = claim_context_json(&context);
             let rows: Vec<Value> = picks
                 .iter()
                 .map(|p| {
@@ -2785,12 +2872,14 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                 .map(|c| c.cost)
                 .sum::<i64>()
                 / 2;
-            let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
+            let width = schedule::max_compatible_among(&context.recommended, max_overlap, &weights);
             print_json(&json!({
                 "schema_version": 1,
                 "picks": rows,
                 "overlap_cost": overlap_cost,
                 "width": width,
+                "claim_overlaps": claim_overlaps,
+                "stale_claims": stale_claims,
             }))
         }
         Format::Human => {
@@ -2810,6 +2899,7 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                 }
                 print_full_thread_if_any(&comments, &p.ticket.id);
             }
+            print_claim_context(&context);
             Ok(())
         }
     }
@@ -3473,6 +3563,8 @@ fn build_config(repo: &Path, tickets_dir: &str) -> String {
 fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
     let mut s = format!(
         "schema_version = 1\ntickets_dir = \"{tickets_dir}\"\ndefault_base = \"main\"\n\n\
+         # Defaults are written into ticket frontmatter; explicit exclusive scopes win.\n\
+         [defaults]\n# shared_scopes = [\"project/tickets\"]\n\n\
          [output]\ncomments = \"auto\"\ncomment_source = \"all\"\n\n\
          [language]\n# Auto-detected a cargo workspace; the guard expands a changed crate\n\
          # through the cargo reverse-dependency graph.\nbackend = \"rust\"\n\
@@ -3618,6 +3710,7 @@ fn print_claim(fmt: Format, outcome: &claim_core::ClaimOutcome) -> Result<()> {
             "lease_expires_at": outcome.lease_expires_at,
             "stolen": outcome.stolen,
             "renewed": outcome.renewed,
+            "default_shared_scopes_added": outcome.default_shared_scopes_added,
         })),
         Format::Human => {
             let note = if outcome.stolen {
@@ -3628,6 +3721,12 @@ fn print_claim(fmt: Format, outcome: &claim_core::ClaimOutcome) -> Result<()> {
                 ""
             };
             println!("Claimed `{}` for `{}`{note}", outcome.id, outcome.assignee);
+            if !outcome.default_shared_scopes_added.is_empty() {
+                println!(
+                    "  applied default shared scopes: {}",
+                    outcome.default_shared_scopes_added.join(", ")
+                );
+            }
             Ok(())
         }
     }
@@ -4183,20 +4282,20 @@ id, status (todo/ready/in-progress/blocked/review/done), priority (p0..p3),
 dependencies, and scopes.
 
 Scopes are abstract names you map to path globs in ticketsplease.toml ([scopes]).
-A ticket declares the scopes it will touch. Two tickets that share a scope conflict
-(can't run in parallel); guard uses scopes to catch a branch leaving its lane.
+A ticket declares exclusive or shared access intent; scheduling turns that metadata,
+overlap policy, and claim leases into a recommendation for the agent to judge.
 
 ready    — tickets whose dependencies are all done (the dispatchable queue).
-tracks   — partitions ready tickets into conflict-free parallel batches (no two in a
-           batch share a scope). `--parallel N` caps each batch to N.
+tracks   — recommends parallel batches and reports live/stale claim overlaps in JSON.
+           `--ignore-claims` requests the unfiltered view without hiding context.
 next     — the highest-impact ready pick(s), scored by
            1000 x priority + 10 x critical-path length + count of tickets it unblocks.
            `--parallel N` returns N scope-disjoint picks; `--claim --as <w>` claims one.
 why a b  — explains whether two tickets can run in parallel.
 
 guard <branch> — diffs the branch against a base, maps changed files to scopes, and
-           fails (exit 6) if the branch touches scopes its ticket didn't declare
-           (under-declaration) or overlaps another open ticket (collision).
+           fails (exit 6) if the branch touches undeclared scopes. Declared-area
+           overlaps are reported as non-failing warnings unless explicitly gated.
 
 claim/release/claims — a git-ref lock + frontmatter lease let many agents claim
            tickets race-free. `claims` shows who holds what.
@@ -4302,6 +4401,97 @@ fn ticket_summary(ticket: &Ticket) -> Value {
         "related": ticket.related,
         "tags": ticket.tags,
     })
+}
+
+fn auto_claim_frontier<'a>(
+    tickets: &'a [Ticket],
+    candidates: &[&'a Ticket],
+    max_overlap: i64,
+    weights: &BTreeMap<String, i64>,
+    ignore_claims: bool,
+) -> schedule::ClaimAwareFrontier<'a> {
+    let (live, stale) = schedule::classify_claims(tickets, now_epoch());
+    let active: Vec<(&Ticket, schedule::ClaimLeaseState)> = live
+        .into_iter()
+        .map(|t| (t, schedule::ClaimLeaseState::Live))
+        .collect();
+    schedule::claim_aware_frontier(
+        candidates,
+        &active,
+        &stale,
+        schedule::ClaimFrontierOptions {
+            max_overlap,
+            weights,
+            ignore_claims,
+        },
+    )
+}
+
+fn claim_context_json(context: &schedule::ClaimAwareFrontier<'_>) -> (Vec<Value>, Vec<Value>) {
+    let overlaps = context
+        .claim_overlaps
+        .iter()
+        .map(|entry| {
+            let claims: Vec<Value> = entry
+                .claims
+                .iter()
+                .map(|claim| {
+                    json!({
+                        "ticket": claim.claim.id,
+                        "assignee": claim.claim.assignee,
+                        "lease_expires_at": claim.claim.lease_expires_at,
+                        "lease_state": claim.lease_state.as_str(),
+                        "scopes": claim.scopes,
+                        "cost": claim.cost,
+                        "exceeds_budget": claim.exceeds_budget,
+                    })
+                })
+                .collect();
+            json!({
+                "candidate": ticket_summary(entry.candidate),
+                "claims": claims,
+                "excluded_from_recommended_front": entry.excluded_from_recommended_front,
+            })
+        })
+        .collect();
+    let stale = context
+        .stale_claims
+        .iter()
+        .map(|ticket| {
+            let mut value = ticket_summary(ticket);
+            value["assignee"] = json!(ticket.assignee);
+            value["lease_expires_at"] = json!(ticket.lease_expires_at);
+            value
+        })
+        .collect();
+    (overlaps, stale)
+}
+
+fn print_claim_context(context: &schedule::ClaimAwareFrontier<'_>) {
+    if !context.claim_overlaps.is_empty() {
+        println!("claim overlaps (review before dispatch):");
+        for entry in &context.claim_overlaps {
+            for claim in &entry.claims {
+                let disposition = if entry.excluded_from_recommended_front {
+                    "not in recommended front"
+                } else {
+                    "retained in recommended front"
+                };
+                println!(
+                    "  {} ~ {}  {} lease, cost {} on {} ({disposition})",
+                    entry.candidate.id,
+                    claim.claim.id,
+                    claim.lease_state.as_str(),
+                    claim.cost,
+                    claim.scopes.join(", "),
+                );
+            }
+        }
+    }
+    if !context.stale_claims.is_empty() {
+        let ids: Vec<&str> = context.stale_claims.iter().map(|t| t.id.as_str()).collect();
+        println!("stale claims to review: {}", ids.join(", "));
+    }
 }
 
 fn ticket_json(ticket: &Ticket) -> Value {

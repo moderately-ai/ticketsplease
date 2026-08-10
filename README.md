@@ -2,14 +2,14 @@
 
 > git-native parallel-work ticketing — weave parallel work threads into one fabric
 
-`ticketsplease` (short alias `tkt`) manages development work as **git-versioned markdown tickets** carrying dependency and affected-area metadata, and computes **conflict-free parallel work assignment** so multiple workers — primarily AI coding agents, humans secondarily — can be dispatched onto disjoint areas of a codebase without merge collisions. No server, no database: GitHub stays git-only.
+`ticketsplease` (short alias `tkt`) manages development work as **git-versioned markdown tickets** carrying dependency and affected-area metadata, and computes conflict-aware parallel-work recommendations so multiple workers — primarily AI coding agents, humans secondarily — can judge what to dispatch from declared scope and claim context. No server, no database: GitHub stays git-only.
 
 It's driven from the command line and built to be scripted: every command speaks JSON, exit codes are the API, and output is deterministic. Ticket detail commands include complete comment threads; collection commands carry a comment count so discussion is never silently hidden.
 
 ## The two commands that matter
 
 ```sh
-tkt tracks --format json          # conflict-free parallel batches of ready tickets
+tkt tracks --format json          # recommended batches + live/stale claim context
 tkt guard <branch> --format json  # exit 6 iff a branch's actual diff escapes its
                                   # ticket's declared scope (an overlap with an open
                                   # ticket is a non-failing WARN by default)
@@ -48,7 +48,7 @@ tkt link add-vector-index --depends-on build-index-trait
 tkt ready                             # what's dispatchable now
 tkt list --where 'priority:p0 AND NOT status:done'   # boolean filter (AND/OR/NOT, parens)
 tkt view save epic 'tag:epic AND NOT status:done'    # save a reusable named view, then: tkt list --view epic
-tkt tracks                            # conflict-free parallel batches
+tkt tracks                            # recommended parallel batches + claim context
 tkt next --parallel 4                 # four disjoint picks for four agents
 tkt guard my-branch                   # gate a branch before merge (exit 6 = conflict)
 tkt status --all-branches             # each worker's tip status across tkt/* branches
@@ -82,9 +82,9 @@ Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes 
 
 **Terminal states — `done` vs `closed`.** Both take a ticket out of scheduling, but they mean different things. `done` = completed: it *satisfies* dependents, so they become ready. `closed` = terminated without completing (won't-do, duplicate, obsolete, superseded, cancelled): it does **not** satisfy dependents — instead they surface as **orphaned** (`rollup` lists them, `lint` fails on them, and `claim` refuses with a pointed message) so you re-point, waive, or close them rather than silently building on abandoned work. `tkt close <id> --reason <duplicate|wontdo|obsolete|superseded|cancelled> --note <text>` records an optional resolution; `tkt reopen <id>` returns it to an active status and clears the reason in the same write. The reason is queryable (`list --where 'reason:duplicate'`).
 
-A **scope** is a stable abstract name for an area of the codebase. Tickets reference scopes; `ticketsplease.toml` maps them to file globs (and, for Rust repos, to crates). Two tickets that share a scope never land in the same parallel batch, and the guard fails a branch that touches a scope its ticket didn't declare.
+A **scope** is a stable abstract name for an area of the codebase. Tickets reference scopes; `ticketsplease.toml` maps them to file globs (and, for Rust repos, to crates). Scheduling uses scope access intent, configured overlap budgets, and current claim leases to build a recommended front; the guard separately fails a branch that touches a scope its ticket did not declare.
 
-**Access intent.** A scope can be claimed *exclusively* (`scopes` — a rewrite) or *shared/additively* (`shared_scopes` — append/extend). Two shared claims on a scope are compatible and run in parallel; a shared claim still conflicts with an exclusive one. On top of that, `tracks`/`next`/`lanes` take `--max-overlap K`, a per-pair tolerance budget (`0` strict … `any`), so you fill N workers least-riskily instead of single-threading on benign clashes — `tracks --width` tells you how many fit, and `lanes` plans ordered per-worker queues that *sequence* conflicts instead of dropping them. `[scope_policy]` weights a scope's clash cost (`0` = free hub). The guard honours all of this: a shared-by-both collision is reported but non-gating.
+**Access intent.** A scope can be claimed *exclusively* (`scopes` — a rewrite) or *shared/additively* (`shared_scopes` — append/extend). Two shared claims on a scope have zero conflict cost; a shared claim still costs against an exclusive one. `tracks`/`next`/`lanes` take `--max-overlap K`, a per-pair tolerance budget (`0` strict … `any`). Their JSON includes `claim_overlaps` and `stale_claims`; live overlaps beyond the budget are left out of the recommended front, stale leases remain advisory, and `--ignore-claims` requests the unfiltered view without discarding the context. `tracks --width` reports recommended additional capacity, while `lanes` plans ordered per-worker queues. `[scope_policy]` weights a scope's clash cost (`0` = free hub). The guard reports shared-by-both collisions as non-gating.
 
 ## Configuration — `ticketsplease.toml`
 
@@ -92,6 +92,9 @@ A **scope** is a stable abstract name for an area of the codebase. Tickets refer
 schema_version = 1
 tickets_dir = "tickets"
 default_base = "main"          # base ref for `guard`
+
+[defaults]
+shared_scopes = ["project/tickets"] # merged into create/claim; explicit exclusive wins
 
 [output]
 comments = "auto"              # detail=full thread, collections=count; full|summary|none override
@@ -131,6 +134,8 @@ qa   = ["shipped", "wontfix"]
 "*"  = ["wontfix"]            # escape hatch: cancel from any state
 ```
 
+`[defaults].shared_scopes` removes repetitive declaration work for additive areas such as `tickets/**`. `create` writes the defaults into new frontmatter and `claim` backfills older tickets atomically; the declaration remains visible to scheduling and guard audits. Unknown defaults are lint findings and claim-time errors.
+
 When `backend = "rust"`, the guard maps a branch's changed files to crates and walks the cargo **reverse-dependency** graph: a change to a leaf crate is flagged against every crate that depends on it. This needs `cargo` on `PATH` (always true inside a Rust repo). Each collision is tagged `cause: "direct"` (a real file/crate overlap) or `"transitive"` (reached only via the reverse-dep walk — safe for an additive change), and a per-scope `affected_causes` map lets a consumer triage which under-declarations and collisions are real rather than hand-diffing. Pass `guard --direct-only` (alias `--no-reverse-deps`) to gate on direct overlap only and skip the expansion entirely.
 
 `[external_scopes]` extends the guard beyond this repo: a branch that bumps a pinned `git = … rev = …` dependency (matched by `repo` against the changed manifest lines) — or edits an in-tree fork `paths` glob — is flagged against tickets declaring that external scope. Because external scopes are ordinary scope names, `tracks` already keeps two tickets touching the same fork in separate batches.
@@ -158,7 +163,7 @@ Saved views (and bundled body templates) live under `.ticketsplease/` at the rep
 
 `tkt init` (and `tkt skill install`) wire the bundled skill into your agent harness's skills directory — Claude Code by default (`.claude/skills/ticketsplease/`). It teaches an agent the orchestration loop — `tracks` to fan out disjoint work, `guard` to gate each branch before merge.
 
-The skill is a single `SKILL.md` + `references/` layout that the major coding agents all consume, so `--harness` selects where it installs: `claude` → `.claude/skills`, `codex` → `.agents/skills` (the cross-tool Agent Skills standard directory, also read by opencode and Pi), `opencode` → `.opencode/skills`, `pi-agent` → `.pi/skills`. `--global` installs into the harness's user-global dir (available in every project) instead of the repo.
+The skill contains `SKILL.md`, progressive-disclosure `references/`, and Codex-facing `agents/openai.yaml` metadata. The major coding agents consume the same bundle, so `--harness` selects where it installs: `claude` → `.claude/skills`, `codex` → `.agents/skills` (the cross-tool Agent Skills standard directory, also read by opencode and Pi), `opencode` → `.opencode/skills`, `pi-agent` → `.pi/skills`. `--global` installs into the harness's user-global dir instead of the repo.
 
 The skill is embedded in the binary, but instead of a frozen per-repo copy it lives once at a canonical per-user path (`~/.local/share/ticketsplease/skill`) and each install is a **symlink** to it. The installer runs `tkt skill sync` after every install/`self-update`, so the canonical copy — and therefore every linked project — always matches your binary; `tkt doctor` warns if it drifts and `tkt migrate` repairs a stale link. A project link is local, so `init` gitignores it; use `tkt skill install --copy` if you'd rather commit a real copy.
 

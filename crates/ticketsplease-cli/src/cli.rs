@@ -85,7 +85,7 @@ pub enum Command {
     Events(EventsArgs),
     /// List dependency-satisfied, dispatchable tickets.
     Ready(ReadyArgs),
-    /// Partition ready tickets into conflict-free parallel batches.
+    /// Recommend parallel batches from ready tickets and current claim context.
     Tracks(TracksArgs),
     /// Plan worker lanes: ordered per-worker queues that sequence conflicting work
     /// instead of dropping it, with a merge order.
@@ -244,19 +244,31 @@ pub struct SetArgs {
     #[arg(long)]
     pub priority: Option<String>,
     /// Scopes to add (repeatable or comma-separated).
-    #[arg(long = "add-scope", value_delimiter = ',')]
+    #[arg(
+        long = "add-scope",
+        visible_aliases = ["scope", "scopes"],
+        value_delimiter = ','
+    )]
     pub add_scope: Vec<String>,
     /// Scopes to remove (repeatable or comma-separated).
     #[arg(long = "remove-scope", value_delimiter = ',')]
     pub remove_scope: Vec<String>,
     /// Shared (additive) scope claims to add (repeatable or comma-separated).
-    #[arg(long = "add-shared-scope", value_delimiter = ',')]
+    #[arg(
+        long = "add-shared-scope",
+        visible_aliases = ["shared-scope", "shared-scopes"],
+        value_delimiter = ','
+    )]
     pub add_shared_scope: Vec<String>,
     /// Shared scope claims to remove (repeatable or comma-separated).
     #[arg(long = "remove-shared-scope", value_delimiter = ',')]
     pub remove_shared_scope: Vec<String>,
     /// Tags to add (repeatable or comma-separated).
-    #[arg(long = "add-tag", value_delimiter = ',')]
+    #[arg(
+        long = "add-tag",
+        visible_aliases = ["tag", "tags"],
+        value_delimiter = ','
+    )]
     pub add_tag: Vec<String>,
     /// Tags to remove (repeatable or comma-separated).
     #[arg(long = "remove-tag", value_delimiter = ',')]
@@ -275,7 +287,7 @@ pub struct SetArgs {
     #[arg(long = "remove-dependency", value_delimiter = ',')]
     pub remove_dependency: Vec<String>,
     /// Non-blocking related links to add (repeatable or comma-separated).
-    #[arg(long = "add-related", value_delimiter = ',')]
+    #[arg(long = "add-related", visible_alias = "related", value_delimiter = ',')]
     pub add_related: Vec<String>,
     /// Non-blocking related links to remove (repeatable or comma-separated).
     #[arg(long = "remove-related", value_delimiter = ',')]
@@ -437,6 +449,9 @@ pub struct RollupArgs {
     /// Restrict with a saved view (ANDs with --tag/--where).
     #[arg(long)]
     pub view: Option<String>,
+    /// Keep live-claim overlaps in the recommended width while still reporting them.
+    #[arg(long)]
+    pub ignore_claims: bool,
 }
 
 /// `graph` arguments. Selectors restrict the exported subgraph (metrics stay
@@ -615,6 +630,9 @@ pub struct NextArgs {
     /// with a live claim, so a dispatch loop needs no args.
     #[arg(long = "running", visible_alias = "avoid", value_delimiter = ',')]
     pub running: Vec<String>,
+    /// Keep live-claim overlaps in picks while still reporting claim context.
+    #[arg(long, conflicts_with = "running")]
+    pub ignore_claims: bool,
     /// Treat every scope claim as shared (additive) — collapse conflicts and pack
     /// picks; you reconcile at merge.
     #[arg(long, conflicts_with = "strict")]
@@ -804,14 +822,16 @@ pub struct TracksArgs {
     /// let tickets that conflict by ≤ K per pair share a batch; `any` = unbounded.
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
-    /// Print only the safe parallel width (largest set runnable at once within the
-    /// budget) — how many workers you can usefully spin up right now.
+    /// Print the additional recommended width after live claims and the overlap budget.
     #[arg(long)]
     pub width: bool,
     /// Emit the conflict matrix (every ready pair with its conflicting scopes and cost)
     /// instead of batches, so you can do your own assignment.
     #[arg(long)]
     pub overlap_matrix: bool,
+    /// Keep live-claim overlaps in batches while still reporting claim context.
+    #[arg(long, conflicts_with = "overlap_matrix")]
+    pub ignore_claims: bool,
     /// Treat every scope claim as shared (additive) — one batch; reconcile at merge.
     #[arg(long, conflicts_with = "strict")]
     pub assume_shared: bool,
@@ -823,12 +843,15 @@ pub struct TracksArgs {
 /// `lanes` arguments.
 #[derive(Args)]
 pub struct LanesArgs {
-    /// Number of worker lanes (default: the safe parallel width).
+    /// Number of worker lanes (default: the recommended additional width).
     #[arg(long)]
     pub parallel: Option<usize>,
     /// Per-pair overlap budget tolerated within a concurrent round (see `tracks`).
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// Keep live-claim overlaps in lanes while still reporting claim context.
+    #[arg(long)]
+    pub ignore_claims: bool,
     /// Treat every scope claim as shared (additive) — collapse conflicts.
     #[arg(long, conflicts_with = "strict")]
     pub assume_shared: bool,

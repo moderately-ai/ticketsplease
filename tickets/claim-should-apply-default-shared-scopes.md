@@ -1,11 +1,11 @@
 ---
 id: claim-should-apply-default-shared-scopes
 title: claim should apply configured default shared scopes
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: [set-should-edit-scopes-and-tags]
-scopes: []
+scopes: [core, cli, skill, docs]
 shared_scopes: []
 paths: []
 tags: [feature, claim, guard, scopes]

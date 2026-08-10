@@ -51,6 +51,9 @@ pub struct Config {
     /// count for more. Default weight is 1; a shared-by-both claim is always free.
     #[serde(default)]
     pub scope_policy: BTreeMap<String, ScopePolicy>,
+    /// Ticket field defaults applied when tickets are created or claimed.
+    #[serde(default)]
+    pub defaults: Defaults,
     /// Workflow: custom lifecycle states (+ categories) and optional transition rules.
     #[serde(default)]
     pub workflow: Workflow,
@@ -81,6 +84,15 @@ pub struct ScopePolicy {
     pub weight: i64,
 }
 
+/// Ticket field defaults (`[defaults]`). Defaults are declaration sugar: they are
+/// written into ticket frontmatter so scheduling and guard audits remain explicit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Defaults {
+    /// Shared/additive scopes merged into new and newly-claimed tickets.
+    #[serde(default)]
+    pub shared_scopes: Vec<String>,
+}
+
 impl Config {
     /// The scope -> conflict-cost-weight map (scopes without a policy default to 1).
     #[must_use]
@@ -103,6 +115,25 @@ impl Config {
             .chain(self.external_scopes.keys())
             .map(String::as_str)
             .collect()
+    }
+
+    /// Configured shared-scope defaults that are not already present and are not
+    /// explicitly claimed exclusively. Explicit exclusive intent is stronger and wins.
+    #[must_use]
+    pub fn default_shared_scope_additions(
+        &self,
+        exclusive: &[String],
+        shared: &[String],
+    ) -> Vec<String> {
+        let mut seen: BTreeSet<&str> = exclusive.iter().chain(shared).map(String::as_str).collect();
+        let mut additions = Vec::new();
+        for raw in &self.defaults.shared_scopes {
+            let scope = raw.trim();
+            if !scope.is_empty() && seen.insert(scope) {
+                additions.push(scope.to_string());
+            }
+        }
+        additions
     }
 
     /// The effective workflow state registry: the built-in default states when the repo
@@ -374,6 +405,7 @@ impl Default for Config {
             scope_crates: BTreeMap::new(),
             external_scopes: BTreeMap::new(),
             scope_policy: BTreeMap::new(),
+            defaults: Defaults::default(),
             workflow: Workflow::default(),
             guard: Guard::default(),
             maintenance: Maintenance::default(),
@@ -451,6 +483,18 @@ mod tests {
         // An entry that omits `weight` defaults to 1.
         let c2: Config = toml::from_str("[scope_policy]\ncore = {}\n").unwrap();
         assert_eq!(c2.scope_weights().get("core"), Some(&1));
+    }
+
+    #[test]
+    fn defaults_table_parses_and_explicit_exclusive_scope_wins() {
+        let omitted: Config = toml::from_str("").unwrap();
+        assert!(omitted.defaults.shared_scopes.is_empty());
+
+        let c: Config =
+            toml::from_str("[defaults]\nshared_scopes = [\"tickets\", \" docs \", \"tickets\"]\n")
+                .unwrap();
+        let additions = c.default_shared_scope_additions(&["tickets".into()], &["existing".into()]);
+        assert_eq!(additions, vec!["docs"]);
     }
 
     #[test]
