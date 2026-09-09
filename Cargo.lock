@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "ticketsplease-cargo"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "guppy",
  "ticketsplease-core",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "ticketsplease-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "ticketsplease-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "globset",
  "rayon",
