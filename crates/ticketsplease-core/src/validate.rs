@@ -175,6 +175,7 @@ mod tests {
             defaults: Default::default(),
             workflow: Default::default(),
             guard: Default::default(),
+            scheduler: Default::default(),
             maintenance: Default::default(),
             output: Default::default(),
             recipes: BTreeMap::new(),

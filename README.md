@@ -68,7 +68,7 @@ title: Add vector index
 status: todo                  # built-in: todo|ready|in-progress|blocked|review|done|closed (or your [workflow.states])
 priority: p1                  # p0 (highest) .. p3
 dependencies: [build-index-trait]   # hard, scheduling-blocking; cycle-checked
-related: []                   # soft "see also"; ignored by scheduling
+related: []                   # soft "see also"; ignored by ready; tracks only if related_weight > 0
 scopes: [query/planner]       # exclusive (rewrite) area claims
 shared_scopes: []             # additive (append) claims — co-edit freely
 paths: []                     # extra explicit globs
@@ -84,7 +84,7 @@ Edits are **round-trip-safe**: ticketsplease rewrites only the field it changes 
 
 A **scope** is a stable abstract name for an area of the codebase. Tickets reference scopes; `ticketsplease.toml` maps them to file globs (and, for Rust repos, to crates). Scheduling uses scope access intent, configured overlap budgets, and current claim leases to build a recommended front; the guard separately fails a branch that touches a scope its ticket did not declare.
 
-**Access intent.** A scope can be claimed *exclusively* (`scopes` — a rewrite) or *shared/additively* (`shared_scopes` — append/extend). Two shared claims on a scope have zero conflict cost; a shared claim still costs against an exclusive one. `tracks`/`next`/`lanes` take `--max-overlap K`, a per-pair tolerance budget (`0` strict … `any`). Their JSON includes `claim_overlaps` and `stale_claims`; live overlaps beyond the budget are left out of the recommended front, stale leases remain advisory, and `--ignore-claims` requests the unfiltered view without discarding the context. `tracks --width` reports recommended additional capacity, while `lanes` plans ordered per-worker queues. `[scope_policy]` weights a scope's clash cost (`0` = free hub). The guard reports shared-by-both collisions as non-gating.
+**Access intent.** A scope can be claimed *exclusively* (`scopes` — a rewrite) or *shared/additively* (`shared_scopes` — append/extend). Two shared claims on a scope have zero conflict cost; a shared claim still costs against an exclusive one. `tracks`/`next`/`lanes` take `--max-overlap K`, a per-pair tolerance budget (`0` strict … `any`). Their JSON includes `claim_overlaps` and `stale_claims`; live overlaps beyond the budget are left out of the recommended front, stale leases remain advisory, and `--ignore-claims` requests the unfiltered view without discarding the context. `tracks --width` reports recommended additional capacity, while `lanes` plans ordered per-worker queues. `[scope_policy]` weights a scope's clash cost (`0` = free hub). `[scheduler] related_weight` (default `0`) is an opt-in extra cost for a `related` pair — omitted or `0` keeps related links out of scheduling, matching existing repos. The guard reports shared-by-both collisions as non-gating.
 
 ## Configuration — `ticketsplease.toml`
 
@@ -115,6 +115,9 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 
 [scope_policy]                 # per-scope clash cost for tracks/next --max-overlap
 "core" = { weight = 0 }        # weight 0 = a free-to-co-edit hub; higher = riskier (default 1)
+
+[scheduler]                    # opt-in costs beyond declared scopes
+related_weight = 0             # 0 = related ignored by tracks/next/lanes/why (default)
 
 [workflow]                     # custom lifecycle states (optional; omit for the built-in set)
 enforce_transitions = false    # opt-in state machine; default off (any state -> any state)

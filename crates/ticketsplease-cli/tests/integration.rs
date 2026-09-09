@@ -1878,6 +1878,8 @@ fn why_exits_6_on_conflict() {
     assert_eq!(out.status.code(), Some(6));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["conflict"], true);
+    assert_eq!(v["related"], false);
+    assert_eq!(v["related_cost"], 0);
 }
 
 /// `list` filters compose, the empty result is a friendly message (not silence),
@@ -3897,6 +3899,84 @@ fn related_tickets_share_a_track_when_scopes_disjoint() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     // related (unlike a dependency) imposes no ordering: disjoint scopes -> one batch.
+    assert_eq!(v["batches"].as_array().unwrap().len(), 1);
+
+    let why = tkt(repo)
+        .args(["why", "a", "b", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(why.status.code(), Some(0));
+    let w: serde_json::Value = serde_json::from_slice(&why.stdout).unwrap();
+    assert_eq!(w["conflict"], false);
+    assert_eq!(w["related"], true);
+    assert_eq!(w["related_cost"], 0);
+}
+
+#[test]
+fn related_weight_splits_tracks_and_flips_why() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\"]\n");
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--scope", "io"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "a",
+            "--title",
+            "A",
+            "--scope",
+            "core",
+            "--related",
+            "b",
+        ])
+        .assert()
+        .success();
+
+    // Per-invocation override: related cost above default max-overlap 0 splits.
+    let split = tkt(repo)
+        .args(["tracks", "--related-weight", "1", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        split.status.success(),
+        "{}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&split.stdout).unwrap();
+    assert_eq!(v["batches"].as_array().unwrap().len(), 2);
+
+    let why = tkt(repo)
+        .args(["why", "a", "b", "--related-weight", "3", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(why.status.code(), Some(6));
+    let w: serde_json::Value = serde_json::from_slice(&why.stdout).unwrap();
+    assert_eq!(w["conflict"], true);
+    assert_eq!(w["related"], true);
+    assert_eq!(w["related_cost"], 3);
+    assert!(w["shared_scopes"].as_array().unwrap().is_empty());
+
+    // Config opt-in, then CLI 0 restores default behaviour.
+    let path = repo.join("ticketsplease.toml");
+    let mut cfg = std::fs::read_to_string(&path).unwrap();
+    cfg.push_str("\n[scheduler]\nrelated_weight = 1\n");
+    std::fs::write(&path, cfg).unwrap();
+    let from_cfg = tkt(repo)
+        .args(["tracks", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&from_cfg.stdout).unwrap();
+    assert_eq!(v["batches"].as_array().unwrap().len(), 2);
+    let override_off = tkt(repo)
+        .args(["tracks", "--related-weight", "0", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&override_off.stdout).unwrap();
     assert_eq!(v["batches"].as_array().unwrap().len(), 1);
 }
 

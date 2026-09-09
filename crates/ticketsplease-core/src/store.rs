@@ -1114,7 +1114,13 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          # (--max-overlap): weight 0 = free to co-edit (an additive hub), higher =\n\
          # riskier. Default 1; a shared-by-both claim is always free.\n\
          [scope_policy]\n\
-         # \"core\" = {{ weight = 0 }}\n"
+         # \"core\" = {{ weight = 0 }}\n\
+         \n\
+         # Opt-in coupling cost for a `related` link. Default 0 = related stays\n\
+         # invisible to tracks/next/lanes/why (queryable/graphable only; never gates\n\
+         # ready or cycle detection). A positive value is gated by --max-overlap.\n\
+         [scheduler]\n\
+         # related_weight = 0\n"
     )
 }
 

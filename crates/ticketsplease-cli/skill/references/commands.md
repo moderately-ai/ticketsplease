@@ -18,7 +18,7 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 - **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `close`/`reopen`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `run`→`outputs` (or `steps` with `--dry-run`) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
-- **`dependencies` block; `related` does not.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, but ignored by `ready`/`tracks`/`next`/cycle-detection. Use `related` for "see also", `depends_on` for "must finish first".
+- **`dependencies` block; `related` does not gate `ready`.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, never cycle-checked, and ignored by `ready`. `tracks`/`next`/`lanes`/`why` ignore it unless `[scheduler].related_weight` is a positive integer (default `0`, current behaviour). Use `related` for "see also" / optional coupling, `depends_on` for "must finish first".
 - **Access intent: `scopes` exclusive, `shared_scopes` additive.** A scope in `scopes` is an *exclusive* (rewrite) claim; one in `shared_scopes` is a *shared* (additive/append) claim. Two tickets that both hold a scope shared are compatible (run in parallel); a shared claim still conflicts with an exclusive one. `[scope_policy]` in `ticketsplease.toml` sets a per-scope conflict-cost `weight` (default 1; `0` = free to co-edit). `tracks`/`next`/`lanes` gate on a per-pair **overlap budget** (`--max-overlap K`, `0`=strict … `any`=unbounded), so you can fill workers least-riskily instead of single-threading. The guard tags a shared-by-both collision `cause: shared` and does not fail on it.
 - **Comment metadata on ticket records.** In auto/summary/full modes, ticket objects returned by `list`, `status`, `rollup`, `graph`, `path`, `ready`, `tracks`, `lanes`, `next`, and `claims` add `comment_count` (unique ids) and `comment_sources` (raw per-source counts). Full mode also adds `comments`; every comment has sorted `sources`. These are additive fields and do not bump existing schema versions.
 
@@ -93,7 +93,7 @@ JSON (both): `{ "schema_version", "id", "changed": bool, "dry_run": bool }`.
 ```
 ticketsplease link <id> (--depends-on <other> | --related <other>) [--remove] [--no-validate]
 ```
-Adds (or with `--remove`, removes) a link. `--depends-on` is a hard, cycle-checked **dependency** edge; `--related` is a soft, non-blocking cross-reference that scheduling ignores (and so is never cycle-checked). Exactly one of the two is required. A dangling target is **rejected** at write time (exit 3) unless `--no-validate` — consistent with `create`/`set` (`--no-validate` allows a forward reference, which `lint` then reports as `missing-dep`/`missing-related`). A dependency edge that closes a **cycle** is rejected regardless (exit 5). `--remove` never validates the target, so a link to a deleted ticket can be cleaned. A self-link is rejected (exit 3).
+Adds (or with `--remove`, removes) a link. `--depends-on` is a hard, cycle-checked **dependency** edge; `--related` is a soft, non-blocking cross-reference that never cycle-checks and does not gate `ready` (`tracks`/`next` honour it only when `[scheduler].related_weight` is positive). Exactly one of the two is required. A dangling target is **rejected** at write time (exit 3) unless `--no-validate` — consistent with `create`/`set` (`--no-validate` allows a forward reference, which `lint` then reports as `missing-dep`/`missing-related`). A dependency edge that closes a **cycle** is rejected regardless (exit 5). `--remove` never validates the target, so a link to a deleted ticket can be cleaned. A self-link is rejected (exit 3).
 
 JSON: `{ "schema_version", "id", "depends_on"|"related", "removed", "changed" }`.
 
@@ -207,41 +207,41 @@ JSON: `{ "schema_version", "ready": [ {id,title,status,priority,scopes,paths,dep
 ## tracks
 
 ```
-ticketsplease tracks [--parallel N] [--max-overlap K] [--width] [--overlap-matrix]
+ticketsplease tracks [--parallel N] [--max-overlap K] [--related-weight N] [--width] [--overlap-matrix]
                      [--ignore-claims] [--assume-shared | --strict]
 ```
 Partitions the dependency-ready set into recommended batches. A live claim overlap beyond the budget removes a candidate from the recommendation but remains visible in `claim_overlaps`; stale claims are reported without removing candidates. `--ignore-claims` requests an unfiltered recommendation while retaining the context. `--parallel N` caps each batch to N tickets.
 
-`--max-overlap K` is the per-pair overlap budget: `0` (default), `K`, or `any`. Each batch's residual `overlap_cost` is reported. `--width` is the additional recommended capacity. `--overlap-matrix` remains the raw dependency-ready conflict graph and raw width, deliberately unaffected by claim recommendations. `--assume-shared` treats every claim as shared; `--strict` treats every claim as exclusive.
+`--max-overlap K` is the per-pair overlap budget: `0` (default), `K`, or `any`. Each batch's residual `overlap_cost` is reported. `--related-weight N` overrides `[scheduler].related_weight` for this invocation (config default `0`: related links add no cost). `--width` is the additional recommended capacity. `--overlap-matrix` remains the raw dependency-ready conflict graph and raw width, deliberately unaffected by claim recommendations. `--assume-shared` treats every claim as shared; `--strict` treats every claim as exclusive.
 
-JSON: `{ "schema_version", "batches", "overlap_cost", "width", "claim_overlaps", "stale_claims" }`; `claim_overlaps[]` contains `{candidate, claims: [{ticket,assignee,lease_expires_at,lease_state,scopes,cost,exceeds_budget}], excluded_from_recommended_front}`. Here `candidate` is ready work being evaluated and each nested `claims[].ticket` is already-started work affecting it. `--width --format json` includes the same context. The raw matrix shape stays `{ "schema_version", "matrix", "width" }`.
+JSON: `{ "schema_version", "batches", "overlap_cost", "width", "claim_overlaps", "stale_claims" }`; `claim_overlaps[]` contains `{candidate, claims: [{ticket,assignee,lease_expires_at,lease_state,scopes,cost,exceeds_budget}], excluded_from_recommended_front}`. Here `candidate` is ready work being evaluated and each nested `claims[].ticket` is already-started work affecting it. `--width --format json` includes the same context. The raw matrix shape stays `{ "schema_version", "matrix", "width" }`; each matrix row is `{a, b, scopes, cost, related}`.
 
 ## lanes
 
 ```
-ticketsplease lanes [--parallel N] [--max-overlap K] [--ignore-claims] [--assume-shared | --strict]
+ticketsplease lanes [--parallel N] [--max-overlap K] [--related-weight N] [--ignore-claims] [--assume-shared | --strict]
 ```
-Plans **worker lanes** from the recommended front: ordered per-worker queues that sequence conflicting candidates onto one lane. `--parallel N` is the lane count (default: the recommended additional width); `--max-overlap` applies the same budget as `tracks`, and `--ignore-claims` requests the unfiltered front while retaining context.
+Plans **worker lanes** from the recommended front: ordered per-worker queues that sequence conflicting candidates onto one lane. `--parallel N` is the lane count (default: the recommended additional width); `--max-overlap` applies the same budget as `tracks`; `--related-weight` overrides `[scheduler].related_weight`; `--ignore-claims` requests the unfiltered front while retaining context.
 
 JSON: `{ "schema_version", "lanes": [ [ {id,...} ] ], "merge_order": [ids], "claim_overlaps", "stale_claims" }`.
 
 ## next
 
 ```
-ticketsplease next [--parallel N] [--max-overlap K] [--running ids] [--allow-overlap]
+ticketsplease next [--parallel N] [--max-overlap K] [--related-weight N] [--running ids] [--allow-overlap]
                    [--ignore-claims] [--assume-shared | --strict]
                    [--claim --as <worker> [--ttl <secs>]]
 ```
-The highest-scored recommended ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks`. Picks fill compatible work first, then overlaps within the budget, each annotated with `conflicts_with`. `--running <ids>` (alias `--avoid`) supplies explicit in-flight work; omit it to use live claims. `--ignore-claims` is mutually exclusive with `--running` and requests the unfiltered automatic view. Claim context remains visible either way. `--claim --as <worker>` atomically claims the first still-free pick.
+The highest-scored recommended ticket(s). **Score** = `1000 × priority (p0=3..p3=0) + 10 × critical-path length + count of not-done tickets it unblocks`. Picks fill compatible work first, then overlaps within the budget, each annotated with `conflicts_with`. `--running <ids>` (alias `--avoid`) supplies explicit in-flight work; omit it to use live claims. `--ignore-claims` is mutually exclusive with `--running` and requests the unfiltered automatic view. Claim context remains visible either way. `--claim --as <worker>` atomically claims the first still-free pick. `--related-weight` overrides `[scheduler].related_weight`.
 
 JSON: `{ "schema_version", "picks", "overlap_cost", "width", "claim_overlaps", "stale_claims" }`, or with `--claim`: a claim payload (see below); an empty result retains context beside `"claimed": null`.
 
 ## why
 
 ```
-ticketsplease why <a> <b>
+ticketsplease why <a> <b> [--related-weight N]
 ```
-Explains whether two *different* tickets can run in parallel (passing the same id twice is a usage error, exit 3). They cannot if they share a scope **or** one transitively depends on the other. JSON: `{ "schema_version", "a", "b", "conflict": bool, "shared_scopes": [...], "dependency_ordered": bool }`. Exits 6 on conflict (so `why a b && …` gates).
+Explains whether two *different* tickets can run in parallel (passing the same id twice is a usage error, exit 3). They cannot if they share an exclusive scope, one transitively depends on the other, **or** (when `related_weight` is positive) they are coupled by a `related` link. JSON: `{ "schema_version", "a", "b", "conflict": bool, "shared_scopes": [...], "dependency_ordered": bool, "related": bool, "related_cost": int }`. `related` / `related_cost` are additive keys (`schema_version` stays 1). Default `related_weight` is 0, so a related-only pair does not flip `conflict` or exit 6. Exits 6 on conflict (so `why a b && …` gates).
 
 ## run
 

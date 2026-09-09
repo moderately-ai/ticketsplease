@@ -60,6 +60,9 @@ pub struct Config {
     /// Guard behaviour: whether a declared-area overlap with an open sibling gates.
     #[serde(default)]
     pub guard: Guard,
+    /// Scheduler behaviour: opt-in costs beyond declared scopes.
+    #[serde(default)]
+    pub scheduler: Scheduler,
     /// Maintenance-advisory behaviour (update-check, drift auto-migrate, cadence).
     #[serde(default)]
     pub maintenance: Maintenance,
@@ -195,6 +198,18 @@ pub struct Guard {
     /// (or pass `--strict` per-invocation) to restore hard-fail-on-overlap.
     #[serde(default)]
     pub gate_collisions: bool,
+}
+
+/// Scheduler configuration (`[scheduler]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Scheduler {
+    /// Extra per-pair conflict cost when two tickets list each other in `related`
+    /// (either direction). Default `0` keeps related links invisible to
+    /// `tracks`/`next`/`lanes`/`why` — they stay queryable and graphable, and they
+    /// never gate `ready` or cycle detection. A positive value is an opt-in coupling
+    /// cost, gated by `--max-overlap` like a scope weight.
+    #[serde(default)]
+    pub related_weight: i64,
 }
 
 /// Maintenance-advisory configuration (`[maintenance]`): the interactive, stderr-only
@@ -408,6 +423,7 @@ impl Default for Config {
             defaults: Defaults::default(),
             workflow: Workflow::default(),
             guard: Guard::default(),
+            scheduler: Scheduler::default(),
             maintenance: Maintenance::default(),
             output: Output::default(),
             recipes: BTreeMap::new(),
@@ -516,6 +532,17 @@ mod tests {
         assert!(!c.maintenance.update_check);
         assert!(c.maintenance.auto_migrate);
         assert_eq!(c.maintenance.check_interval_hours, 6);
+    }
+
+    #[test]
+    fn scheduler_related_weight_defaults_to_zero() {
+        let omitted: Config = toml::from_str("").unwrap();
+        assert_eq!(omitted.scheduler.related_weight, 0);
+        assert_eq!(Config::default().scheduler.related_weight, 0);
+        let c: Config = toml::from_str("[scheduler]\nrelated_weight = 4\n").unwrap();
+        assert_eq!(c.scheduler.related_weight, 4);
+        let empty_table: Config = toml::from_str("[scheduler]\n").unwrap();
+        assert_eq!(empty_table.scheduler.related_weight, 0);
     }
 
     #[test]

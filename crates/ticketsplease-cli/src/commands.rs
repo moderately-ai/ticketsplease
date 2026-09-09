@@ -1211,7 +1211,8 @@ pub fn reopen(repo: &Path, fmt: Format, args: &ReopenArgs) -> Result<()> {
 
 /// `link` — add or remove a link between tickets. `--depends-on` is a hard,
 /// cycle-checked dependency; `--related` is a soft, non-blocking cross-reference
-/// that scheduling ignores (and so is never cycle-checked). The CLI arg-group
+/// that never cycle-checks and does not gate `ready`. `tracks`/`next`/`lanes`/`why`
+/// ignore it unless `[scheduler].related_weight` is positive. The CLI arg-group
 /// guarantees exactly one target is set.
 pub fn link(repo: &Path, fmt: Format, args: &LinkArgs) -> Result<()> {
     let related = args.related.is_some();
@@ -1802,9 +1803,11 @@ pub fn rollup(repo: &Path, fmt: Format, output: OutputOverrides, args: &RollupAr
     // Recommended parallel width within the initiative's ready frontier, accounting
     // for live claims anywhere on the board. The raw `ready` list remains visible.
     let weights = store.config.scope_weights();
+    let overlap = schedule::Overlap::new(0, &weights)
+        .with_related(store.config.scheduler.related_weight.max(0));
     let ready_refs: Vec<&Ticket> = ready.iter().map(|t| **t).collect();
-    let claim_context = auto_claim_frontier(&all, &ready_refs, 0, &weights, args.ignore_claims);
-    let width = schedule::max_compatible_among(&claim_context.recommended, 0, &weights);
+    let claim_context = auto_claim_frontier(&all, &ready_refs, overlap, args.ignore_claims);
+    let width = schedule::max_compatible_among(&claim_context.recommended, overlap);
 
     // Blocked vs orphaned: a selected dispatchable-status ticket whose dependencies are
     // not all satisfied. A `closed` (abandoned) dependency can never complete, so its
@@ -2489,25 +2492,22 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
+    let related_weight =
+        resolve_related_weight(store.config.scheduler.related_weight, args.related_weight)?;
+    let overlap = schedule::Overlap::new(max_overlap, &weights).with_related(related_weight);
     // The `--overlap-matrix` and `--width` paths need only the width, so they compute it
     // alone; the normal path needs both the width and the batches and gets them from a
     // single conflict-graph build (`tracks_and_width`) instead of two independent O(n²)
     // passes over the same dispatchable frontier.
     if args.overlap_matrix {
         // `--overlap-matrix` hands back the raw conflict graph for self-service assignment.
-        let width = schedule::parallel_width(&tickets, max_overlap, &weights)?;
-        return emit_overlap_matrix(fmt, &tickets, &weights, width);
+        let width = schedule::parallel_width(&tickets, overlap)?;
+        return emit_overlap_matrix(fmt, &tickets, overlap, width);
     }
     if args.width {
         let candidates = schedule::ready(&tickets)?;
-        let context = auto_claim_frontier(
-            &tickets,
-            &candidates,
-            max_overlap,
-            &weights,
-            args.ignore_claims,
-        );
-        let width = schedule::max_compatible_among(&context.recommended, max_overlap, &weights);
+        let context = auto_claim_frontier(&tickets, &candidates, overlap, args.ignore_claims);
+        let width = schedule::max_compatible_among(&context.recommended, overlap);
         return match fmt {
             Format::Json => {
                 let (claim_overlaps, stale_claims) = claim_context_json(&context);
@@ -2525,15 +2525,8 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
         };
     }
     let candidates = schedule::ready(&tickets)?;
-    let context = auto_claim_frontier(
-        &tickets,
-        &candidates,
-        max_overlap,
-        &weights,
-        args.ignore_claims,
-    );
-    let (mut batches, width) =
-        schedule::tracks_and_width_among(&context.recommended, max_overlap, &weights);
+    let context = auto_claim_frontier(&tickets, &candidates, overlap, args.ignore_claims);
+    let (mut batches, width) = schedule::tracks_and_width_among(&context.recommended, overlap);
     // --parallel caps each batch to N tickets, splitting larger ones so an orchestrator
     // with N workers gets worker-sized fronts. Chunking preserves the per-pair budget.
     if let Some(n) = args.parallel.filter(|&n| n > 0) {
@@ -2542,7 +2535,7 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
             .flat_map(|b| b.chunks(n).map(<[&Ticket]>::to_vec).collect::<Vec<_>>())
             .collect();
     }
-    let overlap_cost = batch_overlap_cost(&batches, &weights);
+    let overlap_cost = batch_overlap_cost(&batches, overlap);
     let ids: Vec<String> = batches.iter().flatten().map(|t| t.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
@@ -2597,12 +2590,12 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
 
 /// Sum of the residual conflict cost between tickets sharing a batch (0 for strictly
 /// conflict-free batches).
-fn batch_overlap_cost(batches: &[Vec<&Ticket>], weights: &BTreeMap<String, i64>) -> i64 {
+fn batch_overlap_cost(batches: &[Vec<&Ticket>], overlap: schedule::Overlap<'_>) -> i64 {
     let mut total = 0;
     for batch in batches {
         for i in 0..batch.len() {
             for j in (i + 1)..batch.len() {
-                total += schedule::conflict_cost(batch[i], batch[j], weights);
+                total += overlap.pair_cost(batch[i], batch[j]);
             }
         }
     }
@@ -2615,20 +2608,17 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
     let tickets = apply_mode_override(store.load_all()?, args.assume_shared, args.strict);
     let max_overlap = parse_overlap_budget(&args.max_overlap)?;
     let weights = store.config.scope_weights();
+    let related_weight =
+        resolve_related_weight(store.config.scheduler.related_weight, args.related_weight)?;
+    let overlap = schedule::Overlap::new(max_overlap, &weights).with_related(related_weight);
     let candidates = schedule::ready(&tickets)?;
-    let context = auto_claim_frontier(
-        &tickets,
-        &candidates,
-        max_overlap,
-        &weights,
-        args.ignore_claims,
-    );
+    let context = auto_claim_frontier(&tickets, &candidates, overlap, args.ignore_claims);
     // Default the lane count to the recommended additional width.
     let n = match args.parallel {
         Some(n) => n,
-        None => schedule::max_compatible_among(&context.recommended, max_overlap, &weights).max(1),
+        None => schedule::max_compatible_among(&context.recommended, overlap).max(1),
     };
-    let plan = schedule::lanes_among(&context.recommended, n, max_overlap, &weights);
+    let plan = schedule::lanes_among(&context.recommended, n, overlap);
     let ids: Vec<String> = plan.lanes.iter().flatten().map(|t| t.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
@@ -2719,17 +2709,24 @@ fn apply_mode_override(tickets: Vec<Ticket>, assume_shared: bool, strict: bool) 
 fn emit_overlap_matrix(
     fmt: Format,
     tickets: &[Ticket],
-    weights: &BTreeMap<String, i64>,
+    overlap: schedule::Overlap<'_>,
     width: usize,
 ) -> Result<()> {
     let ready = schedule::ready(tickets)?;
-    let mut rows: Vec<(String, String, Vec<String>, i64)> = Vec::new();
+    let mut rows: Vec<(String, String, Vec<String>, i64, bool)> = Vec::new();
     for i in 0..ready.len() {
         for j in (i + 1)..ready.len() {
             let scopes = schedule::conflicting_scopes(ready[i], ready[j]);
-            if !scopes.is_empty() {
-                let cost = schedule::conflict_cost(ready[i], ready[j], weights);
-                rows.push((ready[i].id.clone(), ready[j].id.clone(), scopes, cost));
+            let related = schedule::related_linked(ready[i], ready[j]);
+            let cost = overlap.pair_cost(ready[i], ready[j]);
+            if cost > 0 || !scopes.is_empty() {
+                rows.push((
+                    ready[i].id.clone(),
+                    ready[j].id.clone(),
+                    scopes,
+                    cost,
+                    related,
+                ));
             }
         }
     }
@@ -2737,7 +2734,9 @@ fn emit_overlap_matrix(
         Format::Json => {
             let edges: Vec<Value> = rows
                 .iter()
-                .map(|(a, b, scopes, cost)| json!({ "a": a, "b": b, "scopes": scopes, "cost": cost }))
+                .map(|(a, b, scopes, cost, related)| {
+                    json!({ "a": a, "b": b, "scopes": scopes, "cost": cost, "related": related })
+                })
                 .collect();
             print_json(&json!({ "schema_version": 1, "matrix": edges, "width": width }))
         }
@@ -2745,8 +2744,15 @@ fn emit_overlap_matrix(
             if rows.is_empty() {
                 println!("(no conflicts among ready tickets)");
             }
-            for (a, b, scopes, cost) in &rows {
-                println!("{a} ~ {b}  cost {cost}  ({})", scopes.join(", "));
+            for (a, b, scopes, cost, related) in &rows {
+                let reason = if scopes.is_empty() && *related {
+                    "related".to_string()
+                } else if *related {
+                    format!("{}; related", scopes.join(", "))
+                } else {
+                    scopes.join(", ")
+                };
+                println!("{a} ~ {b}  cost {cost}  ({reason})");
             }
             Ok(())
         }
@@ -2765,6 +2771,16 @@ fn parse_overlap_budget(s: &str) -> Result<i64> {
     })
 }
 
+fn resolve_related_weight(configured: i64, cli: Option<i64>) -> Result<i64> {
+    let w = cli.unwrap_or(configured);
+    if w < 0 {
+        return Err(Error::Invalid(
+            "--related-weight expects a non-negative integer".into(),
+        ));
+    }
+    Ok(w)
+}
+
 /// `next` — scored recommendation(s); `--parallel N` returns N disjoint picks.
 pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) -> Result<()> {
     let store = Store::open(repo)?;
@@ -2776,6 +2792,9 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
         parse_overlap_budget(&args.max_overlap)?
     };
     let weights = store.config.scope_weights();
+    let related_weight =
+        resolve_related_weight(store.config.scheduler.related_weight, args.related_weight)?;
+    let overlap = schedule::Overlap::new(max_overlap, &weights).with_related(related_weight);
     let candidates = schedule::ready(&tickets)?;
     let (live, stale) = schedule::classify_claims(&tickets, now_epoch());
     let active: Vec<(&Ticket, schedule::ClaimLeaseState)> = if args.running.is_empty() {
@@ -2795,18 +2814,11 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
         &active,
         &stale,
         schedule::ClaimFrontierOptions {
-            max_overlap,
-            weights: &weights,
+            overlap,
             ignore_claims: args.ignore_claims,
         },
     );
-    let picks = schedule::next_among(
-        &tickets,
-        &context.recommended,
-        args.parallel,
-        max_overlap,
-        &weights,
-    )?;
+    let picks = schedule::next_among(&tickets, &context.recommended, args.parallel, overlap)?;
 
     // Atomic dispatch: claim the first pick still free. Trying picks in order makes a
     // lost race (another worker grabbed the top pick) fall through to the next instead
@@ -2860,7 +2872,12 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                     v["conflicts_with"] = json!(p
                         .conflicts_with
                         .iter()
-                        .map(|c| json!({ "ticket": c.ticket, "scopes": c.scopes, "cost": c.cost }))
+                        .map(|c| json!({
+                            "ticket": c.ticket,
+                            "scopes": c.scopes,
+                            "cost": c.cost,
+                            "related": c.related,
+                        }))
                         .collect::<Vec<_>>());
                     v
                 })
@@ -2872,7 +2889,7 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                 .map(|c| c.cost)
                 .sum::<i64>()
                 / 2;
-            let width = schedule::max_compatible_among(&context.recommended, max_overlap, &weights);
+            let width = schedule::max_compatible_among(&context.recommended, overlap);
             print_json(&json!({
                 "schema_version": 1,
                 "picks": rows,
@@ -2895,7 +2912,14 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                     comment_marker(&comments, &p.ticket.id)
                 );
                 for c in &p.conflicts_with {
-                    println!("    overlaps `{}` on: {}", c.ticket, c.scopes.join(", "));
+                    let reason = if c.scopes.is_empty() && c.related {
+                        "related".to_string()
+                    } else if c.related {
+                        format!("{}; related", c.scopes.join(", "))
+                    } else {
+                        c.scopes.join(", ")
+                    };
+                    println!("    overlaps `{}` on: {reason}", c.ticket);
                 }
                 print_full_thread_if_any(&comments, &p.ticket.id);
             }
@@ -3588,7 +3612,12 @@ fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {
          # The guard flags a branch that bumps the pin (matched by `repo`) or edits an\n\
          # in-tree fork `paths` glob, against tickets declaring the same scope.\n\
          [external_scopes]\n\
-         # \"sqlparser-fork\" = { repo = \"tomsanbear/sqlparser\", paths = [] }\n",
+         # \"sqlparser-fork\" = { repo = \"tomsanbear/sqlparser\", paths = [] }\n\
+         \n\
+         # Opt-in coupling cost for a `related` link. Default 0 = related stays\n\
+         # invisible to tracks/next/lanes/why. A positive value is gated by --max-overlap.\n\
+         [scheduler]\n\
+         # related_weight = 0\n",
     );
     s
 }
@@ -3634,7 +3663,9 @@ fn read_text(path: &str) -> Result<String> {
 pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let tickets = store.load_all()?;
-    let w = schedule::why(&tickets, &args.a, &args.b)?;
+    let related_weight =
+        resolve_related_weight(store.config.scheduler.related_weight, args.related_weight)?;
+    let w = schedule::why(&tickets, &args.a, &args.b, related_weight)?;
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
@@ -3643,6 +3674,8 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
             "conflict": w.conflict,
             "shared_scopes": w.shared_scopes,
             "dependency_ordered": w.dependency_ordered,
+            "related": w.related,
+            "related_cost": w.related_cost,
         }))?,
         Format::Human => {
             if w.conflict {
@@ -3652,6 +3685,9 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
                 }
                 if w.dependency_ordered {
                     reasons.push("one depends on the other".to_string());
+                }
+                if w.related_cost > 0 {
+                    reasons.push(format!("related (cost {})", w.related_cost));
                 }
                 println!(
                     "`{}` and `{}` cannot share a batch — {}.",
@@ -4403,13 +4439,12 @@ fn ticket_summary(ticket: &Ticket) -> Value {
     })
 }
 
-fn auto_claim_frontier<'a>(
-    tickets: &'a [Ticket],
-    candidates: &[&'a Ticket],
-    max_overlap: i64,
-    weights: &BTreeMap<String, i64>,
+fn auto_claim_frontier<'t>(
+    tickets: &'t [Ticket],
+    candidates: &[&'t Ticket],
+    overlap: schedule::Overlap<'_>,
     ignore_claims: bool,
-) -> schedule::ClaimAwareFrontier<'a> {
+) -> schedule::ClaimAwareFrontier<'t> {
     let (live, stale) = schedule::classify_claims(tickets, now_epoch());
     let active: Vec<(&Ticket, schedule::ClaimLeaseState)> = live
         .into_iter()
@@ -4420,8 +4455,7 @@ fn auto_claim_frontier<'a>(
         &active,
         &stale,
         schedule::ClaimFrontierOptions {
-            max_overlap,
-            weights,
+            overlap,
             ignore_claims,
         },
     )
@@ -4477,13 +4511,17 @@ fn print_claim_context(context: &schedule::ClaimAwareFrontier<'_>) {
                 } else {
                     "retained in recommended front"
                 };
+                let on = if claim.scopes.is_empty() {
+                    "related".to_string()
+                } else {
+                    claim.scopes.join(", ")
+                };
                 println!(
-                    "  {} ~ {}  {} lease, cost {} on {} ({disposition})",
+                    "  {} ~ {}  {} lease, cost {} on {on} ({disposition})",
                     entry.candidate.id,
                     claim.claim.id,
                     claim.lease_state.as_str(),
                     claim.cost,
-                    claim.scopes.join(", "),
                 );
             }
         }

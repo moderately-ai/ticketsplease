@@ -361,8 +361,8 @@ pub struct LinkArgs {
     /// Add/remove a hard dependency (blocks scheduling; cycle-checked).
     #[arg(long = "depends-on")]
     pub depends_on: Option<String>,
-    /// Add/remove a soft, non-blocking related link (ignored by scheduling; never
-    /// cycle-checked).
+    /// Add/remove a soft, non-blocking related link (never cycle-checked; ignored
+    /// by ready/tracks unless `[scheduler].related_weight` is positive).
     #[arg(long)]
     pub related: Option<String>,
     /// Remove the link instead of adding it.
@@ -625,6 +625,10 @@ pub struct NextArgs {
     /// `K` = also admit the cheapest overlaps costing ≤ K per pair; `any` = unbounded.
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// Override `[scheduler].related_weight` for this invocation. Omit to use config
+    /// (default 0: related links do not affect conflict cost).
+    #[arg(long = "related-weight")]
+    pub related_weight: Option<i64>,
     /// In-flight ticket ids to stay compatible with — picks conflicting with these
     /// (beyond the budget) are dropped. Omit to default to every in-progress ticket
     /// with a live claim, so a dispatch loop needs no args.
@@ -660,6 +664,10 @@ pub struct WhyArgs {
     pub a: String,
     /// Second ticket id.
     pub b: String,
+    /// Override `[scheduler].related_weight` for this invocation. Omit to use config
+    /// (default 0: a related link does not flip `conflict` / exit 6).
+    #[arg(long = "related-weight")]
+    pub related_weight: Option<i64>,
 }
 
 /// `claim` arguments.
@@ -822,6 +830,10 @@ pub struct TracksArgs {
     /// let tickets that conflict by ≤ K per pair share a batch; `any` = unbounded.
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// Override `[scheduler].related_weight` for this invocation. Omit to use config
+    /// (default 0: related links do not affect conflict cost).
+    #[arg(long = "related-weight")]
+    pub related_weight: Option<i64>,
     /// Print the additional recommended width after live claims and the overlap budget.
     #[arg(long)]
     pub width: bool,
@@ -849,6 +861,10 @@ pub struct LanesArgs {
     /// Per-pair overlap budget tolerated within a concurrent round (see `tracks`).
     #[arg(long = "max-overlap", default_value = "0")]
     pub max_overlap: String,
+    /// Override `[scheduler].related_weight` for this invocation. Omit to use config
+    /// (default 0: related links do not affect conflict cost).
+    #[arg(long = "related-weight")]
+    pub related_weight: Option<i64>,
     /// Keep live-claim overlaps in lanes while still reporting claim context.
     #[arg(long)]
     pub ignore_claims: bool,

@@ -141,8 +141,10 @@ pub struct Ticket {
     /// IDs of tickets this one depends on.
     pub dependencies: Vec<String>,
     /// IDs of thematically-related tickets. A soft, non-blocking cross-reference:
-    /// recorded structurally (queryable, graphable) but ignored by readiness,
-    /// `tracks`, and cycle detection — unlike `dependencies`, which gate scheduling.
+    /// recorded structurally (queryable, graphable), ignored by readiness and cycle
+    /// detection, and ignored by `tracks`/`next`/`lanes` unless
+    /// `[scheduler].related_weight` is positive — unlike `dependencies`, which always
+    /// gate scheduling.
     pub related: Vec<String>,
     /// Abstract scope names this ticket claims *exclusively* (a rewrite): two tickets
     /// that both claim a scope here cannot run in parallel.
