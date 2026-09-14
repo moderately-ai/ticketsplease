@@ -181,6 +181,8 @@ pub struct CreateSpec {
     /// Optional body template name (CLI resolves via `.ticketsplease/templates/`).
     /// Core's [`TicketRenderer`] ignores this and uses `body` as-is.
     pub template: Option<String>,
+    /// Watches to write. `None` omits the key; `Some` writes the list (`[]` is opt-out).
+    pub watch: Option<Vec<crate::ticket::Watch>>,
 }
 
 /// One planned create with a frozen final id and fully rendered body.
@@ -288,7 +290,12 @@ impl CreateRenderer for TicketRenderer {
             &spec.tags,
             &spec.body,
         )
-        .map(|t| t.render())
+        .and_then(|mut t| {
+            if let Some(watch) = &spec.watch {
+                t.set_watch(watch)?;
+            }
+            Ok(t.render())
+        })
     }
 }
 
@@ -331,7 +338,7 @@ pub fn plan_creates(
             allocator.allocate_unique(&base, |candidate| renderer.render(spec, candidate))?
         };
 
-        let ticket_overlay = Ticket::new(
+        let mut ticket_overlay = Ticket::new(
             &final_id,
             &spec.title,
             &spec.status,
@@ -344,6 +351,9 @@ pub fn plan_creates(
             &spec.tags,
             "", // overlay body unused for link/cycle validation
         )?;
+        if let Some(watch) = &spec.watch {
+            ticket_overlay.set_watch(watch)?;
+        }
 
         let planned = PlannedCreate {
             source_index,
@@ -494,6 +504,7 @@ mod tests {
             tags: vec![],
             body: "body\n".into(),
             template: None,
+            watch: None,
         }
     }
 

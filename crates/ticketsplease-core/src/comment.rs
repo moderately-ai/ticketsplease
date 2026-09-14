@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use yaml_rust2::YamlLoader;
 
 use crate::error::{Error, Result};
-use crate::frontmatter::Document;
+use crate::frontmatter::{self, Document};
 use crate::ids;
 
 /// A single comment on a ticket.
@@ -114,7 +114,7 @@ impl Comment {
         let mut s = String::from("---\n");
         s.push_str(&format!("id: {}\n", self.id));
         if let Some(by) = &self.by {
-            s.push_str(&format!("by: {}\n", yaml_dq(by)));
+            s.push_str(&format!("by: {}\n", frontmatter::render_scalar(by)));
         }
         if let Some(at) = self.at {
             s.push_str(&format!("at: {at}\n"));
@@ -127,12 +127,6 @@ impl Comment {
         s.push('\n');
         s
     }
-}
-
-/// Double-quote a scalar so arbitrary author strings (e.g. `@worker`, `a: b`) stay
-/// valid YAML. Escapes the two chars that matter inside a double-quoted scalar.
-fn yaml_dq(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]

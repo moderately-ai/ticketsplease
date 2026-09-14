@@ -11,16 +11,17 @@ Exit codes are the contract — see the table in `SKILL.md` (`0` ok · `2` usage
 
 ## Contents
 
-`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `run` · `claim` / `release` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` · `maintenance advisories` (each is a `##` section below; the conventions that follow apply to all).
+`init` · `create` · `set` · `close` / `reopen` · `link` · `show` / `list` · `view` · `rollup` · `graph` / `path` · `status` · `reconcile` · `watch` · `comment add` / `list` · `events` · `ready` · `tracks` · `lanes` · `next` · `why` · `run` · `claim` / `release` · `ack` · `guard` · `delete` / `rename` · `doctor` / `guide` · `states` · `lint` · `skill install` / `sync` / `self-update` · `maintenance advisories` (each is a `##` section below; the conventions that follow apply to all).
 
 ## Conventions
 
-- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `close`/`reopen`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `run`→`outputs` (or `steps` with `--dry-run`) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
+- **Result key per command.** Each command's payload carries its result under a stable, documented key, listed with the command below. The quick map: `init`→(fields) · `create`→`results` · `set`→(fields, or `results` in bulk) · `close`/`reopen`→(fields) · `link`→(fields) · `show`→(fields) · `list`→`tickets` · `view`→(fields/`views`) · `rollup`→(fields) · `graph`→`nodes`/`edges` · `path`→`path` · `status`→`tickets` · `reconcile`→`findings` · `claims`→`claims` · `ready`→`ready` · `tracks`→`batches` (or `matrix`/`width`) · `lanes`→`lanes`/`merge_order` · `next`→`picks` (or `claimed` with `--claim`) · `why`→(fields) · `run`→`outputs` (or `steps` with `--dry-run`) · `guard`→(fields) · `lint`→`diagnostics` · `comment list`→`comments` · `events`→`events` · `ack`→(fields) · `doctor`→`checks` · `guide`→`guide` · `delete`/`rename`→(fields).
 - **`id` vs `ticket`.** When an object *is* a ticket (show/list/ready/status/claims), its id is `id`. When an object *references* a ticket from elsewhere (a comment, an event, a collision, a `conflicts_with` entry), the referenced ticket is `ticket` and the object's own id (if any) is `id`/`comment_id`. So `id` is always "this object", `ticket` is always "the ticket it's about".
 - **`depends_on` in, `dependencies` out.** Inputs that accept dependencies use `depends_on` (`create --depends-on`, `link --depends-on`, and the batch spec key, which also accepts `dependencies` as an alias). Stored/queried output always uses `dependencies`.
 - **`dependencies` block; `related` does not gate `ready`.** `dependencies` gate scheduling (a ticket is not `ready` until all are `done`) and are cycle-checked. `related` is a soft, non-blocking cross-reference: recorded, queryable (`--where related:x`), and graphable, never cycle-checked, and ignored by `ready`. `tracks`/`next`/`lanes`/`why` ignore it unless `[scheduler].related_weight` is a positive integer (default `0`, current behaviour). Use `related` for "see also" / optional coupling, `depends_on` for "must finish first".
 - **Access intent: `scopes` exclusive, `shared_scopes` additive.** A scope in `scopes` is an *exclusive* (rewrite) claim; one in `shared_scopes` is a *shared* (additive/append) claim. Two tickets that both hold a scope shared are compatible (run in parallel); a shared claim still conflicts with an exclusive one. `[scope_policy]` in `ticketsplease.toml` sets a per-scope conflict-cost `weight` (default 1; `0` = free to co-edit). `tracks`/`next`/`lanes` gate on a per-pair **overlap budget** (`--max-overlap K`, `0`=strict … `any`=unbounded), so you can fill workers least-riskily instead of single-threading. The guard tags a shared-by-both collision `cause: shared` and does not fail on it.
 - **Comment metadata on ticket records.** In auto/summary/full modes, ticket objects returned by `list`, `status`, `rollup`, `graph`, `path`, `ready`, `tracks`, `lanes`, `next`, and `claims` add `comment_count` (unique ids) and `comment_sources` (raw per-source counts). Full mode also adds `comments`; every comment has sorted `sources`. These are additive fields and do not bump existing schema versions.
+- **`watch` / `needs_review`.** A ticket may declare `watch: [{on, of, reason}]`. `on` is `claim`/`release`/`reopen`/`done`/`closed` or a workflow state; `of` is `self`/`dependencies`/`related` or a ticket id; `reason` is why the author is watching (tkt does not interpret it). Missing key = no watches; `watch: []` opts out of `[defaults].watch`. Detail (`show`, `claim`) returns `needs_review` as an array of `{ticket, reason, on?, of?, event?: {id, ticket, kind, by, at, data}}`. Collection rows add `needs_review_count` when any fires are unacked. Event ids are a cursor in JSON; humans never type them. `tkt ack <id> --as <worker>` records the receipt. This is unrelated to the `watch` **command** (`tkt watch <id> --until`, poll until status) and to `events --watch`.
 
 ## init
 
@@ -36,14 +37,16 @@ JSON: `{ "schema_version", "tickets_dir", "wrote_config", "skill_installed", "te
 ```
 ticketsplease create --title <s> [--id <slug>] [--status <s>] [--priority p0..p3]
                       [--depends-on a,b] [--related c,d] [--scope x,y] [--shared-scope z]
-                      [--path 'glob'] [--tag t] [--body <s>] [--template <name>] [--dry-run] [--no-validate]
+                      [--path 'glob'] [--tag t] [--body <s>] [--template <name>]
+                      [--add-watch on:of --watch-reason <s>] [--no-watch]
+                      [--dry-run] [--no-validate]
 ticketsplease create --from <file|-> [--dry-run] [--no-validate]
 ```
 Writes new tickets. Without `--id`, the id is a slug of the title and the create is **content-addressed-idempotent**: re-running the same create is a no-op (`created: false`), not a `<slug>-2` clone; a genuinely different ticket at that slug takes the next suffix. With `--id`, re-running with identical content is a no-op; different content with the same id is an error (exit 3).
 
 `--template <name>` scaffolds the body from `.ticketsplease/templates/<name>.md` (seeded by `init`; add your own), substituting `{{title}}` and `{{id}}`. An explicit `--body` wins over `--template`; an unknown template is exit 4.
 
-`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly).
+`--from` batch-creates from a **JSON array** of specs or a **TOML `[[ticket]]`** document (format chosen by `.json`/`.toml` extension; `-` reads stdin, defaulting to JSON unless the content starts with `[[`). Each spec is `{title, id?, status?, priority?, depends_on?, related?, scopes?, shared_scopes?, paths?, tags?, body?, template?, watch?}`. Unknown keys are **rejected** (a typo like `dependson` fails loudly). `watch` is `[{on, of, reason}, …]`; omit to inherit `[defaults].watch`, `[]` to opt out.
 
 **Transactional batch pipeline.** A `--from` batch freezes **final ids** first (same suffix rules as single auto-id create), validates the full post-image board (board ∪ planned tickets), then applies every create in one journaled commit under `.ticketsplease/txn/`. On any failure the invocation leaves **no partial creates**. `--dry-run` runs the same plan + validate path and reports the **final** ids/outcomes the write would use (no disk). Re-running an identical successful batch is all `created: false`.
 
@@ -51,7 +54,9 @@ Writes new tickets. Without `--id`, the id is a slug of the title and the create
 
 **Write-time validation (default on).** `create` rejects (exit 3) a declared **scope not defined** in `ticketsplease.toml` (`[scopes]`/`[scope_crates]`/`[external_scopes]`) and a **dangling `related`/`depends_on`** id. Dependency **cycles** are always rejected (exit 5), including under `--no-validate`. A `--from` batch resolves cross-references among its own **final** ids. Pass **`--no-validate`** only for forward references to tickets/scopes you will add next (skips missing targets and undefined scopes; does **not** skip cycles, bad slugs, unknown keys, or injectivity/content conflicts). (Same ref checks apply to `set`/`link` — see below.)
 
-`[defaults].shared_scopes` is merged into both single and batch creates before validation and rendering. Explicit exclusive scopes win over the same default; existing shared values are retained and deduplicated. Because create idempotency compares the fully rendered post-image, use `claim` to backfill defaults onto older tickets rather than re-running an old create.
+`[defaults].shared_scopes` is merged into both single and batch creates before validation and rendering. Explicit exclusive scopes win over the same default; existing shared values are retained and deduplicated. `[defaults].watch` is written the same way when the ticket omits `watch`; `--no-watch` / `watch: []` opts out and is not backfilled. Because create idempotency compares the fully rendered post-image, use `claim` to backfill defaults onto older tickets rather than re-running an old create.
+
+`--add-watch on:of` (first colon; e.g. `done:dependencies`) requires a matching `--watch-reason` sentence. `on` is `claim`/`release`/`reopen`/`done`/`closed` or a workflow state; `of` is `self`/`dependencies`/`related` or a ticket id. Identity is `(on, of)`. Missing `watch` means no watches; `watch: []` is explicit opt-out.
 
 JSON (single and batch share one shape): `{ "schema_version", "results": [ {id, created: bool, path} ], "dry_run": bool }`.
 
@@ -65,6 +70,7 @@ ticketsplease set (<id> | --where <expr> | --view <name>)
                        [--add-path 'glob'] [--remove-path 'glob']
                        [--add-dependency d] [--remove-dependency e]
                        [--add-related r] [--remove-related s]
+                       [--add-watch on:of --watch-reason <s>] [--remove-watch on:of]
                        [--body <s> | --body-file <f|-> | --append-body <s> | --append-body-file <f|->] [--dry-run] [--no-validate]
 ```
 Surgically updates fields (round-trip-safe), writing back to the file it read even if the frontmatter `id` has drifted from the filename. No-op if nothing changes. `--add-dependency` is rejected if it would close a cycle (exit 5), like `link`; `--add-related` is never cycle-checked. An **added** scope that is undefined, or an added `related`/`depends_on` id that does not resolve, is rejected (exit 3) — only the additions are checked, so an unrelated edit never trips on a pre-existing dangling link; `--no-validate` skips it. Setting a terminal status (`done` or `closed`) clears the claim (assignee + lease). `--reason <duplicate|wontdo|obsolete|superseded|cancelled>` and `--note <text>` are valid only alongside `--status closed` (they record the resolution, and are cleared automatically when the ticket later leaves `closed`); prefer the `close`/`reopen` verbs below. When `[workflow] enforce_transitions` is on, a status change that is not a permitted transition is rejected (exit 6) unless `--force` is passed (bulk `--where` skips illegal ones instead). `--dry-run` previews without writing.
@@ -193,7 +199,7 @@ ticketsplease comment list <id> [--ref <branch>]
 ```
 ticketsplease events [--since <event-id>] [--ticket <id>] [--type <kind>] [--watch] [--interval 2] [--timeout <secs>]
 ```
-The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob in `.git`, visible across worktrees and a shared clone **immediately — no commit, no push** (but see cross-clone note in the parallel-workflow guide). `comment add`, `set --status`, `claim`, and `release` emit events. The id is time-sortable; `--since <last-seen-id>` is a resumable cursor. `--ticket` (must exist) / `--type` (one of `comment`, `status`, `claim`, `release`) are validated — a typo fails loudly rather than masking the stream. Requires a git repo (else a clean error, not silent empty). `--watch` blocks until a matching event appears, exiting **7** on `--timeout`. Human output shows relative timestamps. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`.
+The cross-branch activity log: each event is a `refs/ticketsplease/events/<id>` ref pointing at a JSON blob in `.git`, visible across worktrees and a shared clone **immediately — no commit, no push** (but see cross-clone note in the parallel-workflow guide). `comment add`, `set --status`, `claim`, `release`, and `ack` emit events. The id is time-sortable; `--since <last-seen-id>` is a resumable cursor. `--ticket` (must exist) / `--type` (one of `comment`, `status`, `claim`, `release`, `ack`) are validated — a typo fails loudly rather than masking the stream. Requires a git repo (else a clean error, not silent empty). `--watch` blocks until a matching event appears, exiting **7** on `--timeout`. Human output shows relative timestamps. JSON: `{ "schema_version", "events": [ {id, ticket, kind, by, at, data} ] }`.
 
 ## ready
 
@@ -276,8 +282,15 @@ ticketsplease release <id> [--as <worker>] [--force]
 
 `release` restores the pre-claim status (not always `ready`) — but keeps real progress if the worker advanced to review/blocked/done. Without `--force`, only the recorded holder may release; a **bare** `release` (no `--as`) on a held ticket is refused (pass `--as <holder>` or `--force`).
 
-claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool, "renewed": bool, "default_shared_scopes_added": [names] }`.
+claim JSON: `{ "schema_version", "id", "assignee", "lease_expires_at", "stolen": bool, "renewed": bool, "default_shared_scopes_added": [names], "default_watch_added": bool, "needs_review": [ {ticket, reason, on?, of?, event?} ] }`. Claim is still exit 0 when `needs_review` is non-empty — drain it before starting work.
 release JSON: `{ "schema_version", "id", "released": bool }`.
+
+## ack
+
+```
+ticketsplease ack <id> --as <worker> [--ticket <subject>] [--note <text>]
+```
+Record that fired watches on `<id>` have been reviewed. `--as` is required. With no `--ticket`, catch up every currently fired subject and store the current spec hash. `--ticket` limits the receipt to one subject. Do not pass event ids; the cursor is recorded for you. Human: `Acked \`id\` (caught up)`. JSON: `{ "schema_version", "id", "acked": bool, "by", "against", "hash", "tickets": [...] }`. Receipts live under `<tickets_dir>/<id>.acks/` (append-only, like comments) and emit an `ack` event.
 
 ## guard
 

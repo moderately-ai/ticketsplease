@@ -5,13 +5,14 @@
 //! [`crate::schedule::Graph::build`]; lint still uses
 //! [`crate::schedule::link_diagnostics`]. Those three consumers stay separate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{Config, CONFIG_FILE};
 use crate::error::{Error, Result};
 use crate::plan::{materialize_board, BoardSnapshot, MutationPlan};
 use crate::schedule;
 use crate::ticket::Ticket;
+use crate::watch;
 
 /// Scope and link fields to validate for a create/set/link write.
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +150,31 @@ pub fn validate_plan(
         }
     }
 
+    // Watch rules always run (unknown on, empty reason, duplicates, self+terminal).
+    // `--no-validate` only skips dangling explicit `of` ids, via validate_refs.
+    let ids: BTreeSet<&str> = known.keys().copied().collect();
+    let registry = config.state_registry();
+    let check = watch::WatchCheck {
+        registry: &registry,
+        refs: if opts.validate_refs {
+            watch::RefCheck::Known(&ids)
+        } else {
+            watch::RefCheck::Skip
+        },
+    };
+    for planned in &plan.planned_creates {
+        let t = &planned.ticket_overlay;
+        if let Some(dup) = watch::duplicate_watch(&t.watch) {
+            return Err(Error::Invalid(format!(
+                "ticket `{}`: duplicate watch `on: {}` `of: {}`",
+                planned.final_id, dup.on, dup.of
+            )));
+        }
+        for w in &t.watch {
+            watch::validate_watch(&format!("ticket `{}`", planned.final_id), w, &check)?;
+        }
+    }
+
     if opts.validate_cycles {
         schedule::ensure_acyclic(&post)?;
     }
@@ -202,6 +228,7 @@ mod tests {
             tags: vec![],
             body: String::new(),
             template: None,
+            watch: None,
         }
     }
 
@@ -287,6 +314,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message().contains("dx"), "{}", err.message());
+    }
+
+    #[test]
+    fn validate_plan_rejects_unknown_watch_on_even_without_refs() {
+        let snap = BoardSnapshot::default();
+        let mut spec = spec("X", Some("x"), &[], &[]);
+        spec.watch = Some(vec![crate::ticket::Watch::new(
+            "nope",
+            crate::ticket::WatchOf::Watcher,
+            "x",
+        )]);
+        let mut renderer = TicketRenderer;
+        let plan = plan_creates(&snap, &[spec], &mut renderer).unwrap();
+        let err = validate_plan(
+            &empty_config(),
+            &snap,
+            &plan,
+            ValidationOptions::cycles_only(),
+        )
+        .unwrap_err();
+        assert!(err.message().contains("unknown watch"), "{}", err.message());
     }
 
     #[test]

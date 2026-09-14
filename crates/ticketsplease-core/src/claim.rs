@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::store::Store;
+use crate::watch::{self, RefCheck, WatchCheck};
 use crate::Ticket;
 
 /// Default claim lease (one hour): long enough for a coding-agent task, short
@@ -50,6 +51,8 @@ pub struct ClaimOutcome {
     pub renewed: bool,
     /// Configured shared-scope defaults added by this claim. Empty on a no-op merge.
     pub default_shared_scopes_added: Vec<String>,
+    /// Whether `[defaults].watch` was written because the ticket had no `watch` key.
+    pub default_watch_added: bool,
 }
 
 /// Seconds since the Unix epoch. A lease is mutation state, not query output, so
@@ -72,6 +75,7 @@ pub fn claim(
     force: bool,
 ) -> Result<ClaimOutcome> {
     validate_default_shared_scopes(store)?;
+    validate_default_watches(store)?;
     let ticket = store.load(id)?; // NotFound (exit 4) if the id is unknown
     let registry = store.config.state_registry();
     // Claimable = a dispatchable state, or already at the claim target (a renewal). A
@@ -164,6 +168,13 @@ fn claim_locked(
     for scope in &default_shared_scopes_added {
         ticket.add_shared_scope(scope)?;
     }
+    let default_watch_added =
+        if let Some(watches) = store.config.default_watch_backfill(ticket.has_watch_key()) {
+            ticket.set_watch(&watches)?;
+            true
+        } else {
+            false
+        };
     ticket.set_claim(agent, lease, &store.config.state_registry())?;
     store.save(&ticket)?;
     Ok(ClaimOutcome {
@@ -173,7 +184,26 @@ fn claim_locked(
         stolen,
         renewed,
         default_shared_scopes_added,
+        default_watch_added,
     })
+}
+
+fn validate_default_watches(store: &Store) -> Result<()> {
+    let registry = store.config.state_registry();
+    if let Some(dup) = watch::duplicate_watch(&store.config.defaults.watch) {
+        return Err(Error::Invalid(format!(
+            "[defaults].watch has a duplicate `on: {}` `of: {}`",
+            dup.on, dup.of
+        )));
+    }
+    let check = WatchCheck {
+        registry: &registry,
+        refs: RefCheck::Skip,
+    };
+    for w in &store.config.defaults.watch {
+        watch::validate_watch("[defaults].watch", w, &check)?;
+    }
+    Ok(())
 }
 
 fn validate_default_shared_scopes(store: &Store) -> Result<()> {

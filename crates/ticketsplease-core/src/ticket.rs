@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::error::{Error, Result};
@@ -122,6 +122,102 @@ impl std::fmt::Display for Priority {
     }
 }
 
+/// Who a watch is bound to. Selectors (`self` / `dependencies` / `related`) are
+/// distinct from an explicit ticket id so a slug that happens to be `related`
+/// cannot be confused with the selector of the same name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WatchOf {
+    /// The watching ticket (`of: self`).
+    Watcher,
+    /// Every id in the watcher's `dependencies`.
+    Dependencies,
+    /// Outbound and inbound `related` links.
+    Related,
+    /// One explicit ticket id.
+    Ticket(String),
+}
+
+impl WatchOf {
+    /// Parse the YAML/CLI token. Selectors win over a ticket id of the same spelling.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "self" => WatchOf::Watcher,
+            "dependencies" => WatchOf::Dependencies,
+            "related" => WatchOf::Related,
+            other => WatchOf::Ticket(other.to_string()),
+        }
+    }
+
+    /// The token written to frontmatter and JSON.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            WatchOf::Watcher => "self",
+            WatchOf::Dependencies => "dependencies",
+            WatchOf::Related => "related",
+            WatchOf::Ticket(id) => id,
+        }
+    }
+
+    /// Live-bound selector, not an explicit ticket id.
+    #[must_use]
+    pub fn is_selector(&self) -> bool {
+        !matches!(self, WatchOf::Ticket(_))
+    }
+
+    /// The explicit ticket id, when this is not a selector.
+    #[must_use]
+    pub fn as_ticket(&self) -> Option<&str> {
+        match self {
+            WatchOf::Ticket(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WatchOf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for WatchOf {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WatchOf {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(WatchOf::parse(&s))
+    }
+}
+
+/// A ticket-declared watch: when `on` fires for `of`, the worker should read `reason`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watch {
+    /// Event kind or status alias: `claim` | `release` | `reopen` | `done` | `closed` | a workflow state.
+    pub on: String,
+    /// Bound subjects. Workflow `on` stays a string because states are user-extensible.
+    pub of: WatchOf,
+    /// Why this ticket cares — shown when the watch fires. tkt does not interpret it.
+    pub reason: String,
+}
+
+impl Watch {
+    /// Canonicalize `on` to lowercase; keep `reason` as given.
+    #[must_use]
+    pub fn new(on: impl Into<String>, of: WatchOf, reason: impl Into<String>) -> Self {
+        Self {
+            on: on.into().trim().to_ascii_lowercase(),
+            of,
+            reason: reason.into(),
+        }
+    }
+}
+
 /// A single ticket: typed fields for queries plus the underlying [`Document`]
 /// that backs round-trip-safe writes.
 #[derive(Debug, Clone)]
@@ -169,6 +265,8 @@ pub struct Ticket {
     pub closed_reason: Option<ClosedReason>,
     /// A free-text one-line note accompanying a close. Cleared with `closed_reason`.
     pub closed_note: Option<String>,
+    /// Declared watches (`on` / `of` / `reason`). Missing key means none; `watch: []` is opt-out.
+    pub watch: Vec<Watch>,
     doc: Document,
     /// The file this ticket was loaded from, if any. `save` writes back here so a
     /// ticket whose frontmatter `id` has drifted from its filename updates in place
@@ -220,6 +318,7 @@ impl Ticket {
                 .map(|s| s.parse())
                 .transpose()?,
             closed_note: optional_string(y, "closed_note"),
+            watch: watch_list(y)?,
             doc,
             source_path: None,
         })
@@ -539,6 +638,68 @@ impl Ticket {
         self.doc.append_body(text);
     }
 
+    /// Whether the frontmatter has a `watch` key (absent vs `[]` is how defaults backfill).
+    #[must_use]
+    pub fn has_watch_key(&self) -> bool {
+        self.doc.has_key("watch")
+    }
+
+    /// Replace the watch list (writes `watch: []` when empty).
+    pub fn set_watch(&mut self, watches: &[Watch]) -> Result<()> {
+        self.watch = watches.to_vec();
+        self.write_watch()
+    }
+
+    /// Add or replace a watch keyed by `(on, of)`. Returns whether anything changed.
+    pub fn add_watch(&mut self, watch: Watch) -> Result<bool> {
+        if let Some(existing) = self
+            .watch
+            .iter_mut()
+            .find(|w| w.on == watch.on && w.of == watch.of)
+        {
+            if existing.reason == watch.reason {
+                return Ok(false);
+            }
+            existing.reason = watch.reason;
+        } else {
+            self.watch.push(watch);
+        }
+        self.write_watch()?;
+        Ok(true)
+    }
+
+    /// Remove the watch with this `(on, of)`. Returns whether anything changed.
+    pub fn remove_watch(&mut self, on: &str, of: &WatchOf) -> Result<bool> {
+        let on = on.trim().to_ascii_lowercase();
+        let before = self.watch.len();
+        self.watch.retain(|w| !(w.on == on && w.of == *of));
+        if self.watch.len() == before {
+            return Ok(false);
+        }
+        self.write_watch()?;
+        Ok(true)
+    }
+
+    fn write_watch(&mut self) -> Result<()> {
+        if self.watch.iter().any(|w| w.reason.trim().is_empty()) {
+            return Err(Error::Invalid(
+                "watch reason must be a non-empty sentence".into(),
+            ));
+        }
+        let entries: Vec<Vec<(String, String)>> = self
+            .watch
+            .iter()
+            .map(|w| {
+                vec![
+                    ("on".into(), w.on.clone()),
+                    ("of".into(), w.of.as_str().to_string()),
+                    ("reason".into(), w.reason.clone()),
+                ]
+            })
+            .collect();
+        self.doc.set_map_list("watch", &entries)
+    }
+
     /// Construct a new ticket from fields, rendering canonical frontmatter.
     #[allow(clippy::too_many_arguments)] // a flat ticket; a builder adds no clarity
     pub fn new(
@@ -596,6 +757,23 @@ fn string_list(y: &Yaml, key: &str) -> Vec<String> {
         Some(v) => v.iter().filter_map(scalar_to_string).collect(),
         None => Vec::new(),
     }
+}
+
+fn watch_list(y: &Yaml) -> Result<Vec<Watch>> {
+    match &y["watch"] {
+        Yaml::BadValue => Ok(Vec::new()),
+        Yaml::Array(items) => items.iter().map(watch_from_yaml).collect(),
+        _ => Err(Error::Invalid("`watch` must be a list of maps".into())),
+    }
+}
+
+fn watch_from_yaml(y: &Yaml) -> Result<Watch> {
+    let on = scalar_to_string(&y["on"])
+        .ok_or_else(|| Error::Invalid("watch entry missing `on`".into()))?;
+    let of = scalar_to_string(&y["of"])
+        .ok_or_else(|| Error::Invalid("watch entry missing `of`".into()))?;
+    let reason = scalar_to_string(&y["reason"]).unwrap_or_default();
+    Ok(Watch::new(on, WatchOf::parse(&of), reason))
 }
 
 fn scalar_to_string(y: &Yaml) -> Option<String> {
@@ -767,5 +945,36 @@ mod tests {
         let mut ps = [Priority::P3, Priority::P0, Priority::P2, Priority::P1];
         ps.sort();
         assert_eq!(ps, [Priority::P0, Priority::P1, Priority::P2, Priority::P3]);
+    }
+
+    #[test]
+    fn watch_parses_and_round_trips() {
+        let raw = "---\nid: foo\ntitle: T\nwatch:\n  - on: done\n    of: dependencies\n    reason: Assumes SHA identity\n---\n";
+        let t = Ticket::parse(raw).unwrap();
+        assert_eq!(t.watch.len(), 1);
+        assert_eq!(t.watch[0].on, "done");
+        assert_eq!(t.watch[0].of, WatchOf::Dependencies);
+        assert_eq!(t.watch[0].reason, "Assumes SHA identity");
+        let mut t = t;
+        assert!(t
+            .add_watch(Watch::new("closed", WatchOf::Related, "upstream cancelled"))
+            .unwrap());
+        let out = t.render();
+        assert!(out.contains("of: related"));
+        let again = Ticket::parse(&out).unwrap();
+        assert_eq!(again.watch.len(), 2);
+        assert!(t.remove_watch("done", &WatchOf::Dependencies).unwrap());
+        assert_eq!(Ticket::parse(&t.render()).unwrap().watch.len(), 1);
+    }
+
+    #[test]
+    fn missing_watch_key_is_empty_not_opt_out() {
+        let t = Ticket::parse("---\nid: x\ntitle: T\n---\n").unwrap();
+        assert!(t.watch.is_empty());
+        assert!(!t.has_watch_key());
+        let mut t = t;
+        t.set_watch(&[]).unwrap();
+        assert!(t.has_watch_key());
+        assert!(t.render().contains("watch: []\n"));
     }
 }

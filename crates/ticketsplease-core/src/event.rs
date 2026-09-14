@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One activity event (a comment, a status change, a claim, …).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     /// Sortable unique id (orders the log; also the cursor value).
     pub id: String,

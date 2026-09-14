@@ -81,7 +81,7 @@ pub enum Command {
     Watch(WatchArgs),
     /// Add or list a ticket's comments (append-only, conflict-free).
     Comment(CommentArgs),
-    /// Tail the cross-branch activity event log (comments, status, claims).
+    /// Tail the cross-branch activity event log (comments, status, claims, acks).
     Events(EventsArgs),
     /// List dependency-satisfied, dispatchable tickets.
     Ready(ReadyArgs),
@@ -98,6 +98,8 @@ pub enum Command {
     Next(NextArgs),
     /// Atomically claim a ticket for an agent (race-safe, lease-based).
     Claim(ClaimArgs),
+    /// Record that fired watches on a ticket have been reviewed.
+    Ack(AckArgs),
     /// Release a claimed ticket back to the ready pool.
     Release(ReleaseArgs),
     /// Show current claims (assignee, lease expiry, live/expired).
@@ -207,6 +209,24 @@ pub struct CreateArgs {
     /// forward reference to a ticket or scope you will add next.
     #[arg(long)]
     pub no_validate: bool,
+    /// Watch to declare (`on:of`, e.g. `done:dependencies`). Repeatable; each needs a
+    /// matching `--watch-reason`. Not valid with `--from`.
+    #[arg(long = "add-watch", conflicts_with = "from")]
+    pub add_watch: Vec<String>,
+    /// Reason sentence for the corresponding `--add-watch` (same order).
+    #[arg(
+        long = "watch-reason",
+        allow_hyphen_values = true,
+        conflicts_with = "from"
+    )]
+    pub watch_reason: Vec<String>,
+    /// Write `watch: []` (opt out of `[defaults].watch`). Conflicts with `--add-watch`.
+    #[arg(
+        long = "no-watch",
+        conflicts_with = "add_watch",
+        conflicts_with = "from"
+    )]
+    pub no_watch: bool,
 }
 
 /// `set` arguments.
@@ -315,6 +335,16 @@ pub struct SetArgs {
     /// Skip write-time validation of added scopes/related/dependency ids.
     #[arg(long)]
     pub no_validate: bool,
+    /// Watch to add (`on:of`, e.g. `done:dependencies`). Repeatable; each needs a
+    /// matching `--watch-reason`.
+    #[arg(long = "add-watch")]
+    pub add_watch: Vec<String>,
+    /// Reason sentence for the corresponding `--add-watch` (same order).
+    #[arg(long = "watch-reason", allow_hyphen_values = true)]
+    pub watch_reason: Vec<String>,
+    /// Watch to remove (`on:of`). Repeatable.
+    #[arg(long = "remove-watch")]
+    pub remove_watch: Vec<String>,
 }
 
 /// `close` arguments.
@@ -587,7 +617,7 @@ pub struct EventsArgs {
     /// Only events for this ticket.
     #[arg(long)]
     pub ticket: Option<String>,
-    /// Only events of this kind (e.g. `comment`, `status`, `claim`).
+    /// Only events of this kind (`comment`, `status`, `claim`, `release`, `ack`).
     #[arg(long = "type")]
     pub kind: Option<String>,
     /// Block until at least one matching event appears (wake-on-event); pair with
@@ -687,6 +717,22 @@ pub struct ClaimArgs {
     /// Steal the claim even if another agent holds a live lease.
     #[arg(long)]
     pub force: bool,
+}
+
+/// `ack` arguments.
+#[derive(Args)]
+pub struct AckArgs {
+    /// Ticket id whose fired watches were reviewed.
+    pub id: String,
+    /// Who looked.
+    #[arg(long = "as")]
+    pub agent: String,
+    /// Catch up only this subject ticket (default: every currently fired subject).
+    #[arg(long)]
+    pub ticket: Option<String>,
+    /// Optional note stored on the receipt.
+    #[arg(long, allow_hyphen_values = true)]
+    pub note: Option<String>,
 }
 
 /// `release` arguments.
@@ -1042,6 +1088,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Lanes(a) => commands::lanes(repo, fmt, output, a),
         Command::Next(a) => commands::next(repo, fmt, output, a),
         Command::Claim(a) => commands::claim(repo, fmt, a),
+        Command::Ack(a) => commands::ack(repo, fmt, a),
         Command::Release(a) => commands::release(repo, fmt, a),
         Command::Claims(a) => commands::claims(repo, fmt, output, a),
         Command::Delete(a) => commands::delete(repo, fmt, a),

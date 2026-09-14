@@ -73,6 +73,10 @@ scopes: [query/planner]       # exclusive (rewrite) area claims
 shared_scopes: []             # additive (append) claims — co-edit freely
 paths: []                     # extra explicit globs
 tags: []
+watch:                        # optional: claim/show list needs_review; drain with ack --as
+  - on: done                  # unrelated to `tkt watch <id> --until` (poll a status)
+    of: dependencies
+    reason: Assumes the dep's API; rewrite this ticket if that identity moved.
 # any custom keys you add are preserved verbatim
 ---
 Free-form markdown body.
@@ -95,6 +99,7 @@ default_base = "main"          # base ref for `guard`
 
 [defaults]
 shared_scopes = ["project/tickets"] # merged into create/claim; explicit exclusive wins
+# watch = [{ on = "done", of = "dependencies", reason = "Re-read if a dependency changed what this assumed." }]
 
 [output]
 comments = "auto"              # detail=full thread, collections=count; full|summary|none override

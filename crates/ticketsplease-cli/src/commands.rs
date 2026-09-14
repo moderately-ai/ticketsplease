@@ -27,16 +27,17 @@ use ticketsplease_core::store::{self, CreateOutcome};
 use ticketsplease_core::txn::plan_upserts;
 use ticketsplease_core::views::Views;
 use ticketsplease_core::{
-    lint as lint_core, query, schedule, validate_plan, validate_ticket_links, Error, Priority,
-    Result, StateClass, StateRegistry, Store, Ticket, ValidationOptions, WriteFields,
+    lint as lint_core, query, schedule, spec_hash, validate_plan, validate_ticket_links, watch,
+    AckPlan, AckScope, AckSpec, Error, FiredWatch, Priority, Result, StateClass, StateRegistry,
+    Store, Ticket, ValidationOptions, Watch, WatchOf, WriteFields,
 };
 
 use crate::cli::{
-    ClaimArgs, ClaimsArgs, CloseArgs, CommentAddArgs, CommentListArgs, CreateArgs, DeleteArgs,
-    EventsArgs, GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs, MigrateArgs,
-    NextArgs, PathArgs, ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs, RollupArgs, RunArgs,
-    SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs, TracksArgs, ViewSaveArgs,
-    ViewShowArgs, WatchArgs, WhyArgs,
+    AckArgs, ClaimArgs, ClaimsArgs, CloseArgs, CommentAddArgs, CommentListArgs, CreateArgs,
+    DeleteArgs, EventsArgs, GraphArgs, GuardArgs, InitArgs, LanesArgs, LinkArgs, ListArgs,
+    MigrateArgs, NextArgs, PathArgs, ReconcileArgs, ReleaseArgs, RenameArgs, ReopenArgs,
+    RollupArgs, RunArgs, SelfUpdateArgs, SetArgs, ShowArgs, SkillInstallArgs, StatusArgs,
+    TracksArgs, ViewSaveArgs, ViewShowArgs, WatchArgs, WhyArgs,
 };
 use crate::format::{print_json, Format, OutputOverrides};
 use crate::recipe;
@@ -144,6 +145,162 @@ fn enrich_comment_json(value: &mut Value, id: &str, comments: &LoadedComments) {
             .iter()
             .map(sourced_comment_value)
             .collect::<Vec<_>>());
+    }
+}
+
+fn parse_watch_flags(add: &[String], reasons: &[String]) -> Result<Vec<Watch>> {
+    if add.len() != reasons.len() {
+        return Err(Error::Invalid(format!(
+            "each --add-watch needs a matching --watch-reason (got {} watches, {} reasons)",
+            add.len(),
+            reasons.len()
+        )));
+    }
+    add.iter()
+        .zip(reasons)
+        .map(|(spec, reason)| watch::watch_from_spec(spec, reason))
+        .collect()
+}
+
+fn validate_watches(id: &str, watches: &[Watch], check: &watch::WatchCheck<'_>) -> Result<()> {
+    if let Some(dup) = watch::duplicate_watch(watches) {
+        return Err(Error::Invalid(format!(
+            "ticket `{id}`: duplicate watch `on: {}` `of: {}`",
+            dup.on, dup.of
+        )));
+    }
+    for w in watches {
+        watch::validate_watch(&format!("ticket `{id}`"), w, check)?;
+    }
+    Ok(())
+}
+
+fn watch_check<'a>(
+    registry: &'a StateRegistry,
+    ids: &'a BTreeSet<&'a str>,
+    no_validate: bool,
+) -> watch::WatchCheck<'a> {
+    watch::WatchCheck {
+        registry,
+        refs: if no_validate {
+            watch::RefCheck::Skip
+        } else {
+            watch::RefCheck::Known(ids)
+        },
+    }
+}
+
+fn fired_watch_json(fired: &FiredWatch) -> Value {
+    match fired {
+        FiredWatch::Event {
+            on,
+            of,
+            ticket,
+            reason,
+            event,
+        } => json!({
+            "ticket": ticket,
+            "reason": reason,
+            "on": on,
+            "of": of,
+            "event": {
+                "id": event.id,
+                "ticket": event.ticket,
+                "kind": event.kind,
+                "by": event.by,
+                "at": event.at,
+                "data": event.data,
+            },
+        }),
+        FiredWatch::SpecChanged { ticket } => json!({
+            "ticket": ticket,
+            "reason": watch::HASH_CHANGED_REASON,
+        }),
+    }
+}
+
+fn print_needs_review(fired: &[FiredWatch], ticket_id: &str, agent: Option<&str>) {
+    if fired.is_empty() {
+        return;
+    }
+    let now = now_epoch();
+    println!("Needs review ({}):", fired.len());
+    for f in fired {
+        match f {
+            FiredWatch::Event {
+                on,
+                ticket,
+                reason,
+                event,
+                ..
+            } => {
+                let when = humanize_epoch(event.at, now);
+                let who = event.by.as_deref().unwrap_or("");
+                println!("  {ticket}  {on}  {when}  {who}");
+                if !reason.is_empty() {
+                    println!("  {reason}");
+                }
+            }
+            FiredWatch::SpecChanged { ticket } => {
+                println!("  {ticket}  (changed since last ack)");
+                println!("  {}", watch::HASH_CHANGED_REASON);
+            }
+        }
+    }
+    let who = agent.unwrap_or("<you>");
+    let mut shown = BTreeSet::new();
+    for f in fired {
+        if shown.insert(f.ticket()) {
+            println!("  tkt show {}", f.ticket());
+        }
+    }
+    println!("  tkt ack {ticket_id} --as {who}");
+    println!("  tkt set {ticket_id} --body-file -");
+}
+
+fn load_fired(store: &Store, ticket: &Ticket, board: &[Ticket]) -> Result<Vec<FiredWatch>> {
+    let events = store.events()?;
+    let acks = store.acks(&ticket.id)?;
+    Ok(watch::needs_review(watch::ReviewInput {
+        ticket,
+        board,
+        events: &events,
+        acks: &acks,
+        registry: &store.config.state_registry(),
+    }))
+}
+
+fn review_counts(store: &Store, tickets: &[Ticket]) -> Result<BTreeMap<String, usize>> {
+    let events = store.events()?;
+    let registry = store.config.state_registry();
+    let mut out = BTreeMap::new();
+    for t in tickets {
+        let acks = store.acks(&t.id)?;
+        let n = watch::needs_review(watch::ReviewInput {
+            ticket: t,
+            board: tickets,
+            events: &events,
+            acks: &acks,
+            registry: &registry,
+        })
+        .len();
+        if n > 0 {
+            out.insert(t.id.clone(), n);
+        }
+    }
+    Ok(out)
+}
+
+fn enrich_review_json(value: &mut Value, id: &str, counts: &BTreeMap<String, usize>) {
+    if let Some(n) = counts.get(id) {
+        value["needs_review_count"] = json!(n);
+    }
+}
+
+fn review_marker(id: &str, counts: &BTreeMap<String, usize>) -> String {
+    match counts.get(id) {
+        Some(n) if *n > 0 => format!(" [review:{n}]"),
+        _ => String::new(),
     }
 }
 
@@ -373,6 +530,13 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     );
     let paths = norm_list(&args.paths);
     let tags = norm_list(&args.tags);
+    let watches = if args.no_watch {
+        Some(Vec::new())
+    } else if !args.add_watch.is_empty() || !args.watch_reason.is_empty() {
+        Some(parse_watch_flags(&args.add_watch, &args.watch_reason)?)
+    } else {
+        store.config.default_watch_backfill(false)
+    };
 
     // Reject undefined scopes and dangling related/dependency ids at filing time. A
     // single new ticket cannot close a dependency cycle (nothing references its id yet),
@@ -382,14 +546,24 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
     // validation needs just the config. So a ticket that references no other ticket
     // (the common case — a fresh ticket with only scopes/tags) files in O(1), never
     // reading the board.
+    let validate_id = args.id.clone().unwrap_or_else(|| store::slugify(title));
+    let needs_board = !related.is_empty()
+        || !depends_on.is_empty()
+        || watches
+            .as_ref()
+            .is_some_and(|ws| ws.iter().any(|w| !w.of.is_selector()));
+    let all = if needs_board && (!args.no_validate || watches.is_some()) {
+        store.load_all_lenient()?.0
+    } else {
+        Vec::new()
+    };
+    let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
+    if let Some(w) = &watches {
+        let ids: BTreeSet<&str> = known.keys().copied().collect();
+        let check = watch_check(&registry, &ids, args.no_validate);
+        validate_watches(&validate_id, w, &check)?;
+    }
     if !args.no_validate {
-        let validate_id = args.id.clone().unwrap_or_else(|| store::slugify(title));
-        let all = if related.is_empty() && depends_on.is_empty() {
-            Vec::new()
-        } else {
-            store.load_all_lenient()?.0
-        };
-        let known: BTreeMap<&str, &Ticket> = all.iter().map(|t| (t.id.as_str(), t)).collect();
         validate_write(
             &store.config,
             &validate_id,
@@ -405,7 +579,7 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
 
     let build = |id: &str| -> Result<String> {
         let body = resolve_create_body(repo, &args.body, args.template.as_deref(), id, title)?;
-        Ticket::new(
+        let mut t = Ticket::new(
             id,
             title,
             &args.status,
@@ -417,8 +591,11 @@ pub fn create(repo: &Path, fmt: Format, args: &CreateArgs) -> Result<()> {
             &paths,
             &tags,
             &body,
-        )
-        .map(|t| t.render())
+        )?;
+        if let Some(w) = &watches {
+            t.set_watch(w)?;
+        }
+        Ok(t.render())
     };
 
     if args.dry_run {
@@ -548,6 +725,8 @@ struct TicketSpec {
     body: String,
     #[serde(default)]
     template: Option<String>,
+    #[serde(default)]
+    watch: Option<Vec<Watch>>,
 }
 
 /// The TOML manifest shape: `[[ticket]]` array-of-tables (also accepts `[[tickets]]`).
@@ -610,7 +789,12 @@ impl CreateRenderer for BatchCreateRenderer<'_> {
             &spec.tags,
             &body,
         )
-        .map(|t| t.render())
+        .and_then(|mut t| {
+            if let Some(watch) = &spec.watch {
+                t.set_watch(watch)?;
+            }
+            Ok(t.render())
+        })
     }
 }
 
@@ -662,6 +846,10 @@ fn create_batch(
             tags: norm_list(&s.tags),
             body: s.body,
             template: s.template,
+            watch: match s.watch {
+                Some(w) => Some(w),
+                None => store.config.default_watch_backfill(false),
+            },
         });
     }
 
@@ -810,6 +998,20 @@ fn apply_set_field_mutations(
     for rel in norm_list(&args.remove_related) {
         ticket.remove_related(&rel)?;
     }
+    let added_watches = parse_watch_flags(&args.add_watch, &args.watch_reason)?;
+    if let Some(dup) = watch::duplicate_watch(&added_watches) {
+        return Err(Error::Invalid(format!(
+            "duplicate --add-watch `on: {}` `of: {}`",
+            dup.on, dup.of
+        )));
+    }
+    for w in added_watches {
+        ticket.add_watch(w)?;
+    }
+    for spec in &args.remove_watch {
+        let (on, of) = watch::parse_on_of(spec)?;
+        ticket.remove_watch(&on, &of)?;
+    }
     Ok(deps_added)
 }
 
@@ -899,6 +1101,12 @@ fn set_single(store: &Store, fmt: Format, args: &SetArgs) -> Result<()> {
             },
             &known,
         )?;
+    }
+    if !args.add_watch.is_empty() {
+        let board = store.load_all_lenient()?.0;
+        let ids: BTreeSet<&str> = board.iter().map(|t| t.id.as_str()).collect();
+        let check = watch_check(&registry, &ids, args.no_validate);
+        validate_watches(&ticket.id, &ticket.watch, &check)?;
     }
     // Reject a dependency edit that would close a cycle, exactly like `link`. Related
     // links carry no ordering, so they need no cycle check. `deps_added` implies a
@@ -1044,6 +1252,13 @@ fn set_bulk(repo: &Path, store: &Store, fmt: Format, args: &SetArgs) -> Result<(
     // One cycle check over the whole edited set, mirroring single `set`/`link`.
     if any_deps_added {
         schedule::ensure_acyclic(&all)?;
+    }
+    if !args.add_watch.is_empty() {
+        let ids: BTreeSet<&str> = all.iter().map(|t| t.id.as_str()).collect();
+        let check = watch_check(&registry, &ids, args.no_validate);
+        for &i in &to_save {
+            validate_watches(&all[i].id, &all[i].watch, &check)?;
+        }
     }
     // Single journaled commit for every changed match (no sequential save loop).
     if !args.dry_run && !to_save.is_empty() {
@@ -1335,10 +1550,13 @@ pub fn show(repo: &Path, fmt: Format, output: OutputOverrides, args: &ShowArgs) 
         None => (store.load(&args.id)?, default_query),
     };
     let comments = load_comments(&store, std::slice::from_ref(&args.id), mode, &query)?;
+    let board = store.load_all_lenient()?.0;
+    let fired = load_fired(&store, &ticket, &board)?;
     match fmt {
         Format::Json => {
             let mut v = ticket_json(&ticket);
             enrich_comment_json(&mut v, &ticket.id, &comments);
+            v["needs_review"] = json!(fired.iter().map(fired_watch_json).collect::<Vec<_>>());
             print_json(&v)
         }
         Format::Human => {
@@ -1369,6 +1587,17 @@ pub fn show(repo: &Path, fmt: Format, output: OutputOverrides, args: &ShowArgs) 
             }
             if let Some(n) = &ticket.closed_note {
                 println!("  note:     {n}");
+            }
+            if !ticket.watch.is_empty() {
+                println!("Watching:");
+                for w in &ticket.watch {
+                    println!("  when {} on {}", w.on, w.of);
+                    println!("    {}", w.reason);
+                }
+            }
+            if !fired.is_empty() {
+                println!();
+                print_needs_review(&fired, &ticket.id, None);
             }
             let body = ticket.body().trim_end();
             if !body.trim().is_empty() {
@@ -1485,7 +1714,7 @@ pub fn events(repo: &Path, fmt: Format, args: &EventsArgs) -> Result<()> {
     // Validate filters so a typo (`--type bogs`, a ghost ticket) fails loudly rather
     // than silently masking the whole stream as empty.
     if let Some(kind) = &args.kind {
-        const KNOWN: [&str; 4] = ["comment", "status", "claim", "release"];
+        const KNOWN: [&str; 5] = ["comment", "status", "claim", "release", "ack"];
         if !KNOWN.contains(&kind.as_str()) {
             return Err(Error::Invalid(format!(
                 "unknown event type `{kind}` (expected one of: {})",
@@ -1596,6 +1825,7 @@ pub fn list(repo: &Path, fmt: Format, output: OutputOverrides, args: &ListArgs) 
     // single-axis flags, so existing scripts keep working and add power on top.
     let predicate = resolve_filter(repo, args.where_.as_deref(), args.view.as_deref())?;
     let (all, warnings) = store.load_all_lenient()?;
+    let reviews = review_counts(&store, &all)?;
     let tickets: Vec<Ticket> = all
         .into_iter()
         .filter(|t| status.map_or(true, |f| t.status.eq_ignore_ascii_case(f)))
@@ -1616,6 +1846,7 @@ pub fn list(repo: &Path, fmt: Format, output: OutputOverrides, args: &ListArgs) 
                 .map(|ticket| {
                     let mut value = ticket_summary(ticket);
                     enrich_comment_json(&mut value, &ticket.id, &comments);
+                    enrich_review_json(&mut value, &ticket.id, &reviews);
                     value
                 })
                 .collect();
@@ -1638,7 +1869,12 @@ pub fn list(repo: &Path, fmt: Format, output: OutputOverrides, args: &ListArgs) 
                             t.priority.as_str(),
                             t.status.as_str(),
                             t.id,
-                            format_args!("{}{}", t.title, comment_marker(&comments, &t.id))
+                            format_args!(
+                                "{}{}{}",
+                                t.title,
+                                comment_marker(&comments, &t.id),
+                                review_marker(&t.id, &reviews)
+                            )
                         )?;
                     }
                     writeln!(out, "({} ticket(s))", tickets.len())
@@ -2448,6 +2684,7 @@ pub fn ready(repo: &Path, fmt: Format, output: OutputOverrides) -> Result<()> {
     let ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
+    let reviews = review_counts(&store, &tickets)?; // full board, not just ready
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = ready
@@ -2455,6 +2692,7 @@ pub fn ready(repo: &Path, fmt: Format, output: OutputOverrides) -> Result<()> {
                 .map(|t| {
                     let mut value = ticket_summary(t);
                     enrich_comment_json(&mut value, &t.id, &comments);
+                    enrich_review_json(&mut value, &t.id, &reviews);
                     value
                 })
                 .collect();
@@ -2472,7 +2710,12 @@ pub fn ready(repo: &Path, fmt: Format, output: OutputOverrides) -> Result<()> {
                         t.priority.as_str(),
                         t.status.as_str(),
                         t.id,
-                        format_args!("{}{}", t.title, comment_marker(&comments, &t.id))
+                        format_args!(
+                            "{}{}{}",
+                            t.title,
+                            comment_marker(&comments, &t.id),
+                            review_marker(&t.id, &reviews)
+                        )
                     )?;
                 }
                 Ok(())
@@ -2539,6 +2782,7 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
     let ids: Vec<String> = batches.iter().flatten().map(|t| t.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
+    let reviews = review_counts(&store, &tickets)?;
     match fmt {
         Format::Json => {
             let (claim_overlaps, stale_claims) = claim_context_json(&context);
@@ -2550,6 +2794,7 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
                             .map(|t| {
                                 let mut value = ticket_summary(t);
                                 enrich_comment_json(&mut value, &t.id, &comments);
+                                enrich_review_json(&mut value, &t.id, &reviews);
                                 value
                             })
                             .collect(),
@@ -2572,7 +2817,14 @@ pub fn tracks(repo: &Path, fmt: Format, output: OutputOverrides, args: &TracksAr
             for (i, batch) in batches.iter().enumerate() {
                 let ids: Vec<String> = batch
                     .iter()
-                    .map(|t| format!("{}{}", t.id, comment_marker(&comments, &t.id)))
+                    .map(|t| {
+                        format!(
+                            "{}{}{}",
+                            t.id,
+                            comment_marker(&comments, &t.id),
+                            review_marker(&t.id, &reviews)
+                        )
+                    })
                     .collect();
                 println!("batch {}: {}", i + 1, ids.join(", "));
             }
@@ -2622,6 +2874,7 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
     let ids: Vec<String> = plan.lanes.iter().flatten().map(|t| t.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
+    let reviews = review_counts(&store, &tickets)?;
     match fmt {
         Format::Json => {
             let (claim_overlaps, stale_claims) = claim_context_json(&context);
@@ -2634,6 +2887,7 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
                             .map(|t| {
                                 let mut value = ticket_summary(t);
                                 enrich_comment_json(&mut value, &t.id, &comments);
+                                enrich_review_json(&mut value, &t.id, &reviews);
                                 value
                             })
                             .collect(),
@@ -2656,7 +2910,14 @@ pub fn lanes(repo: &Path, fmt: Format, output: OutputOverrides, args: &LanesArgs
             for (i, lane) in plan.lanes.iter().enumerate() {
                 let ids: Vec<String> = lane
                     .iter()
-                    .map(|t| format!("{}{}", t.id, comment_marker(&comments, &t.id)))
+                    .map(|t| {
+                        format!(
+                            "{}{}{}",
+                            t.id,
+                            comment_marker(&comments, &t.id),
+                            review_marker(&t.id, &reviews)
+                        )
+                    })
                     .collect();
                 println!("lane {}: {}", i + 1, ids.join(" -> "));
             }
@@ -2831,8 +3092,11 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
         for p in &picks {
             match claim_core::claim(&store, &p.ticket.id, agent, args.ttl, false) {
                 Ok(outcome) => {
+                    let ticket = store.load(&outcome.id)?;
+                    let board = store.load_all_lenient()?.0;
+                    let fired = load_fired(&store, &ticket, &board)?;
                     emit_claim_event(&store, &outcome);
-                    return print_claim(fmt, &outcome);
+                    return print_claim(fmt, &outcome, &fired);
                 }
                 // Raced away or became unclaimable — try the next pick.
                 Err(Error::Conflict(_)) => continue,
@@ -2859,6 +3123,7 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
     let ids: Vec<String> = picks.iter().map(|p| p.ticket.id.clone()).collect();
     let (comment_mode, query) = comment_policy(&store, output, CommentContext::Collection, "tkt/");
     let comments = load_comments(&store, &ids, comment_mode, &query)?;
+    let reviews = review_counts(&store, &tickets)?;
 
     match fmt {
         Format::Json => {
@@ -2868,6 +3133,7 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                 .map(|p| {
                     let mut v = ticket_summary(p.ticket);
                     enrich_comment_json(&mut v, &p.ticket.id, &comments);
+                    enrich_review_json(&mut v, &p.ticket.id, &reviews);
                     v["score"] = json!(p.score);
                     v["conflicts_with"] = json!(p
                         .conflicts_with
@@ -2909,7 +3175,11 @@ pub fn next(repo: &Path, fmt: Format, output: OutputOverrides, args: &NextArgs) 
                     p.ticket.id,
                     p.score,
                     p.ticket.title,
-                    comment_marker(&comments, &p.ticket.id)
+                    format_args!(
+                        "{}{}",
+                        comment_marker(&comments, &p.ticket.id),
+                        review_marker(&p.ticket.id, &reviews)
+                    )
                 );
                 for c in &p.conflicts_with {
                     let reason = if c.scopes.is_empty() && c.related {
@@ -3718,8 +3988,73 @@ pub fn why(repo: &Path, fmt: Format, args: &WhyArgs) -> Result<()> {
 pub fn claim(repo: &Path, fmt: Format, args: &ClaimArgs) -> Result<()> {
     let store = Store::open(repo)?;
     let outcome = claim_core::claim(&store, &args.id, &args.agent, args.ttl, args.force)?;
+    let ticket = store.load(&outcome.id)?;
+    let board = store.load_all_lenient()?.0;
+    let fired = load_fired(&store, &ticket, &board)?;
     emit_claim_event(&store, &outcome);
-    print_claim(fmt, &outcome)
+    print_claim(fmt, &outcome, &fired)
+}
+
+/// `ack` — record that fired watches have been reviewed.
+pub fn ack(repo: &Path, fmt: Format, args: &AckArgs) -> Result<()> {
+    let store = Store::open(repo)?;
+    let ticket = store.load(&args.id)?;
+    let board = store.load_all_lenient()?.0;
+    let fired = load_fired(&store, &ticket, &board)?;
+    let receipts = store.acks(&args.id)?;
+    let scope = match &args.ticket {
+        Some(id) => AckScope::Subject(id.clone()),
+        None => AckScope::All,
+    };
+    let plan = AckPlan::new(&fired, &receipts, &scope, &spec_hash(&ticket));
+    if plan.caught_up {
+        return emit_ack(fmt, args, false, &plan);
+    }
+    let receipt = watch::Ack::new(AckSpec {
+        by: args.agent.clone(),
+        against: plan.against.clone(),
+        hash: plan.stored_hash.clone(),
+        scope,
+        note: args.note.clone().unwrap_or_default(),
+    });
+    store.add_ack(&args.id, &receipt)?;
+    let _ = store.emit_event(
+        "ack",
+        &args.id,
+        Some(&args.agent),
+        json!({ "against": plan.against, "tickets": plan.tickets, "hash": plan.current_hash }),
+    );
+    emit_ack(fmt, args, true, &plan)
+}
+
+fn emit_ack(fmt: Format, args: &AckArgs, acked: bool, plan: &AckPlan) -> Result<()> {
+    match fmt {
+        Format::Json => {
+            let tickets = if acked {
+                plan.tickets.clone()
+            } else {
+                Vec::new()
+            };
+            print_json(&json!({
+                "schema_version": 1,
+                "id": args.id,
+                "acked": acked,
+                "by": args.agent,
+                "against": plan.against,
+                "hash": plan.current_hash,
+                "tickets": tickets,
+            }))
+        }
+        Format::Human => {
+            let state = if acked {
+                "caught up"
+            } else {
+                "already caught up"
+            };
+            println!("Acked `{}` ({state})", args.id);
+            Ok(())
+        }
+    }
 }
 
 /// Emit the `claim` doorbell event, unless this was the holder renewing their own
@@ -3737,7 +4072,11 @@ fn emit_claim_event(store: &Store, outcome: &claim_core::ClaimOutcome) {
 }
 
 /// Render a claim outcome (shared by `claim` and `next --claim`).
-fn print_claim(fmt: Format, outcome: &claim_core::ClaimOutcome) -> Result<()> {
+fn print_claim(
+    fmt: Format,
+    outcome: &claim_core::ClaimOutcome,
+    fired: &[FiredWatch],
+) -> Result<()> {
     match fmt {
         Format::Json => print_json(&json!({
             "schema_version": 1,
@@ -3747,6 +4086,8 @@ fn print_claim(fmt: Format, outcome: &claim_core::ClaimOutcome) -> Result<()> {
             "stolen": outcome.stolen,
             "renewed": outcome.renewed,
             "default_shared_scopes_added": outcome.default_shared_scopes_added,
+            "default_watch_added": outcome.default_watch_added,
+            "needs_review": fired.iter().map(fired_watch_json).collect::<Vec<_>>(),
         })),
         Format::Human => {
             let note = if outcome.stolen {
@@ -3762,6 +4103,13 @@ fn print_claim(fmt: Format, outcome: &claim_core::ClaimOutcome) -> Result<()> {
                     "  applied default shared scopes: {}",
                     outcome.default_shared_scopes_added.join(", ")
                 );
+            }
+            if outcome.default_watch_added {
+                println!("  applied default watches");
+            }
+            if !fired.is_empty() {
+                println!();
+                print_needs_review(fired, &outcome.id, Some(&outcome.assignee));
             }
             Ok(())
         }
@@ -3986,6 +4334,11 @@ pub fn delete(repo: &Path, fmt: Format, args: &DeleteArgs) -> Result<()> {
         plan.mutations
             .push(PendingMutation::DeletePath { path: comments });
     }
+    let acks = store.acks_dir(&args.id);
+    if acks.exists() {
+        plan.mutations
+            .push(PendingMutation::DeletePath { path: acks });
+    }
     store.commit(&plan)?;
     match fmt {
         Format::Json => print_json(&json!({ "schema_version": 1, "id": args.id, "deleted": true })),
@@ -4012,6 +4365,13 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
         )));
     }
     ticket.set_id(&args.new)?;
+    let self_watch = ticket.watch.clone();
+    for w in &self_watch {
+        if w.of.as_ticket() == Some(args.old.as_str()) {
+            ticket.remove_watch(&w.on, &w.of)?;
+            ticket.add_watch(Watch::new(&w.on, WatchOf::parse(&args.new), &w.reason))?;
+        }
+    }
     let new_contents = ticket.render();
 
     // Repoint every ticket that referenced the old id — dependency *and* related
@@ -4032,6 +4392,14 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
             t.remove_related(&args.old)?;
             t.add_related(&args.new)?;
             changed = true;
+        }
+        let old_watch = t.watch.clone();
+        for w in &old_watch {
+            if w.of.as_ticket() == Some(args.old.as_str()) {
+                t.remove_watch(&w.on, &w.of)?;
+                t.add_watch(Watch::new(&w.on, WatchOf::parse(&args.new), &w.reason))?;
+                changed = true;
+            }
         }
         if changed {
             upserts.push((t.id.clone(), t.render()));
@@ -4062,6 +4430,13 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
         plan.mutations.push(PendingMutation::RenameDir {
             from: old_comments,
             to: store.comments_dir(&args.new),
+        });
+    }
+    let old_acks = store.acks_dir(&args.old);
+    if old_acks.exists() {
+        plan.mutations.push(PendingMutation::RenameDir {
+            from: old_acks,
+            to: store.acks_dir(&args.new),
         });
     }
     // 4. Delete the old ticket file last.
@@ -4336,6 +4711,11 @@ guard <branch> — diffs the branch against a base, maps changed files to scopes
 claim/release/claims — a git-ref lock + frontmatter lease let many agents claim
            tickets race-free. `claims` shows who holds what.
 
+watches + ack — a ticket may declare frontmatter `watch` entries (`on`/`of`/`reason`).
+           When a matching event fires, `claim`/`show` list it under needs review
+           (exit 0). Drain it with `show` + `set`/`close`/`ack --as` before coding.
+           Unrelated to `tkt watch <id> --until` (poll until a status).
+
 Exit codes: 0 ok · 3 invalid · 4 not-found · 5 cycle · 6 conflict · 7 timeout.
 JSON: every command supports --format json with schema_version: 1.
 
@@ -4436,6 +4816,9 @@ fn ticket_summary(ticket: &Ticket) -> Value {
         "dependencies": ticket.dependencies,
         "related": ticket.related,
         "tags": ticket.tags,
+        "watch": ticket.watch.iter().map(|w| json!({
+            "on": w.on, "of": w.of, "reason": w.reason,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -4549,5 +4932,8 @@ fn ticket_json(ticket: &Ticket) -> Value {
         "lease_expires_at": ticket.lease_expires_at,
         "closed_reason": ticket.closed_reason.map(|r| r.as_str()),
         "closed_note": ticket.closed_note,
+        "watch": ticket.watch.iter().map(|w| json!({
+            "on": w.on, "of": w.of, "reason": w.reason,
+        })).collect::<Vec<_>>(),
     })
 }

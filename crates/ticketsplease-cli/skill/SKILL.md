@@ -25,7 +25,7 @@ ticketsplease helps agents reason about the parallel-work failure mode in two pl
   | 4 | ticket not found |
   | 5 | dependency cycle |
   | 6 | **conflict** — guard found a scope escape (under-declaration), or a declared-area overlap when overlaps are gated (`--strict` / `[guard] gate_collisions`); also a lost claim race, a held-claim release, or a `why` conflict. By default a plain overlap is a non-failing **WARN** (exit 0), not a 6. |
-  | 7 | **timeout** — `watch` / `events --watch` gave up after `--timeout` seconds. |
+  | 7 | **timeout** — `tkt watch <id> --until` / `events --watch` gave up after `--timeout` seconds. |
 
 - Output is deterministic (sorted, no timestamps) — safe to diff and cache.
 - Every command accepts `--repo <path>` (default the current directory). Operations are fully offline and atomic.
@@ -44,7 +44,7 @@ After upgrading the binary, the installer refreshes the canonical skill; if `doc
 
 **Maintenance advisories are human-only — you will never see them.** In an interactive human session the CLI may print a stderr hint after a command (an update is available, the repo drifted → `migrate`, the board has lint findings). They are gated off for every non-interactive caller — `--format json`, no TTY, or `CI` set — so they never touch your stdout or the JSON contract, and `TICKETSPLEASE_NO_ADVISORIES=1` disables them entirely. Config + opt-in auto-repair (`[maintenance]`, `--auto-doctor`): `references/commands.md` → `maintenance advisories`.
 
-Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For additive areas every worker edits, `[defaults] shared_scopes = ["project/tickets"]` makes `create` declare them and `claim` backfill older tickets; an explicit exclusive claim wins. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
+Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas of the codebase. For additive areas every worker edits, `[defaults] shared_scopes = ["project/tickets"]` makes `create` declare them and `claim` backfill older tickets; an explicit exclusive claim wins. Optional `[defaults].watch` is written the same way; `watch: []` or `create --no-watch` opts out. For a Rust repo, set `[language] backend = "rust"` and map `[scope_crates]` (scope → crate) so the guard can expand reverse-dependents. Use `[external_scopes]` (name → `{ repo, paths }`) to name a forked dependency pinned via `git = … rev = …` so the guard flags a branch that bumps its pin.
 
 ## The orchestration loop (dispatching parallel work)
 
@@ -58,7 +58,7 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
    ```sh
    ticketsplease claim <id> --as <worker-id> --format json   # exit 6 → already claimed, pick another
    ```
-   The claim is race-safe and lease-backed (exactly one of N racers wins; the rest get exit 6; a crashed worker's ticket becomes reclaimable), refuses a ticket whose dependencies aren't all done, and flips it to in-progress. Read `default_shared_scopes_added` to see whether repository defaults expanded the ticket's additive declarations. On a clean claim, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside its declared scope. `next --claim --as <worker>` collapses recommend-then-claim into one atomic call; `claims` shows who holds what; `claim --force` steals a live lease.
+   The claim is race-safe and lease-backed (exactly one of N racers wins; the rest get exit 6; a crashed worker's ticket becomes reclaimable), refuses a ticket whose dependencies aren't all done, and flips it to in-progress. Read `default_shared_scopes_added` to see whether repository defaults expanded the ticket's additive declarations. If `needs_review` is a non-empty array, **do not start implementing**: for each item read `reason` and `ticketsplease show <item.ticket> --format json`, then either rewrite this ticket (`set` / `close`) or record that it still holds (`ticketsplease ack <id> --as <worker-id>`). tkt never interprets `reason` and never runs an action from a watch. On a clean claim with empty `needs_review`, branch with the ticket id in the name (e.g. `tkt/<id>`) and work only inside its declared scope. `next --claim --as <worker>` collapses recommend-then-claim into one atomic call; `claims` shows who holds what; `claim --force` steals a live lease.
 
 3. **Before merging, guard the branch:**
    ```sh
@@ -71,7 +71,7 @@ Then edit `ticketsplease.toml`: define `[scopes]` (name → globs) for the areas
 
 5. **Observe and coordinate in flight.** Workers advance status and leave notes on their own `tkt/<id>` branches; from `main` you watch the shared activity log without a checkout:
    ```sh
-   ticketsplease events --watch --since <cursor> --format json   # wake on the next status/claim/comment, across all tickets
+   ticketsplease events --watch --since <cursor> --format json   # wake on the next status/claim/comment/ack/release, across all tickets
    ticketsplease comment add <id> --as <worker> --body-file -     # leave a durable note (e.g. a blocked-reason)
    ```
    Events are `.git` refs, so they're visible the instant they're written — no commit needed — and `comment add` rings the same doorbell. Comments are append-only files (one per comment), conflict-free under concurrent authors. `tkt show <id>` folds in the worktree plus matching `tkt/<id>` thread by default; collection JSON carries `comment_count`, so always inspect it before dispatch/review. Use `--comment-source` or exact `--ref` when provenance matters. See `references/parallel-workflow.md` for the full observe/coordinate loop.
@@ -113,6 +113,8 @@ ticketsplease create --title "Add vector index" --priority p1 \
   --scope query/planner --shared-scope changelog --depends-on build-index-trait --related design-doc --template default
 ticketsplease create --from backlog.toml    # batch from JSON/TOML (- = stdin); transactional (no partial creates); dry-run shows final ids
 ticketsplease set <id> --status in-progress --add-scope core --add-dependency other
+ticketsplease set <id> --add-watch done:dependencies --watch-reason "Assumes the dep's API; rewrite if it moved"
+ticketsplease ack <id> --as <worker-id>     # caught up on fired watches; do not pass event ids
 # additive aliases: --scope/--scopes, --shared-scope/--shared-scopes, --tag/--tags, --related
 # changing a scope's mode is explicit: add the new mode and remove the old one
 ticketsplease set --where 'tag:epic' --add-tag ready-soon   # bulk-edit every match (field edits only, not title/body)

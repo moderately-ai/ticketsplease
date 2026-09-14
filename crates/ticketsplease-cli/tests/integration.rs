@@ -6465,3 +6465,378 @@ fn auto_migrate_applies_only_in_interactive_context() {
         "[maintenance] auto_migrate = true applies the backfill"
     );
 }
+
+/// A depends on nothing; B depends on A; C depends on A and B and watches
+/// `done` on dependencies. Completing A fires review; ack clears it; completing
+/// B (a model shift) fires again on claim.
+#[test]
+fn watch_abc_needs_review_and_ack() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    git_init_commit(repo);
+
+    tkt(repo)
+        .args(["create", "--id", "deployment-record", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "github-adapter",
+            "--title",
+            "B",
+            "--depends-on",
+            "deployment-record",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "slack-notify",
+            "--title",
+            "C",
+            "--depends-on",
+            "deployment-record,github-adapter",
+            "--add-watch",
+            "done:dependencies",
+            "--watch-reason",
+            "Assumes a deployment is identified by SHA. If that identity changes, rewrite before implementing.",
+        ])
+        .assert()
+        .success();
+
+    let show = tkt(repo)
+        .args(["show", "slack-notify", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(v["watch"][0]["on"], "done");
+    assert_eq!(v["watch"][0]["of"], "dependencies");
+    assert!(v["needs_review"].as_array().unwrap().is_empty());
+
+    tkt(repo)
+        .args(["set", "deployment-record", "--status", "done"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "slack-notify", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    let review = v["needs_review"].as_array().unwrap();
+    assert_eq!(review.len(), 1, "{v}");
+    assert_eq!(review[0]["ticket"], "deployment-record");
+    assert!(review[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("identified by SHA"));
+    assert_eq!(ready_ids(repo), vec!["github-adapter"]);
+
+    tkt(repo)
+        .args(["ack", "slack-notify", "--as", "ren"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "slack-notify", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert!(
+        v["needs_review"].as_array().unwrap().is_empty(),
+        "acked A; B has not finished: {v}"
+    );
+
+    tkt(repo)
+        .args(["set", "github-adapter", "--status", "done"])
+        .assert()
+        .success();
+    assert_eq!(ready_ids(repo), vec!["slack-notify"]);
+
+    let claim = tkt(repo)
+        .args(["claim", "slack-notify", "--as", "ren", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        claim.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&claim.stdout).unwrap();
+    let review = v["needs_review"].as_array().unwrap();
+    assert_eq!(review.len(), 1, "{v}");
+    assert_eq!(review[0]["ticket"], "github-adapter");
+    assert!(review[0].get("event").is_some());
+
+    tkt(repo)
+        .args([
+            "set",
+            "slack-notify",
+            "--body",
+            "one message per check_run_id",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["ack", "slack-notify", "--as", "ren"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "slack-notify", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert!(
+        v["needs_review"].as_array().unwrap().is_empty(),
+        "rewritten and acked: {v}"
+    );
+
+    tkt(repo)
+        .args(["set", "slack-notify", "--body", "changed again"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "slack-notify", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    let review = v["needs_review"].as_array().unwrap();
+    assert_eq!(review.len(), 1, "hash change retriggers: {v}");
+    assert!(review[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("changed since last ack"));
+}
+
+#[test]
+fn watch_rejects_bad_on_empty_reason_and_requires_as() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "b",
+            "--title",
+            "B",
+            "--add-watch",
+            "nope:dependencies",
+            "--watch-reason",
+            "x",
+        ])
+        .assert()
+        .code(3);
+    tkt(repo)
+        .args([
+            "set",
+            "a",
+            "--add-watch",
+            "done:dependencies",
+            "--watch-reason",
+            "",
+        ])
+        .assert()
+        .code(3);
+    tkt(repo).args(["ack", "a"]).assert().failure();
+}
+
+#[test]
+fn watch_defaults_backfill_on_claim_and_empty_opts_out() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    git_init_commit(repo);
+    let cfg = repo.join("ticketsplease.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(
+        "\n[[defaults.watch]]\non = \"done\"\nof = \"dependencies\"\nreason = \"Re-read if a dependency changed what this assumed.\"\n",
+    );
+    std::fs::write(&cfg, s).unwrap();
+
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B", "--depends-on", "a"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "c", "--title", "C", "--no-watch"])
+        .assert()
+        .success();
+
+    let show = tkt(repo)
+        .args(["show", "b", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(v["watch"][0]["on"], "done");
+
+    let show = tkt(repo)
+        .args(["show", "c", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(v["watch"].as_array().unwrap().len(), 0);
+
+    // An older ticket with no `watch` key at all (create would have written defaults).
+    std::fs::write(
+        repo.join("tickets/legacy.md"),
+        "---\nid: legacy\ntitle: Legacy\nstatus: todo\npriority: p2\ndependencies: []\nrelated: []\nscopes: []\nshared_scopes: []\npaths: []\ntags: []\n---\n",
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["claim", "legacy", "--as", "w"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "legacy", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(v["watch"][0]["of"], "dependencies");
+}
+
+#[test]
+fn ack_without_as_is_usage() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo).args(["ack", "a"]).assert().code(2);
+}
+
+#[test]
+fn create_no_validate_still_rejects_unknown_watch_on() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "x",
+            "--title",
+            "X",
+            "--add-watch",
+            "nope:self",
+            "--watch-reason",
+            "x",
+            "--no-validate",
+        ])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn no_watch_writes_empty_key_and_claim_does_not_backfill() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    git_init_commit(repo);
+    let cfg = repo.join("ticketsplease.toml");
+    let mut s = std::fs::read_to_string(&cfg).unwrap();
+    s.push_str(
+        "\n[[defaults.watch]]\non = \"done\"\nof = \"dependencies\"\nreason = \"Re-read.\"\n",
+    );
+    std::fs::write(&cfg, s).unwrap();
+    tkt(repo)
+        .args(["create", "--id", "c", "--title", "C", "--no-watch"])
+        .assert()
+        .success();
+    let raw = std::fs::read_to_string(repo.join("tickets/c.md")).unwrap();
+    assert!(
+        raw.contains("watch: []"),
+        "opt-out must write the key: {raw}"
+    );
+    tkt(repo)
+        .args(["claim", "c", "--as", "w", "--format", "json"])
+        .assert()
+        .success();
+    let raw = std::fs::read_to_string(repo.join("tickets/c.md")).unwrap();
+    assert!(
+        raw.contains("watch: []"),
+        "claim must not backfill opt-out: {raw}"
+    );
+}
+
+#[test]
+fn scoped_ack_leaves_other_dependency_fire() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    git_init_commit(repo);
+    tkt(repo)
+        .args(["create", "--id", "a", "--title", "A"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["create", "--id", "b", "--title", "B"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args([
+            "create",
+            "--id",
+            "c",
+            "--title",
+            "C",
+            "--depends-on",
+            "a,b",
+            "--add-watch",
+            "done:dependencies",
+            "--watch-reason",
+            "Assumes both land as filed.",
+        ])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "a", "--status", "done"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["set", "b", "--status", "done"])
+        .assert()
+        .success();
+    tkt(repo)
+        .args(["ack", "c", "--as", "ren", "--ticket", "b"])
+        .assert()
+        .success();
+    let show = tkt(repo)
+        .args(["show", "c", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    let review = v["needs_review"].as_array().unwrap();
+    assert_eq!(review.len(), 1, "{v}");
+    assert_eq!(review[0]["ticket"], "a");
+}
+
+#[test]
+fn batch_create_rejects_invalid_watch() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    let manifest = repo.join("batch.json");
+    std::fs::write(
+        &manifest,
+        r#"[{"id":"x","title":"X","watch":[{"on":"nope","of":"self","reason":"x"}]}]"#,
+    )
+    .unwrap();
+    tkt(repo)
+        .args(["create", "--from", manifest.to_str().unwrap()])
+        .assert()
+        .code(3);
+}

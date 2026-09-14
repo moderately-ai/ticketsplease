@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::states::{StateDef, StateRegistry};
+use crate::ticket::Watch;
 
 /// Config file name, located at the repository root.
 pub const CONFIG_FILE: &str = "ticketsplease.toml";
@@ -94,6 +95,10 @@ pub struct Defaults {
     /// Shared/additive scopes merged into new and newly-claimed tickets.
     #[serde(default)]
     pub shared_scopes: Vec<String>,
+    /// Watches written into new tickets (and claimed tickets missing a `watch` key).
+    /// Explicit `watch: []` is opt-out and is not backfilled.
+    #[serde(default)]
+    pub watch: Vec<Watch>,
 }
 
 impl Config {
@@ -137,6 +142,17 @@ impl Config {
             }
         }
         additions
+    }
+
+    /// Default watches to write when the ticket has no `watch` key. `None` if the
+    /// key is already present (including `watch: []`) or no defaults are configured.
+    #[must_use]
+    pub fn default_watch_backfill(&self, has_watch_key: bool) -> Option<Vec<Watch>> {
+        if has_watch_key || self.defaults.watch.is_empty() {
+            None
+        } else {
+            Some(self.defaults.watch.clone())
+        }
     }
 
     /// The effective workflow state registry: the built-in default states when the repo

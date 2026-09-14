@@ -317,6 +317,48 @@ impl Document {
         self.fm = out;
         Ok(true)
     }
+
+    /// Replace a list-of-maps key (`watch:`) as one span. Empty writes `key: []`.
+    /// Surrounding keys, comments, and the body stay byte-for-byte intact.
+    pub fn set_map_list(&mut self, key: &str, entries: &[Vec<(String, String)>]) -> Result<()> {
+        let ending = self.default_ending();
+        let rendered = render_map_list(key, entries, ending);
+        let lines: Vec<&str> = self.fm.split_inclusive('\n').collect();
+        let Some(key_idx) = lines.iter().position(|l| is_key_line(l, key)) else {
+            let mut out = self.fm.clone();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push_str(ending);
+            }
+            out.push_str(&rendered);
+            self.fm = out;
+            return Ok(());
+        };
+        let after = value_after_key(lines[key_idx], key);
+        if !after.is_empty() && !after.starts_with('[') {
+            return Err(Error::Invalid(format!(
+                "cannot edit `{key}`: unsupported YAML node; edit manually"
+            )));
+        }
+        if after.starts_with('[') && !after.ends_with(']') {
+            return Err(Error::Invalid(format!(
+                "cannot edit `{key}`: multi-line flow sequences are unsupported; edit manually"
+            )));
+        }
+        let mut span_end = key_idx + 1;
+        if after.is_empty() {
+            span_end = map_list_span_end(&lines, key_idx);
+        }
+        let mut out = String::with_capacity(self.fm.len() + rendered.len());
+        for l in &lines[..key_idx] {
+            out.push_str(l);
+        }
+        out.push_str(&rendered);
+        for l in &lines[span_end..] {
+            out.push_str(l);
+        }
+        self.fm = out;
+        Ok(())
+    }
 }
 
 /// Render a scalar value for direct frontmatter templating (quotes when needed).
@@ -339,6 +381,73 @@ pub fn render_inline_list(items: &[String]) -> String {
 enum ListStyle {
     Inline,
     Block { indent: String },
+}
+
+/// End index (exclusive) of a block list-of-maps starting at `key_idx`.
+/// Consumes `- ` items, more-indented fields, and blank lines that still sit
+/// between items. Stops before unindented keys and same-indent non-item lines
+/// (comments/keys after the list).
+fn map_list_span_end(lines: &[&str], key_idx: usize) -> usize {
+    let mut end = key_idx + 1;
+    let mut item_indent: Option<usize> = None;
+    while end < lines.len() {
+        let raw = lines[end];
+        if raw.trim().is_empty() {
+            let next = lines[end + 1..].iter().find(|l| !l.trim().is_empty());
+            match (item_indent, next) {
+                (Some(ind), Some(n))
+                    if indent_width(n) >= ind && n.trim_start().starts_with("- ") =>
+                {
+                    end += 1;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+        let indent = indent_width(raw);
+        let trimmed = raw.trim_start();
+        if indent == 0 {
+            break;
+        }
+        if trimmed.starts_with("- ") {
+            item_indent = Some(indent);
+            end += 1;
+            continue;
+        }
+        if item_indent.is_some_and(|ind| indent > ind) {
+            end += 1;
+            continue;
+        }
+        break;
+    }
+    end
+}
+
+fn indent_width(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+}
+
+fn render_map_list(key: &str, entries: &[Vec<(String, String)>], ending: &str) -> String {
+    if entries.is_empty() {
+        return format!("{key}: []{ending}");
+    }
+    let mut s = format!("{key}:{ending}");
+    for entry in entries {
+        let mut first = true;
+        for (k, v) in entry {
+            if first {
+                s.push_str("  - ");
+                first = false;
+            } else {
+                s.push_str("    ");
+            }
+            s.push_str(k);
+            s.push_str(": ");
+            s.push_str(&render_yaml_scalar(v));
+            s.push_str(ending);
+        }
+    }
+    s
 }
 
 fn render_list(key: &str, items: &[String], style: &ListStyle, ending: &str) -> String {
@@ -607,5 +716,55 @@ mod tests {
         let raw = "---\nid: x\ntitle: |\n  multi\n  line\n---\nbody\n";
         let mut doc = Document::parse(raw).unwrap();
         assert!(doc.set_scalar("title", "new").is_err());
+    }
+
+    #[test]
+    fn set_map_list_appends_and_preserves_custom_keys() {
+        let mut doc = Document::parse(SAMPLE).unwrap();
+        doc.set_map_list(
+            "watch",
+            &[vec![
+                ("on".into(), "done".into()),
+                ("of".into(), "dependencies".into()),
+                ("reason".into(), "Assumes SHA identity".into()),
+            ]],
+        )
+        .unwrap();
+        let out = doc.render();
+        assert!(out.contains(
+            "watch:\n  - on: done\n    of: dependencies\n    reason: Assumes SHA identity\n"
+        ));
+        assert!(out.contains("custom: keep me\n"));
+        assert!(out.contains("# Body\n\nText here.\n"));
+    }
+
+    #[test]
+    fn set_map_list_replaces_span_and_empty_collapses() {
+        let raw = "---\nid: x\ntitle: T\nwatch:\n  - on: done\n    of: dependencies\n    reason: old\ncustom: keep\n---\nbody\n";
+        let mut doc = Document::parse(raw).unwrap();
+        doc.set_map_list("watch", &[]).unwrap();
+        let out = doc.render();
+        assert!(out.contains("watch: []\n"));
+        assert!(out.contains("custom: keep\n"));
+        assert!(!out.contains("reason: old"));
+    }
+
+    #[test]
+    fn set_map_list_keeps_blank_separated_items_and_following_comment() {
+        let raw = "---\nid: x\ntitle: T\nwatch:\n  - on: done\n    of: dependencies\n    reason: a\n\n  - on: closed\n    of: related\n    reason: b\n  # keep\ncustom: keep\n---\nbody\n";
+        let mut doc = Document::parse(raw).unwrap();
+        doc.set_map_list(
+            "watch",
+            &[vec![
+                ("on".into(), "done".into()),
+                ("of".into(), "dependencies".into()),
+                ("reason".into(), "a".into()),
+            ]],
+        )
+        .unwrap();
+        let out = doc.render();
+        assert!(out.contains("custom: keep\n"));
+        assert!(out.contains("# keep"));
+        assert!(!out.contains("of: related"));
     }
 }

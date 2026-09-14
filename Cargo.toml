@@ -29,6 +29,7 @@ globset = "0.4"
 guppy = "0.17"
 include_dir = "0.7"
 rayon = "1"
+sha2 = "0.10"
 
 # Disk hygiene: line-tables-only debug info + opt-level=1 deps for fast iteration.
 [profile.dev]

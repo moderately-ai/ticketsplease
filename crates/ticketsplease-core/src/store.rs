@@ -18,6 +18,7 @@ use crate::event::Event;
 use crate::ids;
 use crate::states::StateRegistry;
 use crate::ticket::Ticket;
+use crate::watch::Ack;
 
 /// A repository handle: the root directory plus its loaded config.
 pub struct Store {
@@ -314,6 +315,12 @@ impl Store {
         self.tickets_dir().join(format!("{id}.comments"))
     }
 
+    /// Directory holding a ticket's ack receipts.
+    #[must_use]
+    pub fn acks_dir(&self, id: &str) -> PathBuf {
+        self.tickets_dir().join(format!("{id}.acks"))
+    }
+
     /// Append a comment to a ticket — one file per comment, so concurrent authors
     /// never collide. The ticket must exist. Returns the created comment.
     pub fn add_comment(
@@ -374,6 +381,45 @@ impl Store {
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    /// All ack receipts on a ticket, sorted by id.
+    pub fn acks(&self, ticket_id: &str) -> Result<Vec<Ack>> {
+        let dir = self.acks_dir(ticket_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)
+            .map_err(|e| Error::Invalid(format!("cannot read {}: {e}", dir.display())))?
+        {
+            let path = entry.map_err(Error::Io)?.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                let raw = fs::read_to_string(&path).map_err(Error::Io)?;
+                out.push(
+                    Ack::parse(&raw)
+                        .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?,
+                );
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    /// Append an ack receipt. The ticket must exist.
+    pub fn add_ack(&self, ticket_id: &str, ack: &Ack) -> Result<()> {
+        if !self.path_for(ticket_id).exists() {
+            return Err(Error::NotFound(ticket_id.to_string()));
+        }
+        let id = &ack.id;
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            return Err(Error::Invalid(format!("unsafe ack id `{id}`")));
+        }
+        let dir = self.acks_dir(ticket_id);
+        fs::create_dir_all(&dir).map_err(Error::Io)?;
+        let path = dir.join(format!("{}.md", ack.id));
+        create_exclusive(&path, &ack.render())?;
+        Ok(())
     }
 
     /// Comments on a ticket as committed on a git ref (cross-branch read) — lists
@@ -1084,6 +1130,9 @@ pub fn default_config_template(tickets_dir: &str) -> String {
          # Defaults are written into ticket frontmatter; explicit exclusive scopes win.\n\
          [defaults]\n\
          # shared_scopes = [\"project/tickets\"]\n\
+         # Written into new tickets (and claimed tickets missing a watch key).\n\
+         # Explicit watch = [] opts out.\n\
+         # watch = [{{ on = \"done\", of = \"dependencies\", reason = \"Re-read if a dependency changed what this assumed.\" }}]\n\
          \n\
          [output]\n\
          # Detail commands show full threads; collections show counts. Comment reads\n\

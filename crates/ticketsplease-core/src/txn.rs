@@ -603,6 +603,7 @@ mod tests {
             tags: vec![],
             body: format!("body for {}\n", title),
             template: None,
+            watch: None,
         }
     }
 

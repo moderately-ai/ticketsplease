@@ -1,7 +1,7 @@
 //! Schema-level linting of tickets. Link validation and cycle detection live in
 //! the scheduling layer (milestone M3) and reuse these diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -23,7 +23,9 @@ pub struct Diagnostic {
     /// `scope-mode-conflict` |
     /// `paths-without-scopes` | `duplicate-id` | `unknown-state` | `state-coverage` |
     /// `unknown-transition-state` | `dead-end-nonterminal` | `stale-resolution` |
-    /// `missing-dep` | `missing-related` | `orphaned-by-closed-dep` | `cycle`.
+    /// `missing-dep` | `missing-related` | `orphaned-by-closed-dep` | `cycle` |
+    /// `unknown-watch-on` | `empty-watch-reason` | `duplicate-watch` |
+    /// `missing-watch-target` | `watch-self-terminal` | `invalid-watch-of`.
     pub code: &'static str,
     /// Human-readable message.
     pub message: String,
@@ -120,6 +122,31 @@ pub fn lint_with_tickets(store: &Store) -> Result<(Vec<Diagnostic>, Vec<Ticket>)
                     ),
                 });
             }
+        }
+    }
+    let default_check = crate::watch::WatchCheck {
+        registry: &registry,
+        refs: crate::watch::RefCheck::Skip,
+    };
+    if let Some(dup) = crate::watch::duplicate_watch(&store.config.defaults.watch) {
+        diags.push(Diagnostic {
+            file: CONFIG_FILE.to_string(),
+            id: None,
+            code: "duplicate-watch",
+            message: format!(
+                "[defaults].watch has a duplicate `on: {}` `of: {}`",
+                dup.on, dup.of
+            ),
+        });
+    }
+    for w in &store.config.defaults.watch {
+        for p in crate::watch::watch_problems(w, &default_check) {
+            diags.push(Diagnostic {
+                file: CONFIG_FILE.to_string(),
+                id: None,
+                code: p.lint_code(),
+                message: format!("[defaults].watch: {}", p.message()),
+            });
         }
     }
     for path in store.ticket_files()? {
@@ -260,6 +287,35 @@ pub fn lint_with_tickets(store: &Store) -> Result<(Vec<Diagnostic>, Vec<Ticket>)
                     });
                 }
                 tickets.push(ticket);
+            }
+        }
+    }
+    let known: BTreeSet<&str> = tickets.iter().map(|t| t.id.as_str()).collect();
+    let check = crate::watch::WatchCheck {
+        registry: &registry,
+        refs: crate::watch::RefCheck::Known(&known),
+    };
+    for ticket in &tickets {
+        let file = ticket
+            .source_path()
+            .map(|p| rel(&store.repo_root, p))
+            .unwrap_or_else(|| format!("{}/{}.md", store.config.tickets_dir, ticket.id));
+        if let Some(dup) = crate::watch::duplicate_watch(&ticket.watch) {
+            diags.push(Diagnostic {
+                file: file.clone(),
+                id: Some(ticket.id.clone()),
+                code: "duplicate-watch",
+                message: format!("duplicate watch `on: {}` `of: {}`", dup.on, dup.of),
+            });
+        }
+        for w in &ticket.watch {
+            for p in crate::watch::watch_problems(w, &check) {
+                diags.push(Diagnostic {
+                    file: file.clone(),
+                    id: Some(ticket.id.clone()),
+                    code: p.lint_code(),
+                    message: p.message(),
+                });
             }
         }
     }

@@ -24,12 +24,13 @@ while there is ready work:
     front = batches[0]                       # the immediately-dispatchable disjoint set
     for ticket in front:                     # one worker per ticket, in parallel
         `ticketsplease claim <ticket.id> --as <worker> --format json`   # exit 6 → already taken, skip
+        if needs_review is non-empty: show each subject, then set/close/ack before coding
         dispatch the worker on branch tkt/<ticket.id> scoped to ticket.scopes
     wait for workers; merge each only if its guard passes (below)
     on success `ticketsplease set <id> --status done`; on abandon `ticketsplease release <id> --as <worker>`
 ```
 
-Why start with `batches[0]`? It is the tool's recommended front under declared access intent, overlap budget, and live leases. That metadata cannot prove semantic independence, so still claim atomically and use the normal build/test/guard gates. `claim_overlaps` retains candidates that overlap live, stale, or explicit work; `excluded_from_recommended_front` says only whether policy omitted the candidate, not whether dispatch is impossible.
+Why start with `batches[0]`? It is the tool's recommended front under declared access intent, overlap budget, and live leases. That metadata cannot prove semantic independence, so still claim atomically and use the normal build/test/guard gates. Completing a dependency unblocks its dependents **and** may invalidate their written assumptions: tickets can declare `watch` (`on`/`of`/`reason`) so `claim`/`show` surface `needs_review` when a matching event has not been acked. Drain that list (`show` the subject, then `set`/`close`/`ack`) before writing code. `claim_overlaps` retains candidates that overlap live, stale, or explicit work; `excluded_from_recommended_front` says only whether policy omitted the candidate, not whether dispatch is impossible.
 
 For stale leases, inspect `claims`, `reconcile`, the matching branch/worktree, or `why` before deciding whether to reclaim; stale claims already remain in the recommendation, so `--ignore-claims` is unnecessary for them alone. Use `--ignore-claims` when evidence supports co-running a candidate that a live overlap omitted: it keeps the same structured context but returns an unfiltered recommendation. Do not treat it as a routine retry after an empty front.
 
