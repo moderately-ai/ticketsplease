@@ -37,7 +37,7 @@ Locate the binary (`ticketsplease` or `tkt` on `PATH`; if neither is present, te
 ```sh
 ticketsplease init        # scaffolds tickets/ + ticketsplease.toml; links the skill into .claude/skills (a git-ignored symlink to the canonical per-user copy)
 ticketsplease guide       # the conceptual model in one screen (scopes, tracks, scoring, guard, claims)
-ticketsplease doctor      # verify setup: config, git repo + commit, scope globs, base ref, skill freshness
+ticketsplease doctor      # verify setup: config, git repo + commit, scope globs (warns per glob matching no tracked file), base ref, skill freshness
 ```
 
 After upgrading the binary, the installer refreshes the canonical skill; if `doctor` flags it as stale, run `ticketsplease skill sync` (and `ticketsplease migrate` to repair a project link). See `references/commands.md` → `skill`.

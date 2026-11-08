@@ -4565,13 +4565,22 @@ pub fn rename(repo: &Path, fmt: Format, args: &RenameArgs) -> Result<()> {
     }
 }
 
+/// Whether a failed `doctor` check fails the run. A failed advisory check only warns:
+/// a stale global skill copy has no per-repo fix, and a scope glob that matches no
+/// tracked file may name files that do not exist yet.
+fn doctor_check_gates(name: &str) -> bool {
+    !(name.starts_with("skill_") || name == "scope_coverage")
+}
+
 /// `doctor` — validate repository setup: config present, git repo with a commit,
-/// scope globs compile, and the base ref resolves. Exits non-zero on any failure.
+/// scope globs compile, and the base ref resolves. Exits non-zero on any failure of a
+/// gating check; advisory checks (see [`doctor_check_gates`]) only warn.
 pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
     let mut checks: Vec<(String, bool, String)> = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {
         checks.push((name.to_string(), ok, detail));
     };
+    let mut coverage: Option<guard::ScopeCoverageReport> = None;
 
     // Config + scope globs depend on a loadable config.
     let config = Config::load(repo);
@@ -4579,11 +4588,34 @@ pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
         Ok(cfg) => {
             check("config", true, format!("{CONFIG_FILE} loaded"));
             match guard::PathGlobMapper::new(cfg) {
-                Ok(_) => check(
-                    "scope_globs",
-                    true,
-                    format!("{} scope(s) compile", cfg.scopes.len()),
-                ),
+                Ok(mapper) => {
+                    check(
+                        "scope_globs",
+                        true,
+                        format!("{} scope(s) compile", cfg.scopes.len()),
+                    );
+                    // A glob that compiles but matches no tracked file leaves a hole in
+                    // guard's file-to-scope mapping. Outside a git repo there are no
+                    // tracked files to match, so the check is skipped.
+                    if ensure_git_repo(repo).is_ok() {
+                        match guard::tracked_files(repo) {
+                            Ok(files) => {
+                                let report = mapper.coverage(&files);
+                                for (scope, glob) in report.unmatched_globs() {
+                                    check(
+                                        "scope_coverage",
+                                        false,
+                                        format!(
+                                            "scope `{scope}` glob `{glob}` matches no tracked file"
+                                        ),
+                                    );
+                                }
+                                coverage = Some(report);
+                            }
+                            Err(e) => check("scope_coverage", false, e.message()),
+                        }
+                    }
+                }
                 Err(e) => check("scope_globs", false, e.message()),
             }
             let base = &cfg.default_base;
@@ -4681,23 +4713,38 @@ pub fn doctor(repo: &Path, fmt: Format) -> Result<()> {
         );
     }
 
-    // The skill checks are advisory — a stale/absent global skill copy is a warning to
-    // surface, not a reason to fail a repo's setup gate (it has no per-repo fix).
     let ok = checks
         .iter()
-        .filter(|(name, _, _)| !name.starts_with("skill_"))
+        .filter(|(name, _, _)| doctor_check_gates(name))
         .all(|(_, c, _)| *c);
     match fmt {
         Format::Json => {
             let rows: Vec<Value> = checks
                 .iter()
-                .map(|(name, c, detail)| json!({ "check": name, "ok": c, "detail": detail }))
+                .map(|(name, c, detail)| {
+                    json!({
+                        "check": name,
+                        "ok": c,
+                        "gating": doctor_check_gates(name),
+                        "detail": detail,
+                    })
+                })
                 .collect();
-            print_json(&json!({ "schema_version": 1, "ok": ok, "checks": rows }))?;
+            print_json(&json!({
+                "schema_version": 1,
+                "ok": ok,
+                "checks": rows,
+                "scope_coverage": coverage,
+            }))?;
         }
         Format::Human => {
             for (name, c, detail) in &checks {
-                println!("{} {name}: {detail}", if *c { "✓" } else { "✗" });
+                let mark = match (*c, doctor_check_gates(name)) {
+                    (true, _) => "✓",
+                    (false, true) => "✗",
+                    (false, false) => "!",
+                };
+                println!("{mark} {name}: {detail}");
             }
         }
     }

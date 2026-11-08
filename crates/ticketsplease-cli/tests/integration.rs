@@ -3301,6 +3301,211 @@ fn doctor_flags_stranded_txn_dirs() {
     );
 }
 
+/// Init `repo` with `scopes` (TOML lines under `[scopes]`) and write `files`; the
+/// caller decides whether and when to commit them.
+fn doctor_scope_fixture(repo: &Path, scopes: &str, files: &[&str]) {
+    tkt(repo).args(["init", "--no-skill"]).assert().success();
+    write_scope_config(repo, scopes);
+    for f in files {
+        let path = repo.join(f);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x\n").unwrap();
+    }
+}
+
+/// Run sandboxed `doctor --format json`, returning the exit code and the payload.
+fn doctor_json(repo: &Path, sandbox: &Path) -> (Option<i32>, serde_json::Value) {
+    let out = tkt_sandboxed(repo, sandbox)
+        .args(["doctor", "--format", "json"])
+        .output()
+        .unwrap();
+    let v = serde_json::from_slice(&out.stdout).unwrap();
+    (out.status.code(), v)
+}
+
+/// The `scope_coverage` check rows of a doctor JSON payload.
+fn coverage_rows(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["check"] == "scope_coverage")
+        .collect()
+}
+
+/// A misspelled scope glob compiles but matches no tracked file: doctor warns, naming
+/// the scope and the glob, and still exits 0.
+#[test]
+fn doctor_warns_on_scope_glob_matching_no_tracked_file() {
+    let dir = TempDir::new().unwrap();
+    let sandbox = TempDir::new().unwrap();
+    let repo = dir.path();
+    doctor_scope_fixture(
+        repo,
+        "\"core\" = [\"core/**\"]\n\"io\" = [\"io/**\", \"oi/**\"]\n",
+        &["core/a.rs", "io/b.rs"],
+    );
+    git_init_commit(repo);
+
+    let out = tkt_sandboxed(repo, sandbox.path())
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a dead glob alone must not fail doctor"
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("! scope_coverage: scope `io` glob `oi/**` matches no tracked file"),
+        "the warning names scope and glob: {text}"
+    );
+    assert_eq!(text.matches("scope_coverage").count(), 1, "{text}");
+
+    let (code, v) = doctor_json(repo, sandbox.path());
+    assert_eq!(code, Some(0));
+    assert_eq!(v["ok"], true);
+    let rows = coverage_rows(&v);
+    assert_eq!(rows.len(), 1, "{v}");
+    assert_eq!(rows[0]["ok"], false);
+    assert_eq!(rows[0]["gating"], false);
+    assert!(rows[0]["detail"].as_str().unwrap().contains("`oi/**`"));
+}
+
+/// When every glob matches, doctor prints nothing beyond the existing `scope_globs`
+/// line. Nested (overlapping) scopes are legitimate: never a warning, only reported in
+/// the JSON as information.
+#[test]
+fn doctor_is_quiet_when_every_scope_glob_matches() {
+    let dir = TempDir::new().unwrap();
+    let sandbox = TempDir::new().unwrap();
+    let repo = dir.path();
+    doctor_scope_fixture(
+        repo,
+        "\"cli\" = [\"cli/**\"]\n\"skill\" = [\"cli/skill/**\"]\n",
+        &["cli/main.rs", "cli/skill/SKILL.md"],
+    );
+    git_init_commit(repo);
+
+    let out = tkt_sandboxed(repo, sandbox.path())
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("✓ scope_globs: 2 scope(s) compile"), "{text}");
+    assert!(!text.contains("scope_coverage"), "{text}");
+    assert!(!text.contains("overlap"), "{text}");
+
+    let (code, v) = doctor_json(repo, sandbox.path());
+    assert_eq!(code, Some(0));
+    assert!(coverage_rows(&v).is_empty(), "{v}");
+    let overlaps = v["scope_coverage"]["overlaps"].as_array().unwrap();
+    assert_eq!(overlaps.len(), 1, "{v}");
+    assert_eq!(overlaps[0]["scopes"], serde_json::json!(["cli", "skill"]));
+    assert_eq!(overlaps[0]["files"], 1);
+}
+
+/// `doctor --format json` carries the match count of every glob and of every scope.
+#[test]
+fn doctor_json_reports_per_glob_match_counts() {
+    let dir = TempDir::new().unwrap();
+    let sandbox = TempDir::new().unwrap();
+    let repo = dir.path();
+    doctor_scope_fixture(
+        repo,
+        "\"core\" = [\"core/**\", \"core/*.rs\", \"cor/**\"]\n\"docs\" = [\"README.md\"]\n",
+        &["core/a.rs", "core/b.md", "README.md"],
+    );
+    git_init_commit(repo);
+
+    let (code, v) = doctor_json(repo, sandbox.path());
+    assert_eq!(code, Some(0));
+    let cov = &v["scope_coverage"];
+    // The fixture's three files, plus the config and the four files `init` seeds.
+    assert_eq!(cov["files"], 8, "{v}");
+    let core = &cov["scopes"]["core"];
+    assert_eq!(
+        core["matched"], 2,
+        "a file two globs match counts once: {v}"
+    );
+    assert_eq!(
+        core["globs"],
+        serde_json::json!([
+            { "glob": "core/**", "matched": 2 },
+            { "glob": "core/*.rs", "matched": 1 },
+            { "glob": "cor/**", "matched": 0 },
+        ])
+    );
+    assert_eq!(cov["scopes"]["docs"]["matched"], 1);
+    assert_eq!(coverage_rows(&v).len(), 1, "only `cor/**` warns: {v}");
+}
+
+/// A scope whose files do not exist yet (`tickets/**` before the first ticket is
+/// committed) is a warning, never the reason doctor fails — before or after the first
+/// commit.
+#[test]
+fn doctor_scope_without_files_yet_is_a_warning() {
+    let dir = TempDir::new().unwrap();
+    let sandbox = TempDir::new().unwrap();
+    let repo = dir.path();
+    doctor_scope_fixture(
+        repo,
+        "\"src\" = [\"src/**\"]\n\"tickets\" = [\"tickets/**\"]\n",
+        &["src/main.rs"],
+    );
+
+    // Before any commit nothing is tracked: both scopes warn, and doctor fails only on
+    // its existing git_repo and base_ref checks.
+    git(repo, &["init", "-q", "-b", "main"]);
+    let (code, v) = doctor_json(repo, sandbox.path());
+    assert_eq!(code, Some(3));
+    let rows = coverage_rows(&v);
+    assert_eq!(rows.len(), 2, "{v}");
+    assert!(rows.iter().all(|r| r["gating"] == false), "{v}");
+    let failed: Vec<&str> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["ok"] == false && c["gating"] == true)
+        .map(|c| c["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(failed, vec!["base_ref", "git_repo"]);
+
+    git_commit_all(repo, "init");
+    let (code, v) = doctor_json(repo, sandbox.path());
+    assert_eq!(code, Some(0), "an empty scope must not fail doctor: {v}");
+    let rows = coverage_rows(&v);
+    assert_eq!(rows.len(), 1, "{v}");
+    assert!(rows[0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("scope `tickets` glob `tickets/**`"));
+}
+
+/// Outside a git repo there are no tracked files, so the coverage check is skipped
+/// cleanly: no warning rows and a null `scope_coverage`.
+#[test]
+fn doctor_skips_scope_coverage_outside_git() {
+    let dir = TempDir::new().unwrap();
+    let sandbox = TempDir::new().unwrap();
+    let repo = dir.path();
+    doctor_scope_fixture(repo, "\"src\" = [\"src/**\"]\n", &["src/main.rs"]);
+
+    let (code, v) = doctor_json(repo, sandbox.path());
+    // doctor still fails on its git_repo check, as before; coverage adds nothing.
+    assert_eq!(code, Some(3));
+    assert!(coverage_rows(&v).is_empty(), "{v}");
+    assert_eq!(v["scope_coverage"], serde_json::Value::Null);
+    let scope_globs = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "scope_globs")
+        .unwrap();
+    assert_eq!(scope_globs["ok"], true);
+}
+
 /// --dry-run previews create/set without writing.
 #[test]
 fn dry_run_previews_without_writing() {

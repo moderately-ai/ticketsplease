@@ -98,6 +98,8 @@ pub struct PathGlobMapper {
     set: GlobSet,
     /// `glob_scope[i]` is the scope that contributed the i-th glob in `set`.
     glob_scope: Vec<String>,
+    /// `glob_text[i]` is the i-th glob in `set`, as written in the config.
+    glob_text: Vec<String>,
 }
 
 impl PathGlobMapper {
@@ -105,18 +107,86 @@ impl PathGlobMapper {
     pub fn new(config: &Config) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
         let mut glob_scope = Vec::new();
+        let mut glob_text = Vec::new();
         for (scope, globs) in &config.scopes {
             for g in globs {
                 builder.add(Glob::new(g).map_err(|e| {
                     Error::Invalid(format!("invalid glob `{g}` for scope `{scope}`: {e}"))
                 })?);
                 glob_scope.push(scope.clone());
+                glob_text.push(g.clone());
             }
         }
         let set = builder
             .build()
             .map_err(|e| Error::Invalid(format!("building path-glob set: {e}")))?;
-        Ok(Self { set, glob_scope })
+        Ok(Self {
+            set,
+            glob_scope,
+            glob_text,
+        })
+    }
+
+    /// Setup-time coverage of `files` (typically every tracked file, see
+    /// [`tracked_files`]): how many files each glob and each scope matches, and which
+    /// scopes share files. It runs the same per-file pass over the same combined set as
+    /// [`AffectedSetMapper::map`], so a glob counts a file here exactly when the guard
+    /// would attribute that file to the glob's scope. A glob matching no file leaves a
+    /// hole in the guard's file-to-scope mapping.
+    #[must_use]
+    pub fn coverage(&self, files: &[String]) -> ScopeCoverageReport {
+        let mut glob_hits = vec![0usize; self.glob_text.len()];
+        let mut scope_hits: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut pair_hits: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        let mut hits: Vec<usize> = Vec::new();
+        let mut file_scopes: Vec<&str> = Vec::new();
+        for f in files {
+            self.set.matches_into(f.as_str(), &mut hits);
+            file_scopes.clear();
+            for &gi in &hits {
+                glob_hits[gi] += 1;
+                // A scope's globs are contiguous and the hits ascend, so one file's
+                // repeat hits on a scope are adjacent and the scopes come out sorted.
+                let scope = self.glob_scope[gi].as_str();
+                if file_scopes.last() != Some(&scope) {
+                    file_scopes.push(scope);
+                }
+            }
+            for (i, &a) in file_scopes.iter().enumerate() {
+                *scope_hits.entry(a).or_default() += 1;
+                for &b in &file_scopes[i + 1..] {
+                    *pair_hits.entry((a, b)).or_default() += 1;
+                }
+            }
+        }
+
+        let mut scopes: BTreeMap<String, ScopeCoverage> = BTreeMap::new();
+        for (gi, glob) in self.glob_text.iter().enumerate() {
+            let scope = &self.glob_scope[gi];
+            scopes
+                .entry(scope.clone())
+                .or_insert_with(|| ScopeCoverage {
+                    matched: scope_hits.get(scope.as_str()).copied().unwrap_or(0),
+                    globs: Vec::new(),
+                })
+                .globs
+                .push(GlobCoverage {
+                    glob: glob.clone(),
+                    matched: glob_hits[gi],
+                });
+        }
+        let overlaps = pair_hits
+            .into_iter()
+            .map(|((a, b), n)| ScopeOverlap {
+                scopes: [a.to_string(), b.to_string()],
+                files: n,
+            })
+            .collect();
+        ScopeCoverageReport {
+            files: files.len(),
+            scopes,
+            overlaps,
+        }
     }
 
     /// For `--explain`: which changed files matched each scope's globs (scope -> files,
@@ -140,6 +210,58 @@ impl PathGlobMapper {
         }
         out
     }
+}
+
+/// How many files the `[scopes]` globs match: per scope, per glob, and per pair of
+/// scopes sharing files. Built by [`PathGlobMapper::coverage`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeCoverageReport {
+    /// How many files were matched against the globs.
+    pub files: usize,
+    /// Per-scope coverage, keyed by scope name. Only scopes with at least one glob.
+    pub scopes: BTreeMap<String, ScopeCoverage>,
+    /// Pairs of scopes whose globs match some of the same files. Informational only:
+    /// nested scopes (a sub-tree scope inside a crate scope) overlap by design.
+    pub overlaps: Vec<ScopeOverlap>,
+}
+
+impl ScopeCoverageReport {
+    /// Every `(scope, glob)` that matches none of the files, in scope then config order.
+    pub fn unmatched_globs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.scopes.iter().flat_map(|(scope, cov)| {
+            cov.globs
+                .iter()
+                .filter(|g| g.matched == 0)
+                .map(move |g| (scope.as_str(), g.glob.as_str()))
+        })
+    }
+}
+
+/// One scope's coverage.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeCoverage {
+    /// Distinct files matched by any of the scope's globs.
+    pub matched: usize,
+    /// Each glob's own match count, in config order.
+    pub globs: Vec<GlobCoverage>,
+}
+
+/// One configured glob and how many files it matches.
+#[derive(Debug, Clone, Serialize)]
+pub struct GlobCoverage {
+    /// The glob as written in the config.
+    pub glob: String,
+    /// How many files it matches.
+    pub matched: usize,
+}
+
+/// Two scopes whose globs match some of the same files.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeOverlap {
+    /// The two scope names, sorted.
+    pub scopes: [String; 2],
+    /// How many files both scopes match.
+    pub files: usize,
 }
 
 impl AffectedSetMapper for PathGlobMapper {
@@ -371,6 +493,30 @@ fn diff_names(repo: &Path, range: &[&str]) -> Result<Vec<String>> {
     changed_files.sort();
     changed_files.dedup();
     Ok(changed_files)
+}
+
+/// Every file tracked in `repo`'s work tree (`git ls-files`), as paths relative to the
+/// work-tree root: the form `git diff --name-only` gives the guard, so the scope globs
+/// read both the same way. `-z` keeps unusual file names unquoted.
+pub fn tracked_files(repo: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "-z", "--full-name", "--", ":/"])
+        .output()
+        .map_err(|e| Error::Invalid(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Invalid(format!(
+            "`git ls-files` failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// A collision with another concurrently-open ticket.
@@ -720,6 +866,58 @@ mod tests {
             .unwrap();
         assert_eq!(affected.get("core"), Some(&ScopeCause::Direct));
         assert!(!affected.contains_key("io"));
+    }
+
+    fn files(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn coverage_counts_files_per_glob_and_distinct_files_per_scope() {
+        let mut cfg = Config::default();
+        cfg.scopes.insert(
+            "core".to_string(),
+            vec![
+                "core/**".to_string(),
+                "core/*.rs".to_string(),
+                "cor/**".to_string(),
+            ],
+        );
+        cfg.scopes
+            .insert("io".to_string(), vec!["io/**".to_string()]);
+        let mapper = PathGlobMapper::new(&cfg).unwrap();
+        let report = mapper.coverage(&files(&["core/a.rs", "core/b.md", "docs/x.md"]));
+
+        assert_eq!(report.files, 3);
+        let core = &report.scopes["core"];
+        // `core/a.rs` matches two of core's globs but counts once for the scope.
+        assert_eq!(core.matched, 2);
+        let counts: Vec<(&str, usize)> = core
+            .globs
+            .iter()
+            .map(|g| (g.glob.as_str(), g.matched))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![("core/**", 2), ("core/*.rs", 1), ("cor/**", 0)]
+        );
+        assert_eq!(report.scopes["io"].matched, 0);
+        let unmatched: Vec<(&str, &str)> = report.unmatched_globs().collect();
+        assert_eq!(unmatched, vec![("core", "cor/**"), ("io", "io/**")]);
+        assert!(report.overlaps.is_empty());
+    }
+
+    #[test]
+    fn coverage_reports_nested_scopes_as_overlaps() {
+        let cfg = config_with_scopes(&[("cli", "cli/**"), ("skill", "cli/skill/**")]);
+        let mapper = PathGlobMapper::new(&cfg).unwrap();
+        let report = mapper.coverage(&files(&["cli/main.rs", "cli/skill/SKILL.md"]));
+        assert_eq!(report.scopes["cli"].matched, 2);
+        assert_eq!(report.scopes["skill"].matched, 1);
+        assert_eq!(report.unmatched_globs().count(), 0);
+        assert_eq!(report.overlaps.len(), 1);
+        assert_eq!(report.overlaps[0].scopes, ["cli", "skill"]);
+        assert_eq!(report.overlaps[0].files, 1);
     }
 
     #[test]
