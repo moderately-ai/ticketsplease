@@ -1,11 +1,11 @@
 ---
 id: skill-ignore-respects-git-excludes
 title: "Skill link ignore: respect existing git excludes instead of always editing .gitignore"
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: []
-scopes: [cli]
+scopes: [cli, core, docs]
 shared_scopes: []
 paths: []
 tags: [ux, bug, onboarding]
