@@ -35,7 +35,7 @@ ticketsplease helps agents reason about the parallel-work failure mode in two pl
 Locate the binary (`ticketsplease` or `tkt` on `PATH`; if neither is present, tell the user how they installed it or ask). Confirm the repo is initialized — there is a `ticketsplease.toml` at its root. If not:
 
 ```sh
-ticketsplease init        # scaffolds tickets/ + ticketsplease.toml; links the skill into .claude/skills (a gitignored symlink to the canonical per-user copy)
+ticketsplease init        # scaffolds tickets/ + ticketsplease.toml; links the skill into .claude/skills (a git-ignored symlink to the canonical per-user copy)
 ticketsplease guide       # the conceptual model in one screen (scopes, tracks, scoring, guard, claims)
 ticketsplease doctor      # verify setup: config, git repo + commit, scope globs, base ref, skill freshness
 ```

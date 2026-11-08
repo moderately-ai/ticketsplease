@@ -204,6 +204,7 @@ mod tests {
             scheduler: Default::default(),
             maintenance: Default::default(),
             output: Default::default(),
+            skill: Default::default(),
             recipes: BTreeMap::new(),
         }
     }

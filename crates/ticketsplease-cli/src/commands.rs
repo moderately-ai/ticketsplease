@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +15,7 @@ use ticketsplease_core::comment::{
     Comment, CommentQuery, CommentSummary, CommentThread, SourcedComment,
 };
 use ticketsplease_core::config::{
-    Backend, CommentMode, CommentSourceMode, Config, Recipe, CONFIG_FILE,
+    Backend, CommentMode, CommentSourceMode, Config, LinkIgnore, Recipe, CONFIG_FILE,
 };
 use ticketsplease_core::event::Event;
 use ticketsplease_core::guard;
@@ -325,18 +325,23 @@ fn print_full_thread_if_any(comments: &LoadedComments, id: &str) {
 
 /// `init` — scaffold the tickets directory and config.
 pub fn init(repo: &Path, fmt: Format, args: &InitArgs) -> Result<()> {
-    let config_body = build_config(repo, &args.dir);
+    let link_ignore = args.link_ignore.map(LinkIgnore::from);
+    let config_body = build_config(repo, &args.dir, link_ignore);
     let outcome = store::init_repo(repo, &args.dir, &config_body, args.force)?;
     let dir = outcome.tickets_dir.display().to_string();
     // Link the project to the canonical skill copy (a self-update refreshes it for
-    // every linked project). The symlink is local, so gitignore it rather than commit.
-    // `--harness` selects the directory convention (Claude Code by default).
+    // every linked project). The symlink is local, so make sure git ignores it rather
+    // than commit it. `--harness` selects the directory convention (Claude Code by default).
     let skill_path = if args.no_skill {
         None
     } else {
+        let target = match link_ignore {
+            Some(target) => target,
+            None => configured_link_ignore(repo)?,
+        };
         let base = args.harness.project_base_dir();
         let link = skill::link_into(repo, base)?;
-        ensure_gitignored(repo, &format!("{base}/ticketsplease"))?;
+        ensure_link_ignored(repo, &format!("{base}/ticketsplease"), target)?;
         Some(link.display().to_string())
     };
     // Seed the example body templates so `create --template` has something to use and
@@ -408,9 +413,13 @@ pub fn skill_install(repo: &Path, fmt: Format, args: &SkillInstallArgs) -> Resul
         if args.copy {
             (skill::copy_into(repo, &base)?, false)
         } else {
+            let target = match args.link_ignore {
+                Some(target) => target.into(),
+                None => configured_link_ignore(repo)?,
+            };
             let link = skill::link_into(repo, &base)?;
-            // The project symlink points at an absolute path, so gitignore it.
-            ensure_gitignored(repo, &format!("{base}/ticketsplease"))?;
+            // The project symlink points at an absolute path, so git must ignore it.
+            ensure_link_ignored(repo, &format!("{base}/ticketsplease"), target)?;
             (link, true)
         }
     };
@@ -461,12 +470,74 @@ pub fn skill_sync(fmt: Format) -> Result<()> {
     }
 }
 
-/// Append `entry` to the repo's `.gitignore` if not already present (one line). Used
-/// for the local skill symlink, which points at an absolute path and must not be
-/// committed. `pub(crate)` so the auto-migrate advisory can reuse the same relink hygiene.
-pub(crate) fn ensure_gitignored(repo: &Path, entry: &str) -> Result<()> {
-    let path = repo.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+/// The persisted `[skill] link_ignore` choice, or the default when the repo has no
+/// config yet (`skill install` works before `init`).
+fn configured_link_ignore(repo: &Path) -> Result<LinkIgnore> {
+    if repo.join(CONFIG_FILE).exists() {
+        Ok(Config::load(repo)?.skill.link_ignore)
+    } else {
+        Ok(LinkIgnore::default())
+    }
+}
+
+/// Make sure git ignores the local skill symlink `entry` (a path relative to `repo`),
+/// which points at an absolute per-user path and must never be committed.
+///
+/// When git already ignores it — through any `.gitignore`, `.git/info/exclude` or the
+/// global excludes file — nothing is written, so a relink never dirties the tree.
+/// Otherwise the entry goes to `target`: the repo's `.gitignore`, or the clone-local
+/// `.git/info/exclude`. When git cannot answer (outside a git work tree) the entry goes
+/// to `.gitignore`, the only ignore file there is. `pub(crate)` so the auto-migrate
+/// advisory reuses the same relink hygiene.
+pub(crate) fn ensure_link_ignored(repo: &Path, entry: &str, target: LinkIgnore) -> Result<()> {
+    match (git_ignores(repo, entry), target) {
+        (Some(true), _) => Ok(()),
+        (Some(false), LinkIgnore::Exclude) => {
+            let (exclude, prefix) = git_exclude_file(repo)?;
+            append_ignore_line(&exclude, &format!("{prefix}{entry}"))
+        }
+        (Some(false), LinkIgnore::Gitignore) | (None, _) => {
+            append_ignore_line(&repo.join(".gitignore"), entry)
+        }
+    }
+}
+
+/// Ask git whether `path` (relative to `repo`) matches any ignore rule. `--no-index`
+/// asks about the rules alone, whatever the index holds. `None` when git cannot answer:
+/// `repo` is not in a git work tree, or git is unavailable.
+fn git_ignores(repo: &Path, path: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "--quiet", "--no-index", "--", path])
+        .output()
+        .ok()?;
+    match output.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// The clone's exclude file (`info/exclude` under the common git dir, so a linked
+/// worktree shares its main checkout's) and `repo`'s path prefix within the work tree:
+/// exclude patterns are relative to the work-tree root, not to `repo`.
+fn git_exclude_file(repo: &Path) -> Result<(PathBuf, String)> {
+    let path = git_lines(repo, &["rev-parse", "--git-path", "info/exclude"])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Internal("git rev-parse --git-path printed nothing".into()))?;
+    let prefix = git_lines(repo, &["rev-parse", "--show-prefix"])?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Ok((repo.join(path), prefix))
+}
+
+/// Append `entry` as one line to the ignore file at `path` unless a line already equals
+/// it, creating the file (and its directory) if needed.
+fn append_ignore_line(path: &Path, entry: &str) -> Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == entry) {
         return Ok(());
     }
@@ -476,7 +547,10 @@ pub(crate) fn ensure_gitignored(repo: &Path, entry: &str) -> Result<()> {
     }
     out.push_str(entry);
     out.push('\n');
-    std::fs::write(&path, out).map_err(Error::Io)
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(Error::Io)?;
+    }
+    std::fs::write(path, out).map_err(Error::Io)
 }
 
 /// `self-update` — replace the binary in place from GitHub Releases.
@@ -3253,7 +3327,11 @@ pub fn migrate(repo: &Path, fmt: Format, args: &MigrateArgs) -> Result<()> {
         std::fs::symlink_metadata(&link_path).is_ok() && !skill::link_ok(repo, ".claude/skills");
     let skill_relinked = if skill_relink_needed && !dry_run {
         skill::link_into(repo, ".claude/skills")?;
-        ensure_gitignored(repo, ".claude/skills/ticketsplease")?;
+        ensure_link_ignored(
+            repo,
+            ".claude/skills/ticketsplease",
+            store.config.skill.link_ignore,
+        )?;
         true
     } else {
         false
@@ -3842,16 +3920,38 @@ fn display_argv(argv: &[String]) -> String {
 
 /// Build the config body for `init`: a Rust-seeded config when a cargo workspace
 /// is detected, otherwise the default path-glob template. A cargo-metadata failure
-/// falls back to the default rather than failing init.
-fn build_config(repo: &Path, tickets_dir: &str) -> String {
-    if repo.join("Cargo.toml").exists() {
-        if let Ok(members) = workspace_members(repo) {
-            if !members.is_empty() {
-                return build_rust_config(tickets_dir, &members);
-            }
-        }
-    }
-    store::default_config_template(tickets_dir)
+/// falls back to the default rather than failing init. Either way it ends with the
+/// `[skill]` table, carrying `--link-ignore` when given.
+fn build_config(repo: &Path, tickets_dir: &str, link_ignore: Option<LinkIgnore>) -> String {
+    let members = if repo.join("Cargo.toml").exists() {
+        workspace_members(repo).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut config = if members.is_empty() {
+        store::default_config_template(tickets_dir)
+    } else {
+        build_rust_config(tickets_dir, &members)
+    };
+    config.push_str(&skill_config_section(link_ignore));
+    config
+}
+
+/// The `[skill]` table of a generated config: an explicit `--link-ignore` choice is
+/// written live so `skill install`, `migrate` and the advisory follow it; otherwise the
+/// default is shown commented out.
+fn skill_config_section(link_ignore: Option<LinkIgnore>) -> String {
+    let key = match link_ignore {
+        None => "# link_ignore = \"gitignore\"",
+        Some(LinkIgnore::Gitignore) => "link_ignore = \"gitignore\"",
+        Some(LinkIgnore::Exclude) => "link_ignore = \"exclude\"",
+    };
+    format!(
+        "\n# Where the local skill symlink is recorded as ignored when git does not already\n\
+         # ignore it: \"gitignore\" (this repo's .gitignore) or \"exclude\" (.git/info/exclude,\n\
+         # clone-local and never committed, e.g. in a fork whose .gitignore is upstream's).\n\
+         [skill]\n{key}\n"
+    )
 }
 
 fn build_rust_config(tickets_dir: &str, members: &[WorkspaceMember]) -> String {

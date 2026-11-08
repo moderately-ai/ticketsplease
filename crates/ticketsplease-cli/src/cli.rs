@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use ticketsplease_core::config::LinkIgnore;
 use ticketsplease_core::Result;
 
 use crate::commands;
@@ -146,6 +147,12 @@ pub struct InitArgs {
     /// claude | codex | opencode | pi-agent.
     #[arg(long, value_enum, default_value = "claude")]
     pub harness: Harness,
+    /// Where to record the skill symlink as ignored when git does not already ignore it:
+    /// gitignore (the repo's .gitignore) | exclude (.git/info/exclude, never committed).
+    /// Written into a config this run generates as `[skill] link_ignore`; otherwise
+    /// overrides that key for this run. Default: the configured value (gitignore).
+    #[arg(long, value_enum)]
+    pub link_ignore: Option<LinkIgnoreArg>,
 }
 
 /// `create` arguments.
@@ -1022,6 +1029,30 @@ pub struct SkillInstallArgs {
     /// Write a committable real copy instead of a symlink to the canonical copy.
     #[arg(long)]
     pub copy: bool,
+    /// Where to record the project symlink as ignored when git does not already ignore
+    /// it: gitignore | exclude (.git/info/exclude). Overrides `[skill] link_ignore` for
+    /// this run. Not valid with --global or --copy.
+    #[arg(long, value_enum, conflicts_with_all = ["global", "copy"])]
+    pub link_ignore: Option<LinkIgnoreArg>,
+}
+
+/// CLI spelling for `[skill] link_ignore`: where a new ignore entry for the project
+/// skill symlink is written.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LinkIgnoreArg {
+    /// The repository's `.gitignore` (tracked).
+    Gitignore,
+    /// `.git/info/exclude` (clone-local, never committed).
+    Exclude,
+}
+
+impl From<LinkIgnoreArg> for LinkIgnore {
+    fn from(value: LinkIgnoreArg) -> Self {
+        match value {
+            LinkIgnoreArg::Gitignore => Self::Gitignore,
+            LinkIgnoreArg::Exclude => Self::Exclude,
+        }
+    }
 }
 
 /// `run` arguments.

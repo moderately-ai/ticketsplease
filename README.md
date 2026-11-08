@@ -124,6 +124,9 @@ backend = "rust"               # "none" (path globs only) or "rust" (also use th
 [scheduler]                    # opt-in costs beyond declared scopes
 related_weight = 0             # 0 = related ignored by tracks/next/lanes/why (default)
 
+[skill]                        # where the local skill symlink is ignored if git does not already ignore it
+link_ignore = "gitignore"      # default; "exclude" = .git/info/exclude (clone-local, never committed)
+
 [workflow]                     # custom lifecycle states (optional; omit for the built-in set)
 enforce_transitions = false    # opt-in state machine; default off (any state -> any state)
 [workflow.states.todo]
@@ -173,7 +176,7 @@ Saved views (and bundled body templates) live under `.ticketsplease/` at the rep
 
 The skill contains `SKILL.md`, progressive-disclosure `references/`, and Codex-facing `agents/openai.yaml` metadata. The major coding agents consume the same bundle, so `--harness` selects where it installs: `claude` → `.claude/skills`, `codex` → `.agents/skills` (the cross-tool Agent Skills standard directory, also read by opencode and Pi), `opencode` → `.opencode/skills`, `pi-agent` → `.pi/skills`. `--global` installs into the harness's user-global dir instead of the repo.
 
-The skill is embedded in the binary, but instead of a frozen per-repo copy it lives once at a canonical per-user path (`~/.local/share/ticketsplease/skill`) and each install is a **symlink** to it. The installer runs `tkt skill sync` after every install/`self-update`, so the canonical copy — and therefore every linked project — always matches your binary; `tkt doctor` warns if it drifts and `tkt migrate` repairs a stale link. A project link is local, so `init` gitignores it; use `tkt skill install --copy` if you'd rather commit a real copy.
+The skill is embedded in the binary, but instead of a frozen per-repo copy it lives once at a canonical per-user path (`~/.local/share/ticketsplease/skill`) and each install is a **symlink** to it. The installer runs `tkt skill sync` after every install/`self-update`, so the canonical copy — and therefore every linked project — always matches your binary; `tkt doctor` warns if it drifts and `tkt migrate` repairs a stale link. A project link is local, so it must be ignored by git: if git already ignores it (any `.gitignore`, `.git/info/exclude`, or your global excludes file), `init`/`skill install`/`migrate` write nothing; otherwise they add it to `.gitignore`, or to `.git/info/exclude` with `[skill] link_ignore = "exclude"` (or `--link-ignore exclude`) — useful in a fork, where a local line in upstream's `.gitignore` would conflict at every rebase. Use `tkt skill install --copy` if you'd rather commit a real copy.
 
 ## Dogfooding
 

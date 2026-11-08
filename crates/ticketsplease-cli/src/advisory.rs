@@ -129,7 +129,11 @@ fn drift_advisory(repo: &Path, store: &Store, apply: bool) -> Option<String> {
             .unwrap_or(0);
         let relinked = link_stale && {
             skill::link_into(repo, ".claude/skills").is_ok() && {
-                let _ = crate::commands::ensure_gitignored(repo, ".claude/skills/ticketsplease");
+                let _ = crate::commands::ensure_link_ignored(
+                    repo,
+                    ".claude/skills/ticketsplease",
+                    store.config.skill.link_ignore,
+                );
                 true
             }
         };

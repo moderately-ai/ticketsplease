@@ -5482,6 +5482,298 @@ fn skill_install_targets_each_harness() {
         .code(3);
 }
 
+/// `tkt` with the canonical skill dir and git's global/system config sandboxed under
+/// `sandbox`, so the host's excludes files never decide what git already ignores.
+fn tkt_sandboxed(repo: &Path, sandbox: &Path) -> Command {
+    let gitconfig = sandbox.join("gitconfig");
+    if !gitconfig.exists() {
+        std::fs::write(&gitconfig, "").unwrap();
+    }
+    let mut cmd = tkt(repo);
+    cmd.env("XDG_DATA_HOME", sandbox.join("data"))
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("GIT_CONFIG_GLOBAL", &gitconfig)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd
+}
+
+/// Run a sandboxed `tkt` command that must succeed.
+fn tkt_sandboxed_ok(repo: &Path, sandbox: &Path, args: &[&str]) -> std::process::Output {
+    let out = tkt_sandboxed(repo, sandbox).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// Replace the project skill symlink with a real directory: the stale copy that
+/// `migrate` and the auto-repair advisory relink.
+fn make_skill_link_stale(repo: &Path) {
+    let link = repo.join(".claude/skills/ticketsplease");
+    std::fs::remove_file(&link).unwrap();
+    std::fs::create_dir_all(&link).unwrap();
+    std::fs::write(link.join("SKILL.md"), "stale copy\n").unwrap();
+}
+
+/// Run the auto-repair advisory (forced interactive `--auto-doctor`, update check pinned
+/// offline) and assert it relinked the skill.
+fn auto_repair_skill_link(repo: &Path, sandbox: &Path) {
+    let out = tkt_sandboxed(repo, sandbox)
+        .args(["ready", "--auto-doctor"])
+        .env_remove("CI")
+        .env_remove("TICKETSPLEASE_NO_ADVISORIES")
+        .env("TICKETSPLEASE_ADVISORY_FORCE", "1")
+        .env("TICKETSPLEASE_UPDATE_LATEST", "0.0.0")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("repaired the skill link"), "advisory: {err}");
+    assert!(
+        std::fs::symlink_metadata(repo.join(".claude/skills/ticketsplease"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// Whether git (sandboxed like `tkt_sandboxed`) ignores `path` in `repo`.
+fn git_ignores(repo: &Path, sandbox: &Path, path: &str) -> bool {
+    Proc::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "-q", "--no-index", "--", path])
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("GIT_CONFIG_GLOBAL", sandbox.join("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Lines of the repo's `.git/info/exclude` equal to `entry`.
+fn exclude_count(repo: &Path, entry: &str) -> usize {
+    std::fs::read_to_string(repo.join(".git/info/exclude"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l == entry)
+        .count()
+}
+
+/// Drop `entry` from the repo's `.git/info/exclude`.
+fn unexclude(repo: &Path, entry: &str) {
+    let path = repo.join(".git/info/exclude");
+    let kept: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|l| *l != entry)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&path, kept).unwrap();
+}
+
+/// A link path git already ignores through `.git/info/exclude` is left alone: init,
+/// skill install, the migrate relink and the auto-repair advisory all leave the tracked
+/// `.gitignore` byte-identical (the fork-rebasing-onto-upstream case).
+#[test]
+fn skill_link_already_git_excluded_leaves_gitignore_untouched() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let sandbox = TempDir::new().unwrap();
+    let sb = sandbox.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    let gitignore = "target/\n";
+    std::fs::write(repo.join(".gitignore"), gitignore).unwrap();
+    let exclude_path = repo.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
+    let mut exclude = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    exclude.push_str(".claude/skills/ticketsplease\n");
+    std::fs::write(&exclude_path, &exclude).unwrap();
+    let untouched = |step: &str| {
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+            gitignore,
+            "{step} must leave .gitignore byte-identical"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exclude_path).unwrap(),
+            exclude,
+            "{step} must not re-add an entry git already has"
+        );
+    };
+
+    tkt_sandboxed_ok(repo, sb, &["init"]);
+    assert!(repo.join(".claude/skills/ticketsplease/SKILL.md").exists());
+    untouched("init");
+
+    tkt_sandboxed_ok(repo, sb, &["skill", "install"]);
+    untouched("skill install");
+
+    make_skill_link_stale(repo);
+    let out = tkt_sandboxed_ok(repo, sb, &["migrate", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["skill_relinked"], true);
+    untouched("migrate");
+
+    make_skill_link_stale(repo);
+    auto_repair_skill_link(repo, sb);
+    untouched("the auto-repair advisory");
+}
+
+/// A link path the global excludes file (`core.excludesFile`) already covers is left
+/// alone too: no `.gitignore` is created and `.git/info/exclude` gains nothing.
+#[test]
+fn skill_link_ignored_by_global_excludes_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let sandbox = TempDir::new().unwrap();
+    let sb = sandbox.path();
+    let global_ignore = sb.join("global-ignore");
+    std::fs::write(&global_ignore, ".claude/\n").unwrap();
+    std::fs::write(
+        sb.join("gitconfig"),
+        format!("[core]\n\texcludesFile = {}\n", global_ignore.display()),
+    )
+    .unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+
+    tkt_sandboxed_ok(repo, sb, &["init", "--link-ignore", "exclude"]);
+    tkt_sandboxed_ok(repo, sb, &["skill", "install"]);
+    assert!(!repo.join(".gitignore").exists(), "no .gitignore written");
+    assert_eq!(exclude_count(repo, ".claude/skills/ticketsplease"), 0);
+}
+
+/// `init --link-ignore exclude` writes the entry to `.git/info/exclude` (never to
+/// `.gitignore`) and persists the choice as `[skill] link_ignore`, which `skill install`,
+/// the migrate relink and the auto-repair advisory then follow. Exclude patterns are
+/// relative to the work-tree root, so a `--repo` subdirectory gets its prefix.
+#[test]
+fn init_link_ignore_exclude_targets_git_exclude_and_persists() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let sandbox = TempDir::new().unwrap();
+    let sb = sandbox.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    let gitignore = "target/\n";
+    std::fs::write(repo.join(".gitignore"), gitignore).unwrap();
+    let entry = ".claude/skills/ticketsplease";
+    let gitignore_untouched = |step: &str| {
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+            gitignore,
+            "{step} must leave .gitignore byte-identical"
+        );
+    };
+
+    tkt_sandboxed_ok(repo, sb, &["init", "--link-ignore", "exclude"]);
+    assert_eq!(exclude_count(repo, entry), 1);
+    assert!(git_ignores(repo, sb, entry));
+    gitignore_untouched("init --link-ignore exclude");
+    let config = std::fs::read_to_string(repo.join("ticketsplease.toml")).unwrap();
+    assert!(
+        config.contains("[skill]\nlink_ignore = \"exclude\"\n"),
+        "the choice is persisted: {config}"
+    );
+
+    // migrate follows the persisted choice when the entry has to be re-added.
+    unexclude(repo, entry);
+    make_skill_link_stale(repo);
+    tkt_sandboxed_ok(repo, sb, &["migrate"]);
+    assert_eq!(exclude_count(repo, entry), 1);
+    gitignore_untouched("migrate");
+
+    // So does the auto-repair advisory.
+    unexclude(repo, entry);
+    make_skill_link_stale(repo);
+    auto_repair_skill_link(repo, sb);
+    assert_eq!(exclude_count(repo, entry), 1);
+    gitignore_untouched("the auto-repair advisory");
+
+    // And skill install without a flag.
+    tkt_sandboxed_ok(repo, sb, &["skill", "install", "--harness", "codex"]);
+    assert_eq!(exclude_count(repo, ".agents/skills/ticketsplease"), 1);
+    gitignore_untouched("skill install");
+
+    // A subdirectory --repo writes a root-relative pattern that really matches.
+    std::fs::create_dir_all(repo.join("nested")).unwrap();
+    tkt_sandboxed_ok(
+        &repo.join("nested"),
+        sb,
+        &["skill", "install", "--link-ignore", "exclude"],
+    );
+    assert_eq!(
+        exclude_count(repo, "nested/.claude/skills/ticketsplease"),
+        1
+    );
+    assert!(git_ignores(repo, sb, "nested/.claude/skills/ticketsplease"));
+    gitignore_untouched("skill install in a subdirectory");
+}
+
+/// The default is unchanged: in a git repo that does not already ignore the link, the
+/// entry is appended to `.gitignore` (once), and the generated config shows the default
+/// commented out. `--link-ignore` overrides the config for one `skill install`, and is
+/// rejected where there is no project link to ignore.
+#[test]
+fn skill_link_ignore_defaults_to_gitignore() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path();
+    let sandbox = TempDir::new().unwrap();
+    let sb = sandbox.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+
+    tkt_sandboxed_ok(repo, sb, &["init"]);
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        "target/\n.claude/skills/ticketsplease\n"
+    );
+    assert_eq!(exclude_count(repo, ".claude/skills/ticketsplease"), 0);
+    let config = std::fs::read_to_string(repo.join("ticketsplease.toml")).unwrap();
+    assert!(
+        config.contains("[skill]\n# link_ignore = \"gitignore\"\n"),
+        "{config}"
+    );
+
+    // Re-installing finds the entry already ignored and writes nothing more.
+    tkt_sandboxed_ok(repo, sb, &["skill", "install"]);
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        "target/\n.claude/skills/ticketsplease\n"
+    );
+
+    // A one-off override lands in the exclude file; the config default still applies next.
+    tkt_sandboxed_ok(
+        repo,
+        sb,
+        &[
+            "skill",
+            "install",
+            "--harness",
+            "codex",
+            "--link-ignore",
+            "exclude",
+        ],
+    );
+    assert_eq!(exclude_count(repo, ".agents/skills/ticketsplease"), 1);
+    tkt_sandboxed_ok(repo, sb, &["skill", "install", "--harness", "opencode"]);
+    assert!(std::fs::read_to_string(repo.join(".gitignore"))
+        .unwrap()
+        .lines()
+        .any(|l| l == ".opencode/skills/ticketsplease"));
+    assert!(!std::fs::read_to_string(repo.join(".gitignore"))
+        .unwrap()
+        .contains(".agents/skills/ticketsplease"));
+
+    for flags in [["--copy"], ["--global"]] {
+        tkt_sandboxed(repo, sb)
+            .args(["skill", "install", "--link-ignore", "exclude"])
+            .args(flags)
+            .assert()
+            .code(2);
+    }
+}
+
 fn show_json(repo: &Path, id: &str) -> serde_json::Value {
     let out = tkt(repo)
         .args(["show", id, "--format", "json"])

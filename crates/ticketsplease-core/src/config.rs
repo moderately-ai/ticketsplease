@@ -70,6 +70,9 @@ pub struct Config {
     /// Output presentation defaults used by the CLI.
     #[serde(default)]
     pub output: Output,
+    /// Project skill install behaviour (where the skill symlink is ignored).
+    #[serde(default)]
+    pub skill: Skill,
     /// Named recipes: typed, parameterized procedures over the tool's own subcommands,
     /// registered inline as `[recipe.<name>]` (also discoverable as
     /// `.ticketsplease/recipes/<name>.toml`). Run with `tkt run <name>`. Distinct from
@@ -261,6 +264,29 @@ pub struct Output {
     pub comment_source: CommentSourceMode,
 }
 
+/// Project skill configuration (`[skill]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Skill {
+    /// Where `init`, `skill install`, `migrate` and the auto-migrate advisory record the
+    /// project skill symlink as ignored when git does not already ignore it (through any
+    /// `.gitignore`, `.git/info/exclude` or the global excludes file). Default
+    /// `gitignore`.
+    #[serde(default)]
+    pub link_ignore: LinkIgnore,
+}
+
+/// Where a new ignore entry for the project skill symlink is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkIgnore {
+    /// The repository's `.gitignore`: tracked, so every clone shares the entry.
+    #[default]
+    Gitignore,
+    /// `.git/info/exclude`: clone-local and never committed, so the working tree stays
+    /// clean (e.g. a fork whose `.gitignore` belongs to an upstream it rebases onto).
+    Exclude,
+}
+
 /// How much comment content a command should emit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -442,6 +468,7 @@ impl Default for Config {
             scheduler: Scheduler::default(),
             maintenance: Maintenance::default(),
             output: Output::default(),
+            skill: Skill::default(),
             recipes: BTreeMap::new(),
         }
     }
@@ -573,6 +600,18 @@ mod tests {
         .unwrap();
         assert_eq!(c.output.comments, CommentMode::Summary);
         assert_eq!(c.output.comment_source, CommentSourceMode::TicketBranch);
+    }
+
+    #[test]
+    fn skill_link_ignore_defaults_to_gitignore_and_parses() {
+        assert_eq!(Config::default().skill.link_ignore, LinkIgnore::Gitignore);
+        let omitted: Config = toml::from_str("").unwrap();
+        assert_eq!(omitted.skill.link_ignore, LinkIgnore::Gitignore);
+        let empty_table: Config = toml::from_str("[skill]\n").unwrap();
+        assert_eq!(empty_table.skill.link_ignore, LinkIgnore::Gitignore);
+        let exclude: Config = toml::from_str("[skill]\nlink_ignore = \"exclude\"\n").unwrap();
+        assert_eq!(exclude.skill.link_ignore, LinkIgnore::Exclude);
+        assert!(toml::from_str::<Config>("[skill]\nlink_ignore = \"info\"\n").is_err());
     }
 
     #[test]
