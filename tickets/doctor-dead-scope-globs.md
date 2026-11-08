@@ -1,7 +1,7 @@
 ---
 id: doctor-dead-scope-globs
 title: "doctor: warn when a scope glob matches no tracked file"
-status: todo
+status: done
 priority: p2
 dependencies: []
 related: [ux-guard-unscoped-paths]
